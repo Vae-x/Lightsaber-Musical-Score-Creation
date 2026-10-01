@@ -7,6 +7,13 @@
 /projects/*
 !/projects/.gitkeep
 
+# Private development conversations and handoff notes, retained locally only
+/docs/history/
+/CX交接说明.md
+/聊天记录.md
+/docs/CX交接说明.md
+/docs/聊天记录.md
+
 # Pinned FFmpeg binaries are restored by scripts/setup-audio-tools.ps1.
 /third_party/ffmpeg/bin/
 

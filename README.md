@@ -26,7 +26,7 @@
 
 在 Windows 64 位上解压完整便携包，双击 `LightsaberMusicalScoreCreation.exe`。保留同目录的 DLL、`audio/`、`platforms/`、`tools/` 等资源；无需安装 Qt、FFmpeg 或 Python，也无需联网。
 
-便携目录与 ZIP 放在本机 `dist/`，不提交到仓库。0.2.0 目录为 `dist/光剑曲谱制作-20261001-171545/`，ZIP 交付名为 `dist/光剑曲谱制作-Windows-v0.2.0-20261001.zip`。该目录在纯系统 PATH 下通过导入、音频、编辑、撤销/重做、保存、导出、重新打开与渲染验证，133 个清单文件的 SHA256 核验通过。旧首版包保留为历史产物。
+正式便携包和 SHA256 校验文件见 [v0.2.0 Release](https://github.com/Vae-x/Lightsaber-Musical-Score-Creation/releases/tag/v0.2.0)。开发时生成的便携目录与 ZIP 放在本机 `dist/`，不提交到源码仓库。该版本在纯系统 PATH 下通过导入、音频、编辑、撤销/重做、保存、导出、重新打开与渲染验证，133 个清单文件的 SHA256 核验通过。
 
 默认编辑工程按歌曲分目录保存：`projects/<歌名>/project.lmsc`。源码开发与便携包各使用自己的 `projects/`；应用目录无写权限时回退到用户文档的 `光剑曲谱制作/工程/`。`.lmsc` 入口、旁边的 `assets-*`、`source-*` 和恢复快照需要一起保留和移动。
 
@@ -48,8 +48,7 @@ Lightsaber Musical Score Creation/
 │   ├── gui/               # Qt 窗口、控件与对应 .ui
 │   └── CMakeLists.txt
 ├── resources/             # 图标、Qt 资源与 Windows 版本资源
-├── docs/
-│   └── history/           # 原始交接说明与聊天记录
+├── docs/                  # 当前需求、架构与使用说明
 ├── tests/                 # 核心、音频和界面验证
 ├── third_party/           # 依赖版本、来源与第三方许可
 ├── scripts/               # 依赖准备和便携打包
@@ -74,10 +73,3 @@ Lightsaber Musical Score Creation/
 项目采用 **GNU GPL v3**，官方许可全文保存在 [LICENSE](LICENSE)。Qt、FFmpeg 及其依赖各自保留原许可证；本项目协议不替换第三方条款。[GNU 官方许可说明](https://www.gnu.org/licenses/gpl-3.0.html)
 
 用户要求每完成一次逻辑改动，在相关验证成功后以中文提交并推送；本地歌曲、工程、设备元数据、构建产物、便携包与 FFmpeg 二进制不推送。持续规则见 [AGENTS.md](AGENTS.md)。
-
-## 历史背景
-
-- [CX 交接说明](docs/history/CX交接说明.md)：早期需求与格式样本结论。
-- [原始聊天记录](docs/history/聊天记录.md)：历史讨论，原文保留。
-
-历史助手建议作为背景，当前用户明确选择优先；此前 Electron 建议已由 Qt5 / Windows 优先的决定替代。
