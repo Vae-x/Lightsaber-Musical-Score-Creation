@@ -51,6 +51,7 @@ add_executable(src WIN32
         gui/EditorViews.cpp
         gui/EditorViews.h
         gui/SettingsDialog.cpp gui/SettingsDialog.h
+        gui/NavigationSidebar.cpp gui/NavigationSidebar.h
         gui/ThemeManager.cpp gui/ThemeManager.h
         ../resources/app.qrc)
 if (WIN32)
@@ -171,6 +172,7 @@ if (BUILD_TESTING)
     add_executable(settings_dialog_tests
             "${LMSC_REPOSITORY_DIR}/tests/SettingsDialogTest.cpp"
             gui/SettingsDialog.cpp gui/SettingsDialog.h
+            gui/NavigationSidebar.cpp gui/NavigationSidebar.h
             gui/ThemeManager.cpp gui/ThemeManager.h
             gui/EditorViews.cpp gui/EditorViews.h)
     target_sources(settings_dialog_tests PRIVATE ../resources/app.qrc)
@@ -229,6 +231,7 @@ if (BUILD_TESTING)
                 gui/EditorViews.cpp gui/EditorViews.h)
         target_sources(main_window_tests PRIVATE
                 gui/SettingsDialog.cpp gui/SettingsDialog.h
+                gui/NavigationSidebar.cpp gui/NavigationSidebar.h
                 gui/ThemeManager.cpp gui/ThemeManager.h)
         target_sources(main_window_tests PRIVATE ../resources/app.qrc)
         target_link_libraries(main_window_tests PRIVATE

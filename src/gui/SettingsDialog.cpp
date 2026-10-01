@@ -1,4 +1,5 @@
 #include "SettingsDialog.h"
+#include "NavigationSidebar.h"
 #include "ThemeManager.h"
 #include "core/ApiModelClient.h"
 #include "core/AppInfo.h"
@@ -11,7 +12,7 @@
 #include <QDialogButtonBox>
 #include <QFileDialog>
 #include <QFormLayout>
-#include <QGroupBox>
+#include <QFrame>
 #include <QHBoxLayout>
 #include <QIcon>
 #include <QLabel>
@@ -50,6 +51,34 @@ QWidget *scrollPage(QWidget *content) {
     scroll->setWidget(content);
     return scroll;
 }
+QVBoxLayout *pageLayout(QWidget *page, const QString &title, const QString &summary) {
+    page->setProperty("role", "settingsPage");
+    auto layout = new QVBoxLayout(page);
+    layout->setContentsMargins(28, 28, 28, 24);
+    layout->setSpacing(16);
+    layout->addWidget(description(title, page, "pageTitle"));
+    if (!summary.isEmpty()) layout->addWidget(description(summary, page));
+    return layout;
+}
+QFrame *settingsCard(QWidget *parent, const QString &title = {}, const QString &summary = {}) {
+    auto card = new QFrame(parent);
+    card->setProperty("role", "settingsCard");
+    auto layout = new QVBoxLayout(card);
+    layout->setContentsMargins(20, 18, 20, 18);
+    layout->setSpacing(12);
+    if (!title.isEmpty()) layout->addWidget(description(title, card, "cardTitle"));
+    if (!summary.isEmpty()) layout->addWidget(description(summary, card));
+    return card;
+}
+QFormLayout *settingsForm() {
+    auto form = new QFormLayout;
+    form->setHorizontalSpacing(16);
+    form->setVerticalSpacing(12);
+    form->setRowWrapPolicy(QFormLayout::WrapLongRows);
+    form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+    form->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    return form;
+}
 }
 
 SettingsDialog::SettingsDialog(QWidget *parent, const QString &settingsFile)
@@ -58,46 +87,73 @@ SettingsDialog::SettingsDialog(QWidget *parent, const QString &settingsFile)
     setObjectName(QStringLiteral("settingsDialog"));
     setWindowTitle(tr("设置 · 光剑曲谱制作"));
     const auto screen = QApplication::primaryScreen();
-    const QSize available = screen ? screen->availableGeometry().size() - QSize(50, 80) : QSize(940, 690);
-    resize(qMin(940, available.width()), qMin(690, available.height()));
+    const QSize available = screen ? screen->availableGeometry().size() - QSize(50, 80) : QSize(1080, 740);
+    resize(qMin(1080, available.width()), qMin(740, available.height()));
     setMinimumSize(qMin(760, available.width()), qMin(500, available.height()));
     QString loadError;
     m_preferences = m_store.load(&loadError);
     m_savedTheme = ThemeManager::mode();
 
     auto outer = new QVBoxLayout(this);
-    outer->setContentsMargins(20, 18, 20, 16);
-    outer->setSpacing(14);
-    auto title = description(tr("设置"), this, "title");
-    outer->addWidget(title);
-    outer->addWidget(description(tr("调整外观、AI 连接与网络，查看应用信息。"), this));
+    outer->setContentsMargins(0, 0, 0, 0);
+    outer->setSpacing(0);
+    auto header = new QWidget(this);
+    header->setObjectName(QStringLiteral("settingsHeader"));
+    auto headerLayout = new QHBoxLayout(header);
+    headerLayout->setContentsMargins(24, 16, 24, 16);
+    headerLayout->setSpacing(12);
+    auto appIcon = new QLabel(header);
+    appIcon->setPixmap(QIcon(QStringLiteral(":/icons/app.png")).pixmap(32, 32));
+    appIcon->setFixedSize(32, 32);
+    headerLayout->addWidget(appIcon);
+    auto appName = description(AppInfo::name(), header, "settingsAppName");
+    appName->setObjectName(QStringLiteral("settingsAppName"));
+    headerLayout->addWidget(appName);
+    headerLayout->addStretch();
+    auto caption = description(tr("偏好设置"), header, "settingsCaption");
+    caption->setObjectName(QStringLiteral("settingsCaption"));
+    headerLayout->addWidget(caption);
+    outer->addWidget(header);
     auto body = new QHBoxLayout;
-    body->setSpacing(18);
-    m_navigation = new QListWidget(this);
+    body->setSpacing(0);
+    auto sidebar = new NavigationSidebar(this);
+    sidebar->setObjectName(QStringLiteral("settingsSidebar"));
+    m_navigation = sidebar->listWidget();
     m_navigation->setObjectName(QStringLiteral("settingsNavigation"));
-    m_navigation->setFixedWidth(145);
-    m_navigation->addItems({tr("外观"), tr("大语言模型"), tr("账号授权"), tr("网络"), tr("关于")});
+    sidebar->addItem(tr("外观"), NavigationIcon::Appearance);
+    sidebar->addItem(tr("大语言模型"), NavigationIcon::Model);
+    sidebar->addItem(tr("账号授权"), NavigationIcon::Account);
+    sidebar->addItem(tr("网络"), NavigationIcon::Network);
+    sidebar->addItem(tr("关于"), NavigationIcon::About);
     m_pages = new QStackedWidget(this);
+    m_pages->setObjectName(QStringLiteral("settingsPages"));
     m_pages->addWidget(scrollPage(buildAppearancePage()));
     m_pages->addWidget(scrollPage(buildModelPage()));
     m_pages->addWidget(scrollPage(buildAccountPage()));
     m_pages->addWidget(scrollPage(buildNetworkPage()));
     m_pages->addWidget(scrollPage(buildAboutPage()));
-    body->addWidget(m_navigation);
+    body->addWidget(sidebar);
     body->addWidget(m_pages, 1);
     outer->addLayout(body, 1);
-    m_saveStatus = description(loadError, this, loadError.isEmpty() ? "muted" : "warning");
+    auto footer = new QWidget(this);
+    footer->setObjectName(QStringLiteral("settingsFooter"));
+    auto footerLayout = new QHBoxLayout(footer);
+    footerLayout->setContentsMargins(24, 14, 24, 14);
+    footerLayout->setSpacing(16);
+    m_saveStatus = description(loadError, footer, loadError.isEmpty() ? "muted" : "warning");
     m_saveStatus->setObjectName(QStringLiteral("settingsSaveStatus"));
-    outer->addWidget(m_saveStatus);
-    auto buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Apply | QDialogButtonBox::Cancel, this);
+    footerLayout->addWidget(m_saveStatus, 1);
+    auto buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Apply | QDialogButtonBox::Cancel, footer);
     buttons->setObjectName(QStringLiteral("settingsButtons"));
     buttons->button(QDialogButtonBox::Save)->setText(tr("保存并关闭"));
     buttons->button(QDialogButtonBox::Apply)->setText(tr("应用"));
     buttons->button(QDialogButtonBox::Cancel)->setText(tr("取消"));
+    buttons->button(QDialogButtonBox::Save)->setProperty("role", "primary");
     connect(buttons, &QDialogButtonBox::accepted, this, [this] { if (savePreferences()) accept(); });
     connect(buttons->button(QDialogButtonBox::Apply), &QPushButton::clicked, this, [this] { savePreferences(); });
     connect(buttons, &QDialogButtonBox::rejected, this, &SettingsDialog::reject);
-    outer->addWidget(buttons);
+    footerLayout->addWidget(buttons);
+    outer->addWidget(footer);
 
     connect(m_navigation, &QListWidget::currentRowChanged, this, [this](int row) {
         m_pages->setCurrentIndex(row);
@@ -165,56 +221,68 @@ SettingsDialog::~SettingsDialog() { m_api->cancel(); m_codex->stop(); }
 
 QWidget *SettingsDialog::buildAppearancePage() {
     auto page = new QWidget;
-    auto layout = new QVBoxLayout(page);
-    layout->setContentsMargins(4, 4, 12, 4);
-    layout->setSpacing(16);
-    layout->addWidget(description(tr("外观"), page, "title"));
-    layout->addWidget(description(tr("主题会立即预览；点击应用或保存后，下次启动会沿用。取消会恢复上次应用的主题。"), page));
-    auto group = new QGroupBox(tr("主题模式"), page);
-    auto form = new QFormLayout(group);
+    auto layout = pageLayout(page, tr("外观"), tr("选择适合工作环境的配色，让编辑更舒适。"));
+    auto group = settingsCard(page);
+    auto row = new QHBoxLayout;
+    row->setSpacing(24);
+    auto copy = new QVBoxLayout;
+    copy->setSpacing(6);
+    copy->addWidget(description(tr("界面主题"), group, "cardTitle"));
+    copy->addWidget(description(tr("网格、时间轴和轨道预览同步切换。"), group));
+    row->addLayout(copy, 1);
     m_theme = new QComboBox(group);
     m_theme->setObjectName(QStringLiteral("themeMode"));
     m_theme->addItem(tr("跟随系统"), QStringLiteral("system"));
     m_theme->addItem(tr("浅色"), QStringLiteral("light"));
     m_theme->addItem(tr("深色"), QStringLiteral("dark"));
     m_theme->setCurrentIndex(qMax(0, m_theme->findData(m_preferences.themeMode)));
-    form->addRow(tr("界面主题"), m_theme);
-    form->addRow(description(tr("编辑网格、波形时间轴和轨道预览也会同步切换。"), group));
+    m_theme->setAccessibleName(tr("界面主题"));
+    m_theme->setMinimumWidth(168);
+    row->addWidget(m_theme);
+    qobject_cast<QVBoxLayout *>(group->layout())->addLayout(row);
     connect(m_theme, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this] {
         ThemeManager::apply(m_theme->currentData().toString());
     });
     layout->addWidget(group);
-    layout->addWidget(description(tr("方块的红蓝颜色、切割箭头和选中标记保留一致，便于辨认左右手。"), page));
+    auto editor = settingsCard(page, tr("编辑器配色"), tr("方块的红蓝颜色、切割箭头和选中标记保留一致，便于辨认左右手。"));
+    auto legend = new QHBoxLayout;
+    legend->setSpacing(24);
+    legend->addWidget(description(tr("● 左手 · 红色"), editor, "error"));
+    legend->addWidget(description(tr("● 右手 · 蓝色"), editor, "link"));
+    legend->addStretch();
+    qobject_cast<QVBoxLayout *>(editor->layout())->addLayout(legend);
+    layout->addWidget(editor);
+    layout->addWidget(description(tr("主题会立即预览。点击应用或保存后，下次启动会沿用；取消会恢复上次应用的主题。"), page));
     layout->addStretch();
     return page;
 }
 
 QWidget *SettingsDialog::buildModelPage() {
     auto page = new QWidget;
-    auto layout = new QVBoxLayout(page);
-    layout->setContentsMargins(4, 4, 12, 4);
-    layout->setSpacing(12);
-    layout->addWidget(description(tr("大语言模型"), page, "title"));
-    auto connectionForm = new QFormLayout;
-    m_connection = new QComboBox(page);
+    auto layout = pageLayout(page, tr("大语言模型"), tr("选择连接方式，配置提供商与可用模型。"));
+    auto connectionCard = settingsCard(page, tr("连接方式"));
+    auto connectionForm = settingsForm();
+    m_connection = new QComboBox(connectionCard);
     m_connection->setObjectName(QStringLiteral("aiConnection"));
     m_connection->addItem(tr("API Key · OpenAI 兼容协议"), QStringLiteral("api"));
     m_connection->addItem(tr("Codex · ChatGPT 账号授权"), QStringLiteral("codex"));
     m_connection->setCurrentIndex(qMax(0, m_connection->findData(m_preferences.aiConnection)));
     connectionForm->addRow(tr("使用方式"), m_connection);
-    layout->addLayout(connectionForm);
+    qobject_cast<QVBoxLayout *>(connectionCard->layout())->addLayout(connectionForm);
+    layout->addWidget(connectionCard);
     m_connectionPages = new QStackedWidget(page);
     auto apiPage = new QWidget;
     auto apiLayout = new QVBoxLayout(apiPage);
     apiLayout->setContentsMargins(0, 0, 0, 0);
-    apiLayout->setSpacing(12);
-    auto form = new QFormLayout;
-    form->setSpacing(10);
-    m_provider = new QComboBox(apiPage);
+    apiLayout->setSpacing(16);
+    auto apiCard = settingsCard(apiPage, tr("API 配置"));
+    auto apiCardLayout = qobject_cast<QVBoxLayout *>(apiCard->layout());
+    auto form = settingsForm();
+    m_provider = new QComboBox(apiCard);
     m_provider->setObjectName(QStringLiteral("aiProvider"));
     for (const auto &preset : AppSettings::providerPresets()) m_provider->addItem(preset.name, preset.id);
     form->addRow(tr("提供商"), m_provider);
-    auto urlRow = new QWidget(apiPage);
+    auto urlRow = new QWidget(apiCard);
     auto urlLayout = new QHBoxLayout(urlRow);
     urlLayout->setContentsMargins(0, 0, 0, 0);
     m_baseUrl = new QLineEdit(urlRow);
@@ -225,7 +293,7 @@ QWidget *SettingsDialog::buildModelPage() {
     urlLayout->addWidget(m_baseUrl, 1);
     urlLayout->addWidget(resetUrl);
     form->addRow(tr("API 地址"), urlRow);
-    auto keyRow = new QWidget(apiPage);
+    auto keyRow = new QWidget(apiCard);
     auto keyLayout = new QHBoxLayout(keyRow);
     keyLayout->setContentsMargins(0, 0, 0, 0);
     m_apiKey = new QLineEdit(keyRow);
@@ -239,45 +307,48 @@ QWidget *SettingsDialog::buildModelPage() {
     keyLayout->addWidget(showKey);
     keyLayout->addWidget(clearKey);
     form->addRow(tr("API Key"), keyRow);
-    m_models = new QComboBox(apiPage);
+    m_models = new QComboBox(apiCard);
     m_models->setObjectName(QStringLiteral("aiModel"));
     m_models->setEditable(true);
     m_models->setInsertPolicy(QComboBox::NoInsert);
     m_models->lineEdit()->setPlaceholderText(tr("获取后选择，或手动输入模型名"));
     form->addRow(tr("模型"), m_models);
-    apiLayout->addLayout(form);
-    apiLayout->addWidget(description(tr("填入密钥后离开输入框，会自动读取模型。每个提供商的地址、密钥与模型分别保存。"), apiPage));
+    apiCardLayout->addLayout(form);
+    apiCardLayout->addWidget(description(tr("填入密钥后离开输入框，会自动读取模型。每个提供商的地址、密钥与模型分别保存。"), apiCard));
     auto fetchRow = new QHBoxLayout;
-    m_fetchModels = new QPushButton(tr("获取模型 / 检查连接"), apiPage);
+    m_fetchModels = new QPushButton(tr("获取模型 / 检查连接"), apiCard);
     m_fetchModels->setObjectName(QStringLiteral("fetchApiModels"));
-    m_cancelFetch = new QPushButton(tr("取消读取"), apiPage);
+    m_cancelFetch = new QPushButton(tr("取消读取"), apiCard);
     m_cancelFetch->setObjectName(QStringLiteral("cancelApiModels"));
     m_cancelFetch->hide();
     fetchRow->addWidget(m_fetchModels);
     fetchRow->addWidget(m_cancelFetch);
     fetchRow->addStretch();
-    apiLayout->addLayout(fetchRow);
-    m_apiStatus = description(tr("选择提供商，填入 API Key。"), apiPage);
+    apiCardLayout->addLayout(fetchRow);
+    m_apiStatus = description(tr("选择提供商，填入 API Key。"), apiCard);
     m_apiStatus->setObjectName(QStringLiteral("apiConnectionStatus"));
-    apiLayout->addWidget(m_apiStatus);
-    m_providerLink = description({}, apiPage);
+    apiCardLayout->addWidget(m_apiStatus);
+    m_providerLink = description({}, apiCard);
     m_providerLink->setOpenExternalLinks(true);
-    apiLayout->addWidget(m_providerLink);
+    apiCardLayout->addWidget(m_providerLink);
+    apiLayout->addWidget(apiCard);
     apiLayout->addStretch();
     m_connectionPages->addWidget(apiPage);
     auto accountPage = new QWidget;
     auto accountLayout = new QVBoxLayout(accountPage);
     accountLayout->setContentsMargins(0, 0, 0, 0);
-    accountLayout->addWidget(description(tr("使用已授权的 ChatGPT 账号及其可用 Codex 模型。"), accountPage));
-    auto configure = new QPushButton(tr("配置 Codex 账号授权"), accountPage);
-    accountLayout->addWidget(configure, 0, Qt::AlignLeft);
+    auto accountCard = settingsCard(accountPage, tr("ChatGPT 账号"), tr("使用已授权的 ChatGPT 账号及其可用 Codex 模型。"));
+    auto configure = new QPushButton(tr("配置 Codex 账号授权"), accountCard);
+    qobject_cast<QVBoxLayout *>(accountCard->layout())->addWidget(configure, 0, Qt::AlignLeft);
+    accountLayout->addWidget(accountCard);
     connect(configure, &QPushButton::clicked, this, [this] { m_navigation->setCurrentRow(2); });
     accountLayout->addStretch();
     m_connectionPages->addWidget(accountPage);
     m_connectionPages->setCurrentIndex(m_connection->currentIndex());
     connect(m_connection, QOverload<int>::of(&QComboBox::currentIndexChanged), m_connectionPages, &QStackedWidget::setCurrentIndex);
-    layout->addWidget(m_connectionPages, 1);
+    layout->addWidget(m_connectionPages);
     layout->addWidget(description(tr("当前完成连接与模型配置，自动制谱将在后续接入。Windows 会为当前用户加密保存 API Key；设置不会进入歌曲工程或导出包。"), page));
+    layout->addStretch();
     connect(m_provider, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this] {
         if (!m_loadingProvider) selectProvider(m_provider->currentData().toString());
     });
@@ -317,13 +388,11 @@ QWidget *SettingsDialog::buildModelPage() {
 
 QWidget *SettingsDialog::buildAccountPage() {
     auto page = new QWidget;
-    auto layout = new QVBoxLayout(page);
-    layout->setContentsMargins(4, 4, 12, 4);
-    layout->setSpacing(12);
-    layout->addWidget(description(tr("Codex 账号授权"), page, "title"));
-    layout->addWidget(description(tr("通过 Codex 的官方登录流程连接 ChatGPT 账号。授权和续期由 Codex 管理，可读取账号状态与模型列表。"), page));
-    auto form = new QFormLayout;
-    auto executable = new QWidget(page);
+    auto layout = pageLayout(page, tr("账号授权"), tr("通过 Codex 的官方登录流程连接 ChatGPT 账号，读取授权状态与模型。"));
+    auto account = settingsCard(page, tr("Codex 账号"));
+    auto accountLayout = qobject_cast<QVBoxLayout *>(account->layout());
+    auto form = settingsForm();
+    auto executable = new QWidget(account);
     auto executableLayout = new QHBoxLayout(executable);
     executableLayout->setContentsMargins(0, 0, 0, 0);
     m_codexPath = new QLineEdit(executable);
@@ -334,36 +403,37 @@ QWidget *SettingsDialog::buildAccountPage() {
     executableLayout->addWidget(m_codexPath, 1);
     executableLayout->addWidget(browse);
     form->addRow(tr("Codex 程序"), executable);
-    m_codexModels = new QComboBox(page);
+    m_codexModels = new QComboBox(account);
     m_codexModels->setObjectName(QStringLiteral("codexModel"));
     m_codexModels->setEditable(true);
     m_codexModels->setInsertPolicy(QComboBox::NoInsert);
     m_codexModels->lineEdit()->setPlaceholderText(tr("授权后获取，或手动填写模型名"));
     m_codexModels->setEditText(m_preferences.codexModel);
     form->addRow(tr("账号模型"), m_codexModels);
-    layout->addLayout(form);
+    accountLayout->addLayout(form);
     auto actions = new QHBoxLayout;
-    auto check = new QPushButton(tr("检查授权"), page);
+    auto check = new QPushButton(tr("检查授权"), account);
     check->setObjectName(QStringLiteral("checkCodexAccount"));
-    m_login = new QPushButton(tr("使用 ChatGPT 登录"), page);
+    m_login = new QPushButton(tr("使用 ChatGPT 登录"), account);
     m_login->setObjectName(QStringLiteral("loginCodexAccount"));
-    m_cancelLogin = new QPushButton(tr("取消授权"), page);
+    m_cancelLogin = new QPushButton(tr("取消授权"), account);
     m_cancelLogin->hide();
     actions->addWidget(check);
     actions->addWidget(m_login);
     actions->addWidget(m_cancelLogin);
     actions->addStretch();
-    layout->addLayout(actions);
-    auto fetch = new QPushButton(tr("获取账号模型"), page);
+    accountLayout->addLayout(actions);
+    auto fetch = new QPushButton(tr("获取账号模型"), account);
     fetch->setObjectName(QStringLiteral("fetchCodexModels"));
-    layout->addWidget(fetch, 0, Qt::AlignLeft);
-    m_accountStatus = description(tr("打开本页后自动检查本机 Codex 授权。"), page);
+    accountLayout->addWidget(fetch, 0, Qt::AlignLeft);
+    m_accountStatus = description(tr("打开本页后自动检查本机 Codex 授权。"), account);
     m_accountStatus->setObjectName(QStringLiteral("codexAccountStatus"));
-    layout->addWidget(m_accountStatus);
-    m_loginLink = description({}, page);
+    accountLayout->addWidget(m_accountStatus);
+    m_loginLink = description({}, account);
     m_loginLink->setOpenExternalLinks(true);
     m_loginLink->hide();
-    layout->addWidget(m_loginLink);
+    accountLayout->addWidget(m_loginLink);
+    layout->addWidget(account);
     layout->addWidget(description(tr("需要本机安装 Codex CLI。已有账号授权可直接使用；登录状态保存在 Codex 自己的凭据存储中。取消本窗口不会退出已有账号。"), page));
     auto documentation = description(tr("<a href=\"https://developers.openai.com/codex/app-server\">官方接入文档</a> · <a href=\"https://github.com/openai/codex\">Codex 开源项目</a>"), page);
     documentation->setOpenExternalLinks(true);
@@ -393,14 +463,10 @@ QWidget *SettingsDialog::buildAccountPage() {
 
 QWidget *SettingsDialog::buildNetworkPage() {
     auto page = new QWidget;
-    auto layout = new QVBoxLayout(page);
-    layout->setContentsMargins(4, 4, 12, 4);
-    layout->setSpacing(16);
-    layout->addWidget(description(tr("网络"), page, "title"));
-    layout->addWidget(description(tr("默认自动配置，也可指定 HTTP 代理。当前配置用于 AI 连接；点击应用或保存后，下次启动会沿用。"), page));
-    auto group = new QGroupBox(tr("代理设置"), page);
-    auto groupLayout = new QVBoxLayout(group);
-    auto modeForm = new QFormLayout;
+    auto layout = pageLayout(page, tr("网络"), tr("配置 AI 连接使用的网络代理。"));
+    auto group = settingsCard(page, tr("代理设置"), tr("默认使用系统代理，也可指定 HTTP 代理。"));
+    auto groupLayout = qobject_cast<QVBoxLayout *>(group->layout());
+    auto modeForm = settingsForm();
     m_proxyMode = new QComboBox(group);
     m_proxyMode->setObjectName(QStringLiteral("networkProxyMode"));
     m_proxyMode->addItem(tr("自动（系统代理）"), QStringLiteral("system"));
@@ -409,7 +475,8 @@ QWidget *SettingsDialog::buildNetworkPage() {
     modeForm->addRow(tr("代理模式"), m_proxyMode);
     groupLayout->addLayout(modeForm);
     m_manualProxy = new QWidget(group);
-    auto manualForm = new QFormLayout(m_manualProxy);
+    auto manualForm = settingsForm();
+    m_manualProxy->setLayout(manualForm);
     manualForm->setContentsMargins(0, 0, 0, 0);
     m_proxyHost = new QLineEdit(m_manualProxy);
     m_proxyHost->setObjectName(QStringLiteral("networkProxyHost"));
@@ -425,6 +492,7 @@ QWidget *SettingsDialog::buildNetworkPage() {
     groupLayout->addWidget(m_manualProxy);
     m_manualProxy->setEnabled(m_proxyMode->currentData().toString() == QStringLiteral("manual"));
     layout->addWidget(group);
+    layout->addWidget(description(tr("点击应用或保存后，下次启动会沿用。"), page));
     layout->addWidget(description(tr("自动模式下，API 使用系统代理，Codex 使用自身的默认网络配置。手动代理用于两种 AI 连接，本机服务保持直连。"), page));
     layout->addWidget(description(tr("打开项目主页或浏览器授权时，浏览器沿用自己的网络设置。"), page));
     layout->addStretch();
@@ -445,18 +513,22 @@ QWidget *SettingsDialog::buildNetworkPage() {
 
 QWidget *SettingsDialog::buildAboutPage() {
     auto page = new QWidget;
-    auto layout = new QVBoxLayout(page);
-    layout->setContentsMargins(4, 4, 12, 4);
-    layout->setSpacing(16);
-    layout->addWidget(description(tr("关于"), page, "title"));
+    auto layout = pageLayout(page, tr("关于"), tr("为音乐创作属于你的光剑曲谱。"));
+    auto group = settingsCard(page);
+    auto groupLayout = qobject_cast<QVBoxLayout *>(group->layout());
     auto heading = new QHBoxLayout;
-    auto icon = new QLabel(page);
+    heading->setSpacing(16);
+    auto icon = new QLabel(group);
     icon->setPixmap(QIcon(QStringLiteral(":/icons/app.png")).pixmap(64, 64));
+    icon->setFixedSize(64, 64);
     heading->addWidget(icon);
-    heading->addWidget(description(AppInfo::name(), page, "title"), 1);
-    layout->addLayout(heading);
-    auto group = new QGroupBox(tr("应用信息"), page);
-    auto form = new QFormLayout(group);
+    auto identity = new QVBoxLayout;
+    identity->setSpacing(6);
+    identity->addWidget(description(AppInfo::name(), group, "cardTitle"));
+    identity->addWidget(description(tr("Qt5 / C++ 曲谱编辑器"), group));
+    heading->addLayout(identity, 1);
+    groupLayout->addLayout(heading);
+    auto form = settingsForm();
     auto version = new QLabel(AppInfo::version(), group);
     version->setObjectName(QStringLiteral("aboutVersion"));
     version->setTextInteractionFlags(Qt::TextSelectableByMouse);
@@ -466,6 +538,7 @@ QWidget *SettingsDialog::buildAboutPage() {
     author->setTextInteractionFlags(Qt::TextSelectableByMouse);
     form->addRow(tr("作者"), author);
     form->addRow(tr("许可"), new QLabel(tr("GNU GPL 第 3 版"), group));
+    groupLayout->addLayout(form);
     layout->addWidget(group);
     auto homepage = new QPushButton(tr("打开项目主页"), page);
     homepage->setObjectName(QStringLiteral("openProjectHomepage"));

@@ -94,6 +94,137 @@ QString stylesheet(bool dark) {
         QScrollBar::handle:hover { background: @muted; }
         QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
         QToolTip { background: @control; color: @text; border: 1px solid @border; padding: 4px; }
+
+        /* Hallmark · genre modern-minimal · macrostructure navigation workbench
+           critique P4 H4 E4 S4 R5 V4: quiet surfaces and clear form hierarchy. */
+        QDialog#settingsDialog { background: @settingsWindow; }
+        QDialog#settingsDialog QWidget { background: transparent; }
+        QDialog#settingsDialog QLabel { font-size: 14px; }
+        QDialog#settingsDialog QWidget#settingsHeader {
+            background: @settingsSidebar; border-bottom: 1px solid @settingsBorder;
+        }
+        QDialog#settingsDialog QWidget#settingsSidebar {
+            background: @settingsSidebar; border-right: 1px solid @settingsBorder;
+        }
+        QDialog#settingsDialog QWidget#settingsFooter {
+            background: @settingsWindow; border-top: 1px solid @settingsBorder;
+        }
+        QDialog#settingsDialog QListWidget#settingsNavigation {
+            background: transparent; border: 0; outline: 0; padding: 0;
+        }
+        QDialog#settingsDialog QListWidget#settingsNavigation::item {
+            background: transparent; border: 0; padding: 0;
+        }
+        QDialog#settingsDialog QListWidget#settingsNavigation::item:selected {
+            background: transparent; color: @text;
+        }
+        QDialog#settingsDialog QLabel[role="pageTitle"] {
+            font-size: 26px; font-weight: 600;
+        }
+        QDialog#settingsDialog QLabel[role="cardTitle"],
+        QDialog#settingsDialog QLabel[role="settingSection"] {
+            font-size: 14px; font-weight: 600;
+        }
+        QDialog#settingsDialog QLabel#settingsAppName { font-size: 14px; font-weight: 600; }
+        QDialog#settingsDialog QLabel#settingsCaption { color: @muted; }
+        QDialog#settingsDialog QLabel[role="link"] { color: @noteBlue; }
+        QDialog#settingsDialog QFrame[role="settingsCard"] {
+            background: @settingsCard; border: 1px solid @settingsBorder; border-radius: 8px;
+        }
+        QDialog#settingsDialog QPushButton, QDialog#settingsDialog QComboBox,
+        QDialog#settingsDialog QLineEdit, QDialog#settingsDialog QSpinBox,
+        QDialog#settingsDialog QDoubleSpinBox {
+            background: @settingsWindow; border: 1px solid @settingsBorder;
+            border-radius: 5px; padding: 6px 9px; font-size: 14px;
+        }
+        QDialog#settingsDialog QPushButton:hover, QDialog#settingsDialog QComboBox:hover,
+        QDialog#settingsDialog QLineEdit:hover, QDialog#settingsDialog QSpinBox:hover,
+        QDialog#settingsDialog QDoubleSpinBox:hover {
+            background: @settingsHover;
+        }
+        QDialog#settingsDialog QPushButton:pressed,
+        QDialog#settingsDialog QPushButton:checked {
+            background: @settingsBorder; color: @text;
+        }
+        QDialog#settingsDialog QPushButton:disabled, QDialog#settingsDialog QComboBox:disabled,
+        QDialog#settingsDialog QLineEdit:disabled, QDialog#settingsDialog QSpinBox:disabled,
+        QDialog#settingsDialog QDoubleSpinBox:disabled {
+            background: @settingsSidebar; color: @disabled; border-color: @settingsBorder;
+        }
+        QDialog#settingsDialog QPushButton:focus, QDialog#settingsDialog QComboBox:focus,
+        QDialog#settingsDialog QLineEdit:focus, QDialog#settingsDialog QSpinBox:focus,
+        QDialog#settingsDialog QDoubleSpinBox:focus { border-color: @accent; }
+        QDialog#settingsDialog QComboBox { padding-right: 30px; }
+        QDialog#settingsDialog QComboBox::drop-down { width: 26px; border: 0; }
+        QDialog#settingsDialog QComboBox QLineEdit,
+        QDialog#settingsDialog QComboBox QLineEdit:focus,
+        QDialog#settingsDialog QComboBox QLineEdit:hover,
+        QDialog#settingsDialog QComboBox QLineEdit:disabled {
+            background: transparent; border: 0; border-radius: 0; padding: 0;
+        }
+        QDialog#settingsDialog QComboBox QAbstractItemView {
+            background: @settingsCard; border-color: @settingsBorder;
+        }
+        QDialog#settingsDialog QPushButton[role="primary"] {
+            background: @accent; color: @primaryText; border-color: @accent; font-weight: 600;
+        }
+        QDialog#settingsDialog QPushButton[role="primary"]:hover {
+            background: @primaryHover; border-color: @primaryHover;
+        }
+        QDialog#settingsDialog QPushButton[role="primary"]:pressed {
+            background: @primaryPressed; border-color: @primaryPressed;
+        }
+        QDialog#settingsDialog QPushButton[role="primary"]:focus {
+            border: 1px solid @text;
+        }
+        QDialog#settingsDialog QPushButton[role="primary"]:disabled {
+            background: @settingsBorder; color: @disabled; border-color: @settingsBorder;
+        }
+        QDialog#settingsDialog QToolButton#navigationToggle {
+            background: transparent; border: 1px solid transparent; border-radius: 6px; padding: 0;
+        }
+        QDialog#settingsDialog QToolButton#navigationToggle:hover { background: @settingsHover; }
+        QDialog#settingsDialog QToolButton#navigationToggle:pressed {
+            background: @settingsBorder; color: @text;
+        }
+        QDialog#settingsDialog QToolButton#navigationToggle:focus { border-color: @accent; }
+        QDialog#settingsDialog QToolButton#navigationToggle:disabled { color: @disabled; }
+        QDialog#settingsDialog QCheckBox { font-size: 14px; spacing: 8px; }
+        QDialog#settingsDialog QCheckBox::indicator {
+            width: 16px; height: 16px; background: @settingsWindow;
+            border: 1px solid @settingsBorder; border-radius: 3px;
+        }
+        QDialog#settingsDialog QCheckBox::indicator:hover,
+        QDialog#settingsDialog QCheckBox::indicator:focus { border-color: @accent; }
+        QDialog#settingsDialog QCheckBox::indicator:checked {
+            background: @accent; border-color: @accent; image: url(:/icons/check-@checkVariant.svg);
+        }
+        QDialog#settingsDialog QCheckBox::indicator:disabled {
+            background: @settingsSidebar; border-color: @settingsBorder;
+        }
+        QDialog#settingsDialog QCheckBox::indicator:checked:disabled {
+            background: @disabled; border-color: @disabled;
+        }
+        QDialog#settingsDialog QScrollBar:vertical {
+            background: transparent; width: 10px; margin: 0;
+        }
+        QDialog#settingsDialog QScrollBar:horizontal {
+            background: transparent; height: 10px; margin: 0;
+        }
+        QDialog#settingsDialog QScrollBar::handle {
+            background: @settingsBorder; border-radius: 5px; min-width: 0; min-height: 0;
+        }
+        QDialog#settingsDialog QScrollBar::handle:vertical { min-height: 32px; }
+        QDialog#settingsDialog QScrollBar::handle:horizontal { min-width: 32px; }
+        QDialog#settingsDialog QScrollBar::handle:hover { background: @settingsScrollHover; }
+        QDialog#settingsDialog QScrollBar::add-line,
+        QDialog#settingsDialog QScrollBar::sub-line {
+            background: transparent; border: 0; width: 0; height: 0;
+        }
+        QDialog#settingsDialog QScrollBar::up-arrow, QDialog#settingsDialog QScrollBar::down-arrow,
+        QDialog#settingsDialog QScrollBar::left-arrow, QDialog#settingsDialog QScrollBar::right-arrow {
+            image: none; width: 0; height: 0;
+        }
     )");
     const auto color = [&](const char *token, const char *darkColor, const char *lightColor) {
         css.replace(QString::fromLatin1(token), QString::fromLatin1(dark ? darkColor : lightColor));
@@ -114,7 +245,18 @@ QString stylesheet(bool dark) {
     color("@accent", "#42d3bd", "#168578");
     color("@base", "#121925", "#ffffff");
     color("@panel", "#202937", "#e8edf4");
+    color("@settingsWindow", "#18191c", "#f6f7f9");
+    color("@settingsSidebar", "#111214", "#eef0f3");
+    color("@settingsCard", "#232529", "#ffffff");
+    color("@settingsBorder", "#36393f", "#dce0e6");
+    color("@settingsHover", "#2d3035", "#e5e8ee");
+    color("@settingsScrollHover", "#70757d", "#a3a9b3");
+    color("@noteBlue", "#7db3ff", "#2469bb");
+    color("@primaryText", "#102724", "#ffffff");
+    color("@primaryHover", "#68dec9", "#11796d");
+    color("@primaryPressed", "#2ab9a4", "#0d675d");
     css.replace(QStringLiteral("@chevron"), dark ? QStringLiteral("chevron-dark.svg") : QStringLiteral("chevron-light.svg"));
+    css.replace(QStringLiteral("@checkVariant"), dark ? QStringLiteral("dark") : QStringLiteral("light"));
     return css;
 }
 

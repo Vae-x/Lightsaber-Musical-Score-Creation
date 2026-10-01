@@ -1,4 +1,5 @@
 #include "gui/SettingsDialog.h"
+#include "gui/NavigationSidebar.h"
 #include "gui/ThemeManager.h"
 #include "gui/EditorViews.h"
 #include "core/AppSettings.h"
@@ -12,14 +13,19 @@
 #include <QDir>
 #include <QFile>
 #include <QFont>
+#include <QFrame>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QPushButton>
+#include <QScrollArea>
+#include <QScrollBar>
 #include <QSpinBox>
+#include <QStackedWidget>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTemporaryDir>
+#include <QToolButton>
 
 class SettingsHomepageReceiver : public QObject {
     Q_OBJECT
@@ -34,6 +40,10 @@ class SettingsDialogTest : public QObject {
 private slots:
     void initTestCase() { qApp->setFont(QFont(QStringLiteral("Microsoft YaHei UI"), 9)); }
     void themePreviewCancelAndApply();
+    void navigationCollapsePreservesDraft();
+    void compactNavigationMouseAndKeyboard();
+    void responsiveSettingsLayout_data();
+    void responsiveSettingsLayout();
     void providerIsolationAndEncryptedSave();
     void fetchModelsThroughUi();
     void fetchModelsThroughManualProxy();
@@ -42,6 +52,233 @@ private slots:
     void painterViewsFollowTheme();
     void captureSettings();
 };
+
+void SettingsDialogTest::navigationCollapsePreservesDraft() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    lmsc::SettingsDialog dialog(nullptr, directory.filePath(QStringLiteral("preferences.json")));
+    dialog.show();
+    auto sidebar = dialog.findChild<lmsc::NavigationSidebar *>(QStringLiteral("settingsSidebar"));
+    auto nav = dialog.findChild<QListWidget *>(QStringLiteral("settingsNavigation"));
+    auto pages = dialog.findChild<QStackedWidget *>(QStringLiteral("settingsPages"));
+    auto toggle = dialog.findChild<QToolButton *>(QStringLiteral("navigationToggle"));
+    auto model = dialog.findChild<QComboBox *>(QStringLiteral("aiModel"));
+    auto key = dialog.findChild<QLineEdit *>(QStringLiteral("aiApiKey"));
+    auto showKey = dialog.findChild<QCheckBox *>(QStringLiteral("showApiKey"));
+    QVERIFY(sidebar && nav && pages && toggle && model && key && showKey);
+    QCOMPARE(sidebar->listWidget(), nav);
+    QVERIFY(!sidebar->isCollapsed());
+    QCOMPARE(sidebar->width(), 208);
+    QCOMPARE(toggle->toolTip(), QStringLiteral("收起导航"));
+    QCOMPARE(toggle->accessibleName(), QStringLiteral("收起导航"));
+    const QStringList pageNames = {QStringLiteral("外观"), QStringLiteral("大语言模型"),
+                                  QStringLiteral("账号授权"), QStringLiteral("网络"), QStringLiteral("关于")};
+    QCOMPARE(nav->count(), pageNames.size());
+    for (int row = 0; row < nav->count(); ++row) {
+        QCOMPARE(nav->item(row)->text(), pageNames.at(row));
+        QCOMPARE(nav->item(row)->toolTip(), pageNames.at(row));
+        QCOMPARE(nav->item(row)->data(Qt::AccessibleTextRole).toString(), pageNames.at(row));
+        QVERIFY(!nav->item(row)->icon().isNull());
+    }
+    nav->setCurrentRow(1);
+    QWidget *const modelPage = pages->currentWidget();
+    key->setText(QStringLiteral("test-only-navigation-key"));
+    model->setEditText(QStringLiteral("unsaved-navigation-model"));
+    QSignalSpy rowChanges(nav, &QListWidget::currentRowChanged);
+    QSignalSpy collapseChanges(sidebar, &lmsc::NavigationSidebar::collapsedChanged);
+    QVERIFY(rowChanges.isValid() && collapseChanges.isValid());
+
+    QTest::mouseClick(toggle, Qt::LeftButton);
+    QTRY_VERIFY(sidebar->isCollapsed());
+    QCOMPARE(sidebar->width(), 64);
+    QCOMPARE(toggle->toolTip(), QStringLiteral("展开导航"));
+    QCOMPARE(toggle->accessibleName(), QStringLiteral("展开导航"));
+    QCOMPARE(nav->currentRow(), 1);
+    QCOMPARE(pages->currentIndex(), 1);
+    QCOMPARE(pages->currentWidget(), modelPage);
+    QCOMPARE(rowChanges.count(), 0);
+    QCOMPARE(collapseChanges.count(), 1);
+    QCOMPARE(collapseChanges.at(0).at(0).toBool(), true);
+    QCOMPARE(model->currentText(), QStringLiteral("unsaved-navigation-model"));
+    QCOMPARE(key->text(), QStringLiteral("test-only-navigation-key"));
+    QCOMPARE(key->echoMode(), QLineEdit::Password);
+    QVERIFY(!showKey->isChecked());
+
+    QTest::mouseClick(toggle, Qt::LeftButton);
+    QTRY_VERIFY(!sidebar->isCollapsed());
+    QCOMPARE(sidebar->width(), 208);
+    QCOMPARE(model->currentText(), QStringLiteral("unsaved-navigation-model"));
+    QCOMPARE(key->echoMode(), QLineEdit::Password);
+    QCOMPARE(pages->currentWidget(), modelPage);
+    QCOMPARE(rowChanges.count(), 0);
+    QCOMPARE(collapseChanges.count(), 2);
+    QCOMPARE(collapseChanges.at(1).at(0).toBool(), false);
+
+    // Explicitly displaying a key is a draft state too; folding must preserve it.
+    showKey->setChecked(true);
+    sidebar->setCollapsed(true);
+    sidebar->setCollapsed(true);
+    QCOMPARE(collapseChanges.count(), 3);
+    QCOMPARE(key->echoMode(), QLineEdit::Normal);
+    QVERIFY(showKey->isChecked());
+    sidebar->setCollapsed(false);
+    QCOMPARE(key->echoMode(), QLineEdit::Normal);
+    QVERIFY(showKey->isChecked());
+    QCOMPARE(model->currentText(), QStringLiteral("unsaved-navigation-model"));
+    QCOMPARE(rowChanges.count(), 0);
+    const int eventsBeforeKeys = collapseChanges.count();
+    toggle->setFocus();
+    // Enter on the menu button must never reach QDialog's default Save button.
+    for (int keyCode : {int(Qt::Key_Return), int(Qt::Key_Enter)}) {
+        QTest::keyClick(toggle, static_cast<Qt::Key>(keyCode));
+        QVERIFY(sidebar->isCollapsed());
+        QVERIFY(dialog.isVisible());
+        sidebar->setCollapsed(false);
+    }
+    QCOMPARE(collapseChanges.count(), eventsBeforeKeys + 4);
+    QTest::keyClick(toggle, Qt::Key_Enter, Qt::KeypadModifier);
+    QVERIFY(sidebar->isCollapsed());
+    QVERIFY(dialog.isVisible());
+    QCOMPARE(rowChanges.count(), 0);
+    QVERIFY(!QFile::exists(directory.filePath(QStringLiteral("preferences.json"))));
+}
+
+void SettingsDialogTest::compactNavigationMouseAndKeyboard() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    lmsc::SettingsDialog dialog(nullptr, directory.filePath(QStringLiteral("preferences.json")));
+    dialog.show();
+    auto sidebar = dialog.findChild<lmsc::NavigationSidebar *>(QStringLiteral("settingsSidebar"));
+    auto nav = dialog.findChild<QListWidget *>(QStringLiteral("settingsNavigation"));
+    auto pages = dialog.findChild<QStackedWidget *>(QStringLiteral("settingsPages"));
+    QVERIFY(sidebar && nav && pages);
+    sidebar->setCollapsed(true);
+    QTest::qWait(30);
+    const QRect networkItem = nav->visualItemRect(nav->item(3));
+    QVERIFY(nav->viewport()->rect().contains(networkItem.center()));
+    QTest::mouseClick(nav->viewport(), Qt::LeftButton, Qt::NoModifier, networkItem.center());
+    QCOMPARE(nav->currentRow(), 3);
+    QCOMPARE(pages->currentIndex(), 3);
+    QCOMPARE(nav->currentItem()->toolTip(), QStringLiteral("网络"));
+    QCOMPARE(nav->currentItem()->data(Qt::AccessibleTextRole).toString(), QStringLiteral("网络"));
+
+    nav->setFocus();
+    QTest::keyClick(nav, Qt::Key_Down);
+    QCOMPARE(nav->currentRow(), 4);
+    QCOMPARE(pages->currentIndex(), 4);
+    QTest::keyClick(nav, Qt::Key_Up);
+    QCOMPARE(nav->currentRow(), 3);
+    QCOMPARE(pages->currentIndex(), 3);
+    sidebar->setCollapsed(false);
+    QCOMPARE(nav->currentRow(), 3);
+    QCOMPARE(pages->currentIndex(), 3);
+    QCOMPARE(nav->currentItem()->text(), QStringLiteral("网络"));
+}
+
+void SettingsDialogTest::responsiveSettingsLayout_data() {
+    QTest::addColumn<QSize>("windowSize");
+    QTest::addColumn<bool>("collapsed");
+    QTest::addColumn<QString>("themeMode");
+    for (const QSize size : {QSize(980, 690), QSize(760, 500)}) {
+        for (bool collapsed : {false, true}) {
+            for (const QString &theme : {QStringLiteral("dark"), QStringLiteral("light")}) {
+                const QByteArray name = QStringLiteral("%1x%2-%3-%4")
+                    .arg(size.width()).arg(size.height())
+                    .arg(collapsed ? QStringLiteral("compact") : QStringLiteral("expanded"), theme).toLatin1();
+                QTest::newRow(name.constData()) << size << collapsed << theme;
+            }
+        }
+    }
+}
+
+void SettingsDialogTest::responsiveSettingsLayout() {
+    QFETCH(QSize, windowSize);
+    QFETCH(bool, collapsed);
+    QFETCH(QString, themeMode);
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    lmsc::SettingsDialog dialog(nullptr, directory.filePath(QStringLiteral("preferences.json")));
+    auto sidebar = dialog.findChild<lmsc::NavigationSidebar *>(QStringLiteral("settingsSidebar"));
+    auto nav = dialog.findChild<QListWidget *>(QStringLiteral("settingsNavigation"));
+    auto pages = dialog.findChild<QStackedWidget *>(QStringLiteral("settingsPages"));
+    auto footer = dialog.findChild<QWidget *>(QStringLiteral("settingsFooter"));
+    auto buttons = dialog.findChild<QDialogButtonBox *>(QStringLiteral("settingsButtons"));
+    auto theme = dialog.findChild<QComboBox *>(QStringLiteral("themeMode"));
+    auto codexPath = dialog.findChild<QLineEdit *>(QStringLiteral("codexExecutable"));
+    QVERIFY(sidebar && nav && pages && footer && buttons && theme && codexPath);
+    // Visiting the account page must not inspect the user's installed CLI or credentials.
+    codexPath->setText(directory.filePath(QStringLiteral("unavailable-test-codex.exe")));
+    theme->setCurrentIndex(theme->findData(themeMode));
+    lmsc::ThemeManager::apply(themeMode);
+    sidebar->setCollapsed(collapsed);
+    dialog.resize(windowSize);
+    dialog.show();
+    QTest::qWait(30);
+    QCOMPARE(dialog.size(), windowSize);
+    const auto inDialog = [&dialog](QWidget *widget) {
+        return QRect(widget->mapTo(&dialog, QPoint(0, 0)), widget->size());
+    };
+    QVERIFY(dialog.rect().contains(inDialog(sidebar)));
+    QVERIFY(dialog.rect().contains(inDialog(footer)));
+    QVERIFY(inDialog(pages).bottom() < inDialog(footer).top());
+    const auto footerButtons = buttons->buttons();
+    QCOMPARE(footerButtons.size(), 3);
+    for (int index = 0; index < footerButtons.size(); ++index) {
+        auto button = footerButtons.at(index);
+        QVERIFY(button->isVisible());
+        QVERIFY(inDialog(footer).contains(inDialog(button)));
+        QVERIFY(button->width() >= button->minimumSizeHint().width());
+        for (int other = index + 1; other < footerButtons.size(); ++other)
+            QVERIFY(!inDialog(button).intersects(inDialog(footerButtons.at(other))));
+    }
+
+    for (int row = 0; row < nav->count(); ++row) {
+        nav->setCurrentRow(row);
+        QTest::qWait(10);
+        auto scroll = qobject_cast<QScrollArea *>(pages->currentWidget());
+        QVERIFY(scroll && scroll->widget());
+        auto content = scroll->widget();
+        QCOMPARE(content->property("role").toString(), QStringLiteral("settingsPage"));
+        QCOMPARE(content->width(), scroll->viewport()->width());
+        QCOMPARE(scroll->horizontalScrollBar()->maximum(), 0);
+        int cardCount = 0;
+        for (auto card : content->findChildren<QFrame *>()) {
+            if (card->property("role").toString() != QStringLiteral("settingsCard")) continue;
+            if (!card->isVisibleTo(content)) continue;
+            ++cardCount;
+            const QRect cardBounds(card->mapTo(content, QPoint(0, 0)), card->size());
+            QVERIFY(cardBounds.width() > 0 && cardBounds.height() > 0);
+            QVERIFY(cardBounds.left() >= 0 && cardBounds.right() < content->width());
+            for (auto field : card->findChildren<QWidget *>()) {
+                if (!field->isVisibleTo(card)) continue;
+                if (!qobject_cast<QLabel *>(field) && !qobject_cast<QComboBox *>(field)
+                    && !qobject_cast<QLineEdit *>(field) && !qobject_cast<QPushButton *>(field)
+                    && !qobject_cast<QSpinBox *>(field) && !qobject_cast<QCheckBox *>(field)) continue;
+                const QRect fieldBounds(field->mapTo(content, QPoint(0, 0)), field->size());
+                QVERIFY2(fieldBounds.width() > 0 && fieldBounds.left() >= cardBounds.left()
+                         && fieldBounds.right() <= cardBounds.right(), qPrintable(field->objectName()));
+            }
+        }
+        QVERIFY2(cardCount > 0, qPrintable(nav->currentItem()->text()));
+        QCOMPARE(pages->currentIndex(), row);
+        QVERIFY(inDialog(pages).bottom() < inDialog(footer).top());
+    }
+    nav->setCurrentRow(3);
+    auto proxyMode = dialog.findChild<QComboBox *>(QStringLiteral("networkProxyMode"));
+    auto proxyHost = dialog.findChild<QLineEdit *>(QStringLiteral("networkProxyHost"));
+    auto saveStatus = dialog.findChild<QLabel *>(QStringLiteral("settingsSaveStatus"));
+    QVERIFY(proxyMode && proxyHost && saveStatus);
+    proxyMode->setCurrentIndex(proxyMode->findData(QStringLiteral("manual")));
+    proxyHost->clear();
+    QTest::mouseClick(buttons->button(QDialogButtonBox::Apply), Qt::LeftButton);
+    QTest::qWait(10);
+    QVERIFY(!saveStatus->text().isEmpty());
+    QVERIFY(dialog.rect().contains(inDialog(footer)));
+    QVERIFY(inDialog(footer).contains(inDialog(saveStatus)));
+    QVERIFY(inDialog(pages).bottom() < inDialog(footer).top());
+    for (auto button : footerButtons) QVERIFY(inDialog(footer).contains(inDialog(button)));
+    QVERIFY(!QFile::exists(directory.filePath(QStringLiteral("preferences.json"))));
+}
 
 void SettingsDialogTest::themePreviewCancelAndApply() {
     QTemporaryDir directory;
@@ -289,38 +526,65 @@ void SettingsDialogTest::captureSettings() {
     if (output.isEmpty()) QSKIP("截图仅在指定核验目录时生成");
     QVERIFY(QDir().mkpath(output));
     QTemporaryDir directory;
+    QVERIFY(directory.isValid());
     lmsc::SettingsDialog dialog(nullptr, directory.filePath(QStringLiteral("preferences.json")));
+    dialog.resize(1080, 740);
     dialog.show();
     auto nav = dialog.findChild<QListWidget *>(QStringLiteral("settingsNavigation"));
     auto theme = dialog.findChild<QComboBox *>(QStringLiteral("themeMode"));
+    auto sidebar = dialog.findChild<lmsc::NavigationSidebar *>(QStringLiteral("settingsSidebar"));
+    auto key = dialog.findChild<QLineEdit *>(QStringLiteral("aiApiKey"));
+    QVERIFY(nav && theme && sidebar && key);
+    // This fresh temporary store never loads real credentials into exported screenshots.
+    QVERIFY(key->text().isEmpty());
+    QCOMPARE(key->echoMode(), QLineEdit::Password);
+    const auto capture = [&dialog, &output](const QString &fileName) {
+        QTest::qWait(80);
+        return dialog.grab().save(QDir(output).filePath(fileName));
+    };
     theme->setCurrentIndex(theme->findData(QStringLiteral("dark")));
-    nav->setCurrentRow(1);
-    QTest::qWait(100);
-    QVERIFY(dialog.grab().save(QDir(output).filePath(QStringLiteral("settings-ai-dark.png"))));
-    theme->setCurrentIndex(theme->findData(QStringLiteral("light")));
-    QTest::qWait(100);
-    QVERIFY(dialog.grab().save(QDir(output).filePath(QStringLiteral("settings-ai-light.png"))));
     nav->setCurrentRow(0);
-    QTest::qWait(50);
-    QVERIFY(dialog.grab().save(QDir(output).filePath(QStringLiteral("settings-appearance-light.png"))));
+    QVERIFY(capture(QStringLiteral("settings-appearance-dark.png")));
+    sidebar->setCollapsed(true);
+    QVERIFY(capture(QStringLiteral("settings-appearance-dark-compact.png")));
+    nav->setCurrentRow(1);
+    QVERIFY(capture(QStringLiteral("settings-ai-dark-compact.png")));
+    sidebar->setCollapsed(false);
+    QVERIFY(capture(QStringLiteral("settings-ai-dark.png")));
+    theme->setCurrentIndex(theme->findData(QStringLiteral("light")));
+    QVERIFY(capture(QStringLiteral("settings-ai-light.png")));
+    sidebar->setCollapsed(true);
+    QVERIFY(capture(QStringLiteral("settings-ai-light-compact.png")));
+    nav->setCurrentRow(0);
+    QVERIFY(capture(QStringLiteral("settings-appearance-light-compact.png")));
+    sidebar->setCollapsed(false);
+    QVERIFY(capture(QStringLiteral("settings-appearance-light.png")));
     nav->setCurrentRow(3);
-    QTest::qWait(50);
-    QVERIFY(dialog.grab().save(QDir(output).filePath(QStringLiteral("settings-network-auto-light.png"))));
+    QVERIFY(capture(QStringLiteral("settings-network-auto-light.png")));
     auto mode = dialog.findChild<QComboBox *>(QStringLiteral("networkProxyMode"));
     mode->setCurrentIndex(mode->findData(QStringLiteral("manual")));
     dialog.findChild<QLineEdit *>(QStringLiteral("networkProxyHost"))->setText(QStringLiteral("127.0.0.1"));
     dialog.findChild<QSpinBox *>(QStringLiteral("networkProxyPort"))->setValue(7890);
-    QTest::qWait(50);
-    QVERIFY(dialog.grab().save(QDir(output).filePath(QStringLiteral("settings-network-manual-light.png"))));
+    QVERIFY(capture(QStringLiteral("settings-network-manual-light.png")));
     nav->setCurrentRow(4);
-    QTest::qWait(50);
-    QVERIFY(dialog.grab().save(QDir(output).filePath(QStringLiteral("settings-about-light.png"))));
+    QVERIFY(capture(QStringLiteral("settings-about-light.png")));
     theme->setCurrentIndex(theme->findData(QStringLiteral("dark")));
-    QTest::qWait(50);
-    QVERIFY(dialog.grab().save(QDir(output).filePath(QStringLiteral("settings-about-dark.png"))));
+    QVERIFY(capture(QStringLiteral("settings-about-dark.png")));
     nav->setCurrentRow(3);
-    QTest::qWait(50);
-    QVERIFY(dialog.grab().save(QDir(output).filePath(QStringLiteral("settings-network-manual-dark.png"))));
+    QVERIFY(capture(QStringLiteral("settings-network-manual-dark.png")));
+
+    dialog.resize(760, 500);
+    for (const QString &mode : {QStringLiteral("dark"), QStringLiteral("light")}) {
+        theme->setCurrentIndex(theme->findData(mode));
+        for (bool collapsed : {false, true}) {
+            sidebar->setCollapsed(collapsed);
+            const QString suffix = collapsed ? QStringLiteral("compact") : QStringLiteral("expanded");
+            nav->setCurrentRow(0);
+            QVERIFY(capture(QStringLiteral("settings-appearance-%1-%2-760x500.png").arg(mode, suffix)));
+            nav->setCurrentRow(1);
+            QVERIFY(capture(QStringLiteral("settings-ai-%1-%2-760x500.png").arg(mode, suffix)));
+        }
+    }
 }
 
 QTEST_MAIN(SettingsDialogTest)
