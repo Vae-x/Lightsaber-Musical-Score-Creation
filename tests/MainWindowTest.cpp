@@ -1,6 +1,7 @@
 #include "gui/MainWindow.h"
 #include "gui/EditorViews.h"
 #include "core/AudioService.h"
+#include "core/MtpImportService.h"
 #include "core/ProjectStore.h"
 #include <QtTest>
 #include <QAction>
@@ -11,17 +12,21 @@
 #include <QDoubleSpinBox>
 #include <QFileDialog>
 #include <QFormLayout>
+#include <QIcon>
 #include <QJsonArray>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QMessageBox>
 #include <QMouseEvent>
 #include <QProcess>
+#include <QPixmap>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSpinBox>
 #include <QStatusBar>
 #include <QTemporaryDir>
+#include <QTextBrowser>
 #include <QTimer>
 #include <cmath>
 
@@ -70,16 +75,68 @@ class MainWindowTest : public QObject {
     Q_OBJECT
 private slots:
     void initTestCase();
+    void chineseBrandIconAndAboutLicense();
     void clickPlaceApplyUndoAndDifficulty();
     void protectedSelectionRejectsEntireDrag();
     void importMp3AndCropThroughDialogs_data();
     void importMp3AndCropThroughDialogs();
     void importDryHands();
+    void importHeadsetThroughDialog();
     void trackFramebufferUsesLoadedObjects();
 private:
     QTemporaryDir m_temp;
     QString m_song;
 };
+
+void MainWindowTest::importHeadsetThroughDialog() {
+    if (!qEnvironmentVariableIsSet("LMSC_TEST_HEADSET"))
+        QSKIP("实机检查通过 LMSC_TEST_HEADSET=1 显式启用");
+    MainWindow window;
+    window.setTestMode(true);
+    window.show();
+    auto service = window.findChild<MtpImportService *>();
+    QVERIFY(service);
+    QSignalSpy loaded(&window, &MainWindow::documentReady);
+    QSignalSpy failed(&window, &MainWindow::loadFailed);
+    bool found = false;
+    connect(service, &MtpImportService::songsListed, &window, [&](const QVector<MtpSongEntry> &) {
+        QTimer::singleShot(0, &window, [&] {
+            auto dialog = window.findChild<QDialog *>("songImportDialog");
+            if (!dialog) return;
+            auto list = dialog->findChild<QListWidget *>("mtpSongList");
+            auto import = dialog->findChild<QPushButton *>("importHeadsetSong");
+            if (list && import) {
+                for (int row = 0; row < list->count(); ++row) {
+                    if (!list->item(row)->text().contains("Dry Hands", Qt::CaseInsensitive)) continue;
+                    list->setCurrentRow(row);
+                    found = true;
+                    dialog->grab().save(QString::fromUtf8(LMSC_AUDIO_FIXTURES_DIR) + "/pico-import.png");
+                    import->click();
+                    return;
+                }
+            }
+            dialog->reject();
+        });
+    });
+    QTimer timeout;
+    timeout.setSingleShot(true);
+    connect(&timeout, &QTimer::timeout, &window, [&] {
+        if (auto dialog = window.findChild<QDialog *>("songImportDialog")) dialog->reject();
+    });
+    timeout.start(60000);
+    auto import = button(window, QStringLiteral("导入歌曲文件夹"));
+    QVERIFY(import);
+    import->click();
+    timeout.stop();
+    QVERIFY2(found, "在连接的头显中找不到 Dry Hands");
+    QTRY_COMPARE_WITH_TIMEOUT(loaded.count(), 1, 60000);
+    QCOMPARE(failed.count(), 0);
+    QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 60000);
+    QVERIFY(window.windowTitle().contains("Dry Hands", Qt::CaseInsensitive));
+    QVERIFY(objectCount(window) > 0);
+    window.grab().save(QString::fromUtf8(LMSC_AUDIO_FIXTURES_DIR) + "/pico-editor.png");
+    window.close();
+}
 
 void MainWindowTest::initTestCase() {
     QVERIFY(m_temp.isValid());
@@ -116,6 +173,72 @@ void MainWindowTest::initTestCase() {
     QVERIFY2(lmsc::ProjectStore::writeJson(QDir(m_song).filePath("Info.dat"), info, &error), qPrintable(error));
     QVERIFY2(lmsc::ProjectStore::writeJson(QDir(m_song).filePath("Expert.dat"), expert, &error), qPrintable(error));
     QVERIFY2(lmsc::ProjectStore::writeJson(QDir(m_song).filePath("ExpertPlus.dat"), expertPlus, &error), qPrintable(error));
+}
+
+void MainWindowTest::chineseBrandIconAndAboutLicense() {
+    MainWindow window; window.setTestMode(true); window.show();
+    QCOMPARE(window.windowTitle(), QStringLiteral("光剑曲谱制作"));
+    QVERIFY(!window.windowIcon().isNull());
+    const QPixmap icon = window.windowIcon().pixmap(32, 32);
+    QVERIFY(!icon.isNull());
+    QCOMPARE(icon.size(), QSize(32, 32));
+
+    QFile license(QStringLiteral(":/licenses/GPL-3.0.txt"));
+    QVERIFY(license.open(QIODevice::ReadOnly));
+    const QString officialLicense = QString::fromUtf8(license.readAll());
+    QVERIFY(officialLicense.contains(QStringLiteral("GNU GENERAL PUBLIC LICENSE")));
+    QVERIFY(officialLicense.contains(QStringLiteral("Version 3, 29 June 2007")));
+    QVERIFY(officialLicense.size() > 30000);
+    QAction *aboutAction = nullptr;
+    for (auto *action : window.findChildren<QAction *>())
+        if (action->text() == QStringLiteral("关于光剑曲谱制作")) aboutAction = action;
+    QVERIFY(aboutAction);
+
+    bool sawAbout = false;
+    bool sawLicense = false;
+    bool aboutIconPresent = false;
+    QString aboutTitle, aboutBody, displayedLicense, licenseTitle;
+    QTimer driver;
+    connect(&driver, &QTimer::timeout, &window, [&] {
+        if (!sawAbout) {
+            auto *about = window.findChild<QMessageBox *>(QStringLiteral("aboutDialog"));
+            if (!about || !about->isVisible()) return;
+            auto *showLicense = button(*about, QStringLiteral("查看 GPLv3 许可"));
+            aboutTitle = about->windowTitle();
+            aboutBody = about->text();
+            aboutIconPresent = !about->iconPixmap().isNull();
+            sawAbout = true;
+            if (showLicense) QTest::mouseClick(showLicense, Qt::LeftButton);
+            else about->reject();
+            return;
+        }
+        auto *dialog = window.findChild<QDialog *>(QStringLiteral("gplLicenseDialog"));
+        if (!dialog || !dialog->isVisible()) return;
+        auto *text = dialog->findChild<QTextBrowser *>(QStringLiteral("gplLicenseText"));
+        licenseTitle = dialog->windowTitle();
+        if (text) displayedLicense = text->toPlainText();
+        sawLicense = true;
+        driver.stop();
+        dialog->reject();
+    });
+    driver.start(10);
+    // 回归时及时关闭弹窗，避免整个界面测试被模态窗口卡住。
+    QTimer::singleShot(3000, &window, [&] {
+        driver.stop();
+        if (auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget())) dialog->reject();
+    });
+    aboutAction->trigger();
+    driver.stop();
+    QVERIFY(sawAbout);
+    QVERIFY(aboutIconPresent);
+    QCOMPARE(aboutTitle, QStringLiteral("关于光剑曲谱制作"));
+    QVERIFY(aboutBody.contains(QStringLiteral("版本 0.2.0")));
+    QVERIFY(aboutBody.contains(QStringLiteral("GNU GPL 第 3 版许可")));
+    QVERIFY(aboutBody.contains(QStringLiteral("第三方组件")));
+    QVERIFY(sawLicense);
+    QCOMPARE(licenseTitle, QStringLiteral("GNU GPL 第 3 版许可"));
+    QCOMPARE(displayedLicense.trimmed(), officialLicense.trimmed());
+    window.close();
 }
 
 void MainWindowTest::clickPlaceApplyUndoAndDifficulty() {

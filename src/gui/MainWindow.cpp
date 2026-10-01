@@ -3,6 +3,8 @@
 #include "EditorViews.h"
 #include "core/AudioService.h"
 #include "core/RhythmAnalyzer.h"
+#include "core/MtpImportService.h"
+#include "core/WorkspacePaths.h"
 #include <QtConcurrent>
 #include <QAction>
 #include <QApplication>
@@ -20,6 +22,7 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QImage>
+#include <QIcon>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -38,6 +41,8 @@
 #include <QSplitter>
 #include <QStatusBar>
 #include <QTemporaryDir>
+#include <QTabWidget>
+#include <QTextBrowser>
 #include <QTimer>
 #include <QToolBar>
 #include <QVBoxLayout>
@@ -62,14 +67,42 @@ MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent), ui(new Ui::MainWindow),
       m_document(std::make_shared<lmsc::BeatmapDocument>()),
       m_audio(new AudioService(this)), m_analyzer(new RhythmAnalyzer(this)),
+      m_mtp(new MtpImportService(this)),
       m_loader(new QFutureWatcher<DocumentLoadResult>(this)) {
     ui->setupUi(this);
+    setWindowIcon(QIcon(QStringLiteral(":/icons/app.png")));
+    lmsc::WorkspacePaths::projectsDirectory();
     const QRect available = QGuiApplication::primaryScreen()->availableGeometry();
     resize(std::min(1440, available.width() - 40), std::min(900, available.height() - 60));
     setMinimumSize(std::min(1050, available.width() - 40), std::min(660, available.height() - 60));
     buildEditor();
     buildActions();
     connectAudio();
+    connect(m_mtp, &MtpImportService::songImported, this, [this](const QString &folder) {
+        if (!m_mtpImportPending) return;
+        m_mtpImportPending = false;
+        setBusy(false);
+        openPath(folder);
+    });
+    connect(m_mtp, &MtpImportService::taskProgress, this, [this](const QString &task, int percent) {
+        if (!m_mtpImportPending) return;
+        statusBar()->showMessage(task);
+        m_progress->setRange(0, percent < 0 ? 0 : 100);
+        if (percent >= 0) m_progress->setValue(percent);
+    });
+    connect(m_mtp, &MtpImportService::errorOccurred, this, [this](const QString &error) {
+        if (!m_mtpImportPending) return;
+        m_mtpImportPending = false;
+        setBusy(false);
+        emit loadFailed(error);
+        showError(error);
+    });
+    connect(m_mtp, &MtpImportService::cancelled, this, [this] {
+        if (!m_mtpImportPending) return;
+        m_mtpImportPending = false;
+        setBusy(false);
+        statusBar()->showMessage(tr("已取消头显歌曲导入"), 8000);
+    });
     connect(m_loader, &QFutureWatcher<DocumentLoadResult>::finished, this, [this] {
         const auto result = m_loader->result();
         setBusy(false);
@@ -108,6 +141,7 @@ MainWindow::MainWindow(QWidget *parent)
 }
 
 MainWindow::~MainWindow() {
+    m_mtp->cancel();
     m_audio->cancel();
     m_analyzer->cancel();
     m_loader->waitForFinished();
@@ -139,11 +173,7 @@ void MainWindow::buildEditor() {
         connect(b, &QPushButton::clicked, this, callback);
     };
     button(tr("新歌 · MP3 / MP4"), [this] { newSong(); });
-    button(tr("导入歌曲文件夹"), [this] {
-        if (m_busy || !confirmDocumentChange()) return;
-        const QString path = QFileDialog::getExistingDirectory(this, tr("选择含 Info.dat 的歌曲目录"));
-        if (!path.isEmpty()) openPath(path);
-    });
+    button(tr("导入歌曲文件夹"), [this] { importSongFolder(); });
     button(tr("导入曲谱 ZIP"), [this] {
         if (m_busy || !confirmDocumentChange()) return;
         const QString path = QFileDialog::getOpenFileName(this, tr("导入曲谱 ZIP"), {}, tr("曲谱压缩包 (*.zip)"));
@@ -151,7 +181,8 @@ void MainWindow::buildEditor() {
     });
     button(tr("打开编辑工程"), [this] {
         if (m_busy || !confirmDocumentChange()) return;
-        const QString path = QFileDialog::getOpenFileName(this, tr("打开编辑工程"), {}, tr("编辑工程 (*.lmsc)"));
+        const QString path = QFileDialog::getOpenFileName(this, tr("打开编辑工程"),
+            lmsc::WorkspacePaths::projectsDirectory(), tr("编辑工程 (*.lmsc)"));
         if (!path.isEmpty()) openPath(path);
     });
     m_recropButton = new QPushButton(tr("重新裁剪来源 · 新建空白谱"), left);
@@ -330,6 +361,7 @@ void MainWindow::buildEditor() {
     statusBar()->addPermanentWidget(m_progress);
     statusBar()->addPermanentWidget(m_cancelButton);
     connect(m_cancelButton, &QPushButton::clicked, this, [this] {
+        if (m_mtpImportPending) { m_mtp->cancel(); return; }
         m_analyzeNew = m_newPending = m_previewPending = false;
         ++m_analysisGeneration;
         ++m_audioGeneration; m_queuedAudio = false;
@@ -355,6 +387,9 @@ void MainWindow::buildEditor() {
                   "QListWidget{background:#121925;border:1px solid #384355;}"
                   "QListWidget::item:selected{background:#355d88;color:#ffffff;}"
                   "QMenu,QMenuBar,QToolBar{background:#202937;}QMenu::item:selected{background:#355d88;}"
+                  "QTabWidget::pane{border:1px solid #384355;background:#171d28;}"
+                  "QTabBar::tab{background:#253044;color:#dae2ef;border:1px solid #41506a;padding:7px 14px;margin-right:3px;}"
+                  "QTabBar::tab:selected{background:#355d88;color:#ffffff;}"
                   "QSplitter::handle{background:#2b3648;}QLabel{background:transparent;}");
 }
 
@@ -375,11 +410,7 @@ void MainWindow::buildActions() {
         connect(a, &QAction::triggered, this, callback); return a;
     };
     action(file, tr("新歌"), QKeySequence::New, [this] { newSong(); });
-    action(file, tr("打开歌曲目录"), QKeySequence::Open, [this] {
-        if (m_busy || !confirmDocumentChange()) return;
-        const auto path = QFileDialog::getExistingDirectory(this, tr("选择歌曲目录"));
-        if (!path.isEmpty()) openPath(path);
-    });
+    action(file, tr("导入歌曲文件夹"), QKeySequence::Open, [this] { importSongFolder(); });
     action(file, tr("打开曲谱 ZIP"), QKeySequence("Ctrl+Shift+O"), [this] {
         if (m_busy || !confirmDocumentChange()) return;
         const auto path = QFileDialog::getOpenFileName(this, tr("打开曲谱 ZIP"), {}, "*.zip");
@@ -416,6 +447,7 @@ void MainWindow::buildActions() {
         if (m_audio->isPlaying()) m_audio->pause(); else if (!m_busy && isAudioReady()) m_audio->play();
     });
     auto help = menuBar()->addMenu(tr("帮助"));
+    help->addAction(tr("关于光剑曲谱制作"), this, &MainWindow::showAbout);
     help->addAction(tr("操作说明"), this, [this] {
         QMessageBox::information(this, tr("操作说明"),
             tr("导入文件夹或 ZIP → 选择难度 → 用波形定位、网格放置 → 保存工程 → 导出歌曲目录。\n\n"
@@ -424,6 +456,134 @@ void MainWindow::buildActions() {
                "高级物件与关联音符会保留并锁定，选中可查看原因。\n"
                "BPM 估计只是建议，需要试听节拍器后校准。"));
     });
+}
+
+void MainWindow::importSongFolder() {
+    if (m_busy || !confirmDocumentChange()) return;
+    QDialog dialog(this);
+    dialog.setObjectName(QStringLiteral("songImportDialog"));
+    dialog.setWindowTitle(tr("导入歌曲文件夹"));
+    dialog.resize(760, 500);
+    auto layout = new QVBoxLayout(&dialog);
+    auto tabs = new QTabWidget(&dialog);
+    layout->addWidget(tabs, 1);
+    auto computer = new QWidget(tabs);
+    auto computerLayout = new QVBoxLayout(computer);
+    auto localHint = new QLabel(tr("选择电脑中含 Info.dat 的歌曲目录。\n头显通过 USB 连接时，请使用“PICO 头显”页。"), computer);
+    localHint->setWordWrap(true);
+    computerLayout->addWidget(localHint);
+    auto chooseLocal = new QPushButton(tr("选择电脑文件夹"), computer);
+    chooseLocal->setObjectName(QStringLiteral("chooseComputerFolder"));
+    computerLayout->addWidget(chooseLocal);
+    computerLayout->addStretch();
+    tabs->addTab(computer, tr("电脑文件夹"));
+    auto headset = new QWidget(tabs);
+    auto headsetLayout = new QVBoxLayout(headset);
+    auto hint = new QLabel(tr("连接并解锁 PICO，允许 USB 文件传输。\n歌曲位置：内部共享存储空间 / SoulTopia / BeatNote / Custom\n导入时复制到电脑，保留头显中的原歌曲。"), headset);
+    hint->setWordWrap(true);
+    headsetLayout->addWidget(hint);
+    auto songs = new QListWidget(headset);
+    songs->setObjectName(QStringLiteral("mtpSongList"));
+    headsetLayout->addWidget(songs, 1);
+    auto status = new QLabel(tr("正在查找头显歌曲…"), headset);
+    status->setWordWrap(true);
+    headsetLayout->addWidget(status);
+    auto controls = new QHBoxLayout;
+    auto refresh = new QPushButton(tr("刷新头显歌曲"), headset);
+    refresh->setObjectName(QStringLiteral("refreshHeadsetSongs"));
+    auto import = new QPushButton(tr("导入选中歌曲"), headset);
+    import->setObjectName(QStringLiteral("importHeadsetSong"));
+    import->setEnabled(false);
+    controls->addWidget(refresh);
+    controls->addWidget(import);
+    headsetLayout->addLayout(controls);
+    tabs->addTab(headset, tr("PICO 头显"));
+    auto buttons = new QDialogButtonBox(QDialogButtonBox::Cancel, &dialog);
+    buttons->button(QDialogButtonBox::Cancel)->setText(tr("取消"));
+    layout->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    QString localFolder;
+    MtpSongEntry selected;
+    bool importDevice = false;
+    connect(chooseLocal, &QPushButton::clicked, &dialog, [&] {
+        localFolder = QFileDialog::getExistingDirectory(&dialog, tr("选择含 Info.dat 的歌曲目录"));
+        if (!localFolder.isEmpty()) dialog.accept();
+    });
+    connect(songs, &QListWidget::currentRowChanged, &dialog, [=](int row) {
+        import->setEnabled(row >= 0 && !m_mtp->isBusy());
+    });
+    connect(m_mtp, &MtpImportService::songsListed, &dialog, [=](const QVector<MtpSongEntry> &entries) {
+        songs->clear();
+        for (const auto &entry : entries) {
+            auto item = new QListWidgetItem(entry.name + "\n" + entry.deviceName, songs);
+            item->setData(Qt::UserRole, QVariant::fromValue(entry));
+            item->setToolTip(entry.location);
+        }
+        refresh->setEnabled(true);
+        status->setText(entries.isEmpty()
+            ? tr("没有找到歌曲。请检查头显连接、USB 文件传输授权，以及 Custom 目录。")
+            : tr("找到 %1 首歌曲，选择后导入。").arg(entries.size()));
+        if (!entries.isEmpty()) { tabs->setCurrentWidget(headset); songs->setCurrentRow(0); }
+    });
+    connect(m_mtp, &MtpImportService::errorOccurred, &dialog, [=](const QString &error) {
+        status->setText(error); refresh->setEnabled(true);
+    });
+    connect(m_mtp, &MtpImportService::cancelled, &dialog, [=] {
+        status->setText(tr("读取已取消，可重新刷新。")); refresh->setEnabled(true);
+    });
+    connect(m_mtp, &MtpImportService::taskProgress, &dialog, [=](const QString &task, int) {
+        status->setText(task);
+    });
+    auto requestList = [=] {
+        if (m_mtp->isBusy()) { status->setText(tr("正在结束上次读取，请稍后刷新。")); return; }
+        songs->clear(); import->setEnabled(false); refresh->setEnabled(false);
+        status->setText(tr("正在查找头显歌曲…")); m_mtp->listSongs();
+    };
+    connect(refresh, &QPushButton::clicked, &dialog, requestList);
+    connect(import, &QPushButton::clicked, &dialog, [&] {
+        if (m_mtp->isBusy() || !songs->currentItem()) return;
+        selected = songs->currentItem()->data(Qt::UserRole).value<MtpSongEntry>();
+        importDevice = true; dialog.accept();
+    });
+    QTimer::singleShot(0, &dialog, requestList);
+    if (dialog.exec() != QDialog::Accepted) { m_mtp->cancel(); return; }
+    if (!importDevice) { m_mtp->cancel(); openPath(localFolder); return; }
+    m_mtpImportPending = true;
+    setBusy(true, tr("正在从头显复制歌曲到电脑…"));
+    m_mtp->importSong(selected);
+}
+
+void MainWindow::showAbout() {
+    QMessageBox about(this);
+    about.setObjectName(QStringLiteral("aboutDialog"));
+    about.setWindowTitle(tr("关于光剑曲谱制作"));
+    about.setIconPixmap(QPixmap(QStringLiteral(":/icons/app.png")).scaled(96, 96, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    about.setTextFormat(Qt::RichText);
+    about.setText(tr("<h3>光剑曲谱制作</h3><p>版本 0.2.0 · Qt5 · Windows</p>"
+        "<p>VR 节奏游戏曲谱编辑工具，支持音频裁剪、试听和 PICO 头显歌曲导入。</p>"
+        "<p>本项目使用 GNU GPL 第 3 版许可。Qt、FFmpeg 等第三方组件遵循各自的许可，随包附有许可和来源说明。</p>"));
+    auto licenseButton = about.addButton(tr("查看 GPLv3 许可"), QMessageBox::ActionRole);
+    about.addButton(tr("关闭"), QMessageBox::RejectRole);
+    about.exec();
+    if (about.clickedButton() != licenseButton) return;
+    QDialog license(this);
+    license.setObjectName(QStringLiteral("gplLicenseDialog"));
+    license.setWindowTitle(tr("GNU GPL 第 3 版许可"));
+    license.resize(760, 620);
+    auto layout = new QVBoxLayout(&license);
+    auto explanation = new QLabel(tr("以下为 GNU GPL 第 3 版官方英文条款全文，保留原文。"), &license);
+    explanation->setWordWrap(true);
+    layout->addWidget(explanation);
+    auto text = new QTextBrowser(&license);
+    text->setObjectName(QStringLiteral("gplLicenseText"));
+    QFile source(QStringLiteral(":/licenses/GPL-3.0.txt"));
+    if (source.open(QIODevice::ReadOnly)) text->setPlainText(QString::fromUtf8(source.readAll()));
+    layout->addWidget(text, 1);
+    auto buttons = new QDialogButtonBox(QDialogButtonBox::Close, &license);
+    buttons->button(QDialogButtonBox::Close)->setText(tr("关闭"));
+    connect(buttons, &QDialogButtonBox::rejected, &license, &QDialog::reject);
+    layout->addWidget(buttons);
+    license.exec();
 }
 
 void MainWindow::connectAudio() {
@@ -566,7 +726,7 @@ void MainWindow::refreshDocument() {
     m_refreshing = true;
     const bool loaded = m_document->isLoaded();
     setWindowTitle((loaded ? m_document->title() + (m_document->isModified() ? " *" : "") + " — " : "")
-                   + "Lightsaber Musical Score Creation");
+                   + tr("光剑曲谱制作"));
     m_songLabel->setText(loaded ? m_document->title() : tr("打开曲谱或创建新歌"));
     const QString project = m_document->projectPath();
     m_projectLabel->setText(project.isEmpty() ? tr("工程尚未保存") : QFileInfo(project).fileName());
@@ -881,7 +1041,9 @@ bool MainWindow::saveProject(bool saveAs) {
     if (m_busy || !m_document->isLoaded()) return false;
     QString path = saveAs ? QString() : m_document->projectPath();
     if (path.isEmpty()) {
-        path = QFileDialog::getSaveFileName(this, tr("保存独立编辑工程"), safeName(m_document->title()) + ".lmsc",
+        const QString suggested = lmsc::WorkspacePaths::suggestedProjectFile(m_document->title());
+        if (suggested.isEmpty()) { showError(tr("无法创建默认工程目录，请检查磁盘空间和写入权限")); return false; }
+        path = QFileDialog::getSaveFileName(this, tr("保存独立编辑工程"), suggested,
                                            tr("编辑工程 (*.lmsc)"));
         if (path.isEmpty()) return false;
         if (!path.endsWith(".lmsc", Qt::CaseInsensitive)) path += ".lmsc";
@@ -969,6 +1131,7 @@ void MainWindow::closeEvent(QCloseEvent *event) {
     m_analyzeNew = m_newPending = false;
     ++m_analysisGeneration; ++m_audioGeneration; m_queuedAudio = false;
     m_analyzer->cancel(); m_audio->cancel(); m_audio->stop();
+    m_mtp->cancel();
     event->accept();
 }
 bool MainWindow::isAudioReady() const { return m_document->isLoaded() && !m_queuedAudio && m_audio->isReady() && !m_audio->isBusy(); }

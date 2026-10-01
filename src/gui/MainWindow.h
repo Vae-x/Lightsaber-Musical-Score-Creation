@@ -10,6 +10,7 @@
 namespace Ui { class MainWindow; }
 class AudioService;
 class RhythmAnalyzer;
+class MtpImportService;
 struct MediaInfo;
 struct RhythmEstimate;
 class TrackView;
@@ -58,6 +59,8 @@ private:
     double currentBeat() const;
     QStringList selectedIds() const;
     void newSong();
+    void importSongFolder();
+    void showAbout();
     void showNewSongDialog(const MediaInfo &info);
     void finishNewSong(const QString &output);
     void applyRhythm(const RhythmEstimate &estimate);
@@ -85,6 +88,7 @@ private:
     QSet<QString> m_selection;
     AudioService *m_audio;
     RhythmAnalyzer *m_analyzer;
+    MtpImportService *m_mtp;
     QFutureWatcher<DocumentLoadResult> *m_loader;
     TrackView *m_track;
     GridEditor *m_grid;
@@ -113,6 +117,7 @@ private:
     bool m_previewPending = false, m_inMediaDialog = false, m_creationLoad = false, m_recropPending = false, m_initializeAudio = true;
     bool m_queuedAudio = false;
     bool m_storageBusy = false, m_mediaFlow = false;
+    bool m_mtpImportPending = false;
     quint64 m_audioGeneration = 0;
     quint64 m_analysisGeneration = 0;
     QMetaObject::Connection m_rhythmConnection;

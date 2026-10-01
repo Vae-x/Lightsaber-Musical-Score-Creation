@@ -13,6 +13,10 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
 
+# 图标独立使用与 C++ 编译器同一工具链的 windres，避免其他 MinGW 抢先被找到。
+if (WIN32 AND MINGW)
+    get_filename_component(LMSC_MINGW_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+endif ()
 find_package(Qt5 5.12 REQUIRED COMPONENTS Core Widgets Multimedia Concurrent)
 
 add_library(lmsc_core STATIC
@@ -25,7 +29,9 @@ add_library(lmsc_core STATIC
         core/AudioService.cpp
         core/AudioService.h
         core/RhythmAnalyzer.cpp
-        core/RhythmAnalyzer.h)
+        core/RhythmAnalyzer.h
+        core/WorkspacePaths.cpp core/WorkspacePaths.h
+        core/MtpImportService.cpp core/MtpImportService.h)
 target_include_directories(lmsc_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(lmsc_core PUBLIC Qt5::Core Qt5::Multimedia)
 
@@ -35,7 +41,26 @@ add_executable(src WIN32
         gui/MainWindow.h
         gui/MainWindow.ui
         gui/EditorViews.cpp
-        gui/EditorViews.h)
+        gui/EditorViews.h
+        ../resources/app.qrc)
+if (WIN32)
+    if (MINGW)
+        # MinGW 7 的 windres 会错误转义带空格的 -I 路径。此资源仅依赖系统头，独立编译无需继承 Qt 包含路径。
+        set(LMSC_ICON_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/app-icon.obj")
+        set(LMSC_RESOURCE_DEBUG_FLAG)
+        if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+            set(LMSC_RESOURCE_DEBUG_FLAG -D_DEBUG)
+        endif ()
+        add_custom_command(OUTPUT "${LMSC_ICON_OBJECT}"
+                COMMAND "${LMSC_MINGW_BIN_DIR}/windres.exe" -O coff ${LMSC_RESOURCE_DEBUG_FLAG}
+                -i "${CMAKE_CURRENT_SOURCE_DIR}/../resources/windows/app.rc" -o "${LMSC_ICON_OBJECT}"
+                DEPENDS ../resources/windows/app.rc ../resources/icons/app.ico VERBATIM)
+        set_source_files_properties("${LMSC_ICON_OBJECT}" PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+        target_sources(src PRIVATE "${LMSC_ICON_OBJECT}")
+    else ()
+        target_sources(src PRIVATE ../resources/windows/app.rc)
+    endif ()
+endif ()
 target_include_directories(src PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(src
         lmsc_core
@@ -49,6 +74,13 @@ set(LMSC_AUDIO_TOOLS_DIR "${LMSC_REPOSITORY_DIR}/third_party/ffmpeg" CACHE PATH
 option(LMSC_DEPLOY_AUDIO_TOOLS "Deploy the bundled offline audio tools with the application" ON)
 
 if (WIN32 AND NOT CMAKE_CROSSCOMPILING)
+    add_custom_command(TARGET src POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:src>/tools/mtp"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${LMSC_REPOSITORY_DIR}/scripts/windows/mtp-import.ps1" "$<TARGET_FILE_DIR:src>/tools/mtp"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${LMSC_REPOSITORY_DIR}/LICENSE" "$<TARGET_FILE_DIR:src>/LICENSE"
+            COMMENT "部署头显导入工具和项目许可" VERBATIM)
     # Resolve the deployment tool from the Qt package that was actually found.
     # CMAKE_PREFIX_PATH may be empty when CLion supplies Qt5_DIR instead.
     get_target_property(QT_QMAKE_EXECUTABLE Qt5::qmake IMPORTED_LOCATION)
@@ -115,6 +147,18 @@ if (BUILD_TESTING)
     endif ()
 
     add_test(NAME core_editing COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:core_tests>")
+    add_executable(mtp_import_tests "${LMSC_REPOSITORY_DIR}/tests/MtpImportTest.cpp")
+    target_link_libraries(mtp_import_tests PRIVATE lmsc_core)
+    set_target_properties(mtp_import_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_test(NAME mtp_import_service COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:mtp_import_tests>")
+    set_tests_properties(mtp_import_service PROPERTIES TIMEOUT 60 LABELS "mtp"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_executable(workspace_paths_tests "${LMSC_REPOSITORY_DIR}/tests/WorkspacePathsTest.cpp")
+    target_link_libraries(workspace_paths_tests PRIVATE lmsc_core)
+    set_target_properties(workspace_paths_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_test(NAME workspace_paths COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:workspace_paths_tests>")
+    set_tests_properties(workspace_paths PROPERTIES TIMEOUT 60 LABELS "core"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
     set_tests_properties(core_editing PROPERTIES TIMEOUT 60 LABELS "core"
             WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
     file(GLOB LMSC_SAMPLE_PACKAGES "${LMSC_REPOSITORY_DIR}/samples/beatmaps/*.zip")
@@ -152,6 +196,7 @@ if (BUILD_TESTING)
                 "${LMSC_REPOSITORY_DIR}/tests/MainWindowTest.cpp"
                 gui/MainWindow.cpp gui/MainWindow.h gui/MainWindow.ui
                 gui/EditorViews.cpp gui/EditorViews.h)
+        target_sources(main_window_tests PRIVATE ../resources/app.qrc)
         target_link_libraries(main_window_tests PRIVATE
                 lmsc_core Qt5::Widgets Qt5::Concurrent Qt5::Test)
         target_compile_definitions(main_window_tests PRIVATE

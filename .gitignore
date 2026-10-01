@@ -3,6 +3,10 @@
 /samples/beatmaps/*
 !/samples/beatmaps/.gitkeep
 
+# Local editor projects and their self-contained media snapshots
+/projects/*
+!/projects/.gitkeep
+
 # Pinned FFmpeg binaries are restored by scripts/setup-audio-tools.ps1.
 /third_party/ffmpeg/bin/
 
