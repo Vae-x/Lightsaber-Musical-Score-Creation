@@ -1,5 +1,7 @@
 # Local Beat Saber reference packages
 /music/
+/samples/beatmaps/*
+!/samples/beatmaps/.gitkeep
 
 # Qt / CMake build outputs and local IDE settings
 /build*/
