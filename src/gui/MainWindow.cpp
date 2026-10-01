@@ -1,0 +1,1042 @@
+#include "MainWindow.h"
+#include "ui_MainWindow.h"
+#include "EditorViews.h"
+#include "core/AudioService.h"
+#include "core/RhythmAnalyzer.h"
+#include <QtConcurrent>
+#include <QAction>
+#include <QApplication>
+#include <QCheckBox>
+#include <QCloseEvent>
+#include <QComboBox>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QDir>
+#include <QDoubleSpinBox>
+#include <QEventLoop>
+#include <QFileDialog>
+#include <QFileInfo>
+#include <QFormLayout>
+#include <QGroupBox>
+#include <QHBoxLayout>
+#include <QImage>
+#include <QLabel>
+#include <QLineEdit>
+#include <QListWidget>
+#include <QMenuBar>
+#include <QMenu>
+#include <QMessageBox>
+#include <QPainter>
+#include <QProgressBar>
+#include <QPushButton>
+#include <QRegularExpression>
+#include <QScreen>
+#include <QScrollArea>
+#include <QSignalBlocker>
+#include <QSlider>
+#include <QSpinBox>
+#include <QSplitter>
+#include <QStatusBar>
+#include <QTemporaryDir>
+#include <QTimer>
+#include <QToolBar>
+#include <QVBoxLayout>
+#include <algorithm>
+#include <cmath>
+
+namespace {
+QStringList directionNames() {
+    return {QStringLiteral("↑ 上"), QStringLiteral("↓ 下"), QStringLiteral("← 左"),
+            QStringLiteral("→ 右"), QStringLiteral("↖ 左上"), QStringLiteral("↗ 右上"),
+            QStringLiteral("↙ 左下"), QStringLiteral("↘ 右下"), QStringLiteral("● 无方向")};
+}
+QString safeName(QString name) {
+    name.replace(QRegularExpression(QStringLiteral("[<>:\"/\\\\|?*\\x00-\\x1f]")), "_");
+    while (name.endsWith('.') || name.endsWith(' ')) name.chop(1);
+    return name.trimmed().isEmpty() ? QStringLiteral("MySong") : name.left(100);
+}
+struct StorageResult { bool ok = false; QString error; };
+}
+
+MainWindow::MainWindow(QWidget *parent)
+    : QMainWindow(parent), ui(new Ui::MainWindow),
+      m_document(std::make_shared<lmsc::BeatmapDocument>()),
+      m_audio(new AudioService(this)), m_analyzer(new RhythmAnalyzer(this)),
+      m_loader(new QFutureWatcher<DocumentLoadResult>(this)) {
+    ui->setupUi(this);
+    const QRect available = QGuiApplication::primaryScreen()->availableGeometry();
+    resize(std::min(1440, available.width() - 40), std::min(900, available.height() - 60));
+    setMinimumSize(std::min(1050, available.width() - 40), std::min(660, available.height() - 60));
+    buildEditor();
+    buildActions();
+    connectAudio();
+    connect(m_loader, &QFutureWatcher<DocumentLoadResult>::finished, this, [this] {
+        const auto result = m_loader->result();
+        setBusy(false);
+        if (m_discardLoad) {
+            m_discardLoad = false; m_creationLoad = false;
+            if (m_mediaFlow) { m_mediaFlow = false; restoreDocumentAudio(); }
+            return;
+        }
+        if (!result.error.isEmpty()) {
+            m_creationLoad = false;
+            if (m_mediaFlow) { m_mediaFlow = false; restoreDocumentAudio(); }
+            emit loadFailed(result.error);
+            showError(result.error);
+            return;
+        }
+        const bool created = m_creationLoad;
+        m_creationLoad = false;
+        if (created) { m_analyzeNew = true; m_mediaFlow = false; }
+        replaceDocument(result.document);
+        if (created) {
+            statusBar()->showMessage(tr("新歌已创建，正在估计节拍；保存工程后启用自动恢复"), 20000);
+            if (!m_testMode) saveProject(true);
+        }
+    });
+    m_autosave = new QTimer(this);
+    m_autosave->setInterval(30000);
+    connect(m_autosave, &QTimer::timeout, this, [this] {
+        if (m_busy || !m_document->isModified() || m_document->projectPath().isEmpty()) return;
+        // Only the JSON snapshot is written; immutable assets were copied at first save.
+        QString error;
+        if (m_document->autoSave(&error)) statusBar()->showMessage(tr("已自动保存恢复快照"), 3000);
+        else statusBar()->showMessage(tr("自动保存失败：") + error, 15000);
+    });
+    m_autosave->start();
+    refreshDocument();
+}
+
+MainWindow::~MainWindow() {
+    m_audio->cancel();
+    m_analyzer->cancel();
+    m_loader->waitForFinished();
+    delete ui;
+}
+
+void MainWindow::buildEditor() {
+    auto outer = new QVBoxLayout(ui->centralwidget);
+    outer->setContentsMargins(10, 8, 10, 6);
+    auto split = new QSplitter(Qt::Horizontal, ui->centralwidget);
+    outer->addWidget(split, 1);
+    auto leftScroll = new QScrollArea(split);
+    leftScroll->setWidgetResizable(true);
+    leftScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    leftScroll->setMinimumWidth(235); leftScroll->setMaximumWidth(285);
+    auto left = new QWidget;
+    leftScroll->setWidget(left);
+    auto leftLayout = new QVBoxLayout(left);
+    m_songLabel = new QLabel(tr("打开曲谱或创建新歌"), left);
+    m_songLabel->setWordWrap(true);
+    m_songLabel->setStyleSheet("font-size:17px;font-weight:600;color:#ecf0f7;");
+    m_projectLabel = new QLabel(tr("工程尚未保存"), left);
+    m_projectLabel->setWordWrap(true);
+    leftLayout->addWidget(m_songLabel);
+    leftLayout->addWidget(m_projectLabel);
+    auto button = [&](const QString &text, auto callback) {
+        auto b = new QPushButton(text, left);
+        leftLayout->addWidget(b);
+        connect(b, &QPushButton::clicked, this, callback);
+    };
+    button(tr("新歌 · MP3 / MP4"), [this] { newSong(); });
+    button(tr("导入歌曲文件夹"), [this] {
+        if (m_busy || !confirmDocumentChange()) return;
+        const QString path = QFileDialog::getExistingDirectory(this, tr("选择含 Info.dat 的歌曲目录"));
+        if (!path.isEmpty()) openPath(path);
+    });
+    button(tr("导入曲谱 ZIP"), [this] {
+        if (m_busy || !confirmDocumentChange()) return;
+        const QString path = QFileDialog::getOpenFileName(this, tr("导入曲谱 ZIP"), {}, tr("曲谱压缩包 (*.zip)"));
+        if (!path.isEmpty()) openPath(path);
+    });
+    button(tr("打开编辑工程"), [this] {
+        if (m_busy || !confirmDocumentChange()) return;
+        const QString path = QFileDialog::getOpenFileName(this, tr("打开编辑工程"), {}, tr("编辑工程 (*.lmsc)"));
+        if (!path.isEmpty()) openPath(path);
+    });
+    m_recropButton = new QPushButton(tr("重新裁剪来源 · 新建空白谱"), left);
+    leftLayout->addWidget(m_recropButton);
+    connect(m_recropButton, &QPushButton::clicked, this, [this] {
+        if (m_busy || !m_document->isNewSong() || !confirmDocumentChange()) return;
+        m_recropPreset = m_document->importSource();
+        if (!m_recropPreset.isAvailable()) { showError(tr("该工程没有保留原始媒体")); return; }
+        QMessageBox::information(this, tr("重新裁剪"),
+            tr("将使用工程保留的原始媒体创建另一张空白谱。原工程可继续保留；已有音符不会搬到新裁剪片段。"));
+        m_recropPending = true;
+        m_mediaFlow = true;
+        ++m_analysisGeneration;
+        m_analyzeNew = false; m_analyzer->cancel(); m_audio->cancel(); m_audio->stop();
+        setBusy(true, tr("正在读取来源音轨…"));
+        const QString source = m_recropPreset.path;
+        queueAudioTask([this, source] { m_audio->probeMedia(source); });
+    });
+    leftLayout->addWidget(new QLabel(tr("文件中可用的难度"), left));
+    m_difficulties = new QListWidget(left);
+    m_difficulties->setMinimumHeight(100);
+    leftLayout->addWidget(m_difficulties, 1);
+    connect(m_difficulties, &QListWidget::currentItemChanged, this,
+            [this](QListWidgetItem *item, QListWidgetItem *) {
+        if (!item || m_refreshing || m_busy) return;
+        QString error;
+        if (!m_document->setDifficulty(item->data(Qt::UserRole).toString(), &error)) showError(error);
+        m_selection.clear();
+        refreshDocument();
+    });
+    auto tempo = new QGroupBox(tr("节拍校准"), left);
+    auto tf = new QFormLayout(tempo);
+    m_bpm = new QDoubleSpinBox(tempo);
+    m_bpm->setRange(1, 1000);
+    m_bpm->setDecimals(3);
+    m_bpm->setValue(120);
+    m_offset = new QDoubleSpinBox(tempo);
+    m_offset->setRange(-3600, 86400);
+    m_offset->setDecimals(4);
+    m_offset->setSuffix(tr(" 秒"));
+    tf->addRow(tr("BPM"), m_bpm);
+    tf->addRow(tr("第一拍时间"), m_offset);
+    m_calibrateButton = new QPushButton(tr("应用校准"), tempo);
+    tf->addRow(m_calibrateButton);
+    connect(m_calibrateButton, &QPushButton::clicked, this, &MainWindow::calibrateTempo);
+    m_estimateButton = new QPushButton(tr("重新估计节拍"), tempo);
+    tf->addRow(m_estimateButton);
+    connect(m_estimateButton, &QPushButton::clicked, this, [this] {
+        if (!m_busy && m_document->isNewSong() && m_audio->isReady() && !m_analyzer->isBusy())
+            requestRhythmAnalysis();
+    });
+    m_analysisLabel = new QLabel(tr("已有曲谱保留原始节拍。\n新歌估拍后可在此校准。"), tempo);
+    m_analysisLabel->setWordWrap(true);
+    tf->addRow(m_analysisLabel);
+    leftLayout->addWidget(tempo);
+    m_summaryLabel = new QLabel(left);
+    m_summaryLabel->setWordWrap(true);
+    leftLayout->addWidget(m_summaryLabel);
+    auto center = new QSplitter(Qt::Vertical, split);
+    auto top = new QSplitter(Qt::Horizontal, center);
+    m_track = new TrackView(top);
+    m_grid = new GridEditor(top);
+    top->setStretchFactor(0, 3);
+    top->setStretchFactor(1, 2);
+    m_timeline = new TimelineView(center);
+    center->setStretchFactor(0, 3);
+    center->setStretchFactor(1, 2);
+    auto rightScroll = new QScrollArea(split);
+    rightScroll->setWidgetResizable(true);
+    rightScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    rightScroll->setMinimumWidth(245); rightScroll->setMaximumWidth(285);
+    auto right = new QWidget;
+    rightScroll->setWidget(right);
+    auto rl = new QVBoxLayout(right);
+    auto placement = new QGroupBox(tr("放置工具"), right);
+    auto pf = new QFormLayout(placement);
+    m_placeType = new QComboBox(placement);
+    m_placeType->addItems({tr("音符"), tr("炸弹"), tr("墙")});
+    m_placeColor = new QComboBox(placement);
+    m_placeColor->addItems({tr("左手 · 红"), tr("右手 · 蓝")});
+    m_placeDirection = new QComboBox(placement);
+    m_placeDirection->addItems(directionNames());
+    m_placeDirection->setCurrentIndex(8);
+    pf->addRow(tr("物件"), m_placeType);
+    pf->addRow(tr("颜色"), m_placeColor);
+    pf->addRow(tr("方向"), m_placeDirection);
+    rl->addWidget(placement);
+    auto updatePlacement = [this] {
+        m_grid->setPlacement(m_placeType->currentIndex(), m_placeColor->currentIndex(),
+                             m_placeDirection->currentIndex());
+        m_placeColor->setEnabled(m_placeType->currentIndex() == 0);
+        m_placeDirection->setEnabled(m_placeType->currentIndex() == 0);
+    };
+    for (auto c : {m_placeType, m_placeColor, m_placeDirection})
+        connect(c, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                [updatePlacement](int) { updatePlacement(); });
+    updatePlacement();
+    auto properties = new QGroupBox(tr("选中物件属性"), right);
+    auto ef = new QFormLayout(properties);
+    m_editBeat = new QDoubleSpinBox(properties);
+    m_editBeat->setRange(0, 1000000); m_editBeat->setDecimals(4);
+    m_editBeat->setSingleStep(0.25);
+    m_editX = new QSpinBox(properties); m_editX->setRange(0, 3);
+    m_editY = new QSpinBox(properties); m_editY->setRange(0, 2);
+    m_editColor = new QComboBox(properties); m_editColor->addItems({tr("左手 · 红"), tr("右手 · 蓝")});
+    m_editDirection = new QComboBox(properties); m_editDirection->addItems(directionNames());
+    m_editDuration = new QDoubleSpinBox(properties);
+    m_editDuration->setRange(0.001, 100000);
+    m_editDuration->setDecimals(3); m_editDuration->setValue(1);
+    m_editWidth = new QSpinBox(properties); m_editWidth->setRange(1, 4);
+    m_editHeight = new QSpinBox(properties); m_editHeight->setRange(1, 5); m_editHeight->setValue(5);
+    ef->addRow(tr("拍位置"), m_editBeat);
+    ef->addRow(tr("列 (0–3)"), m_editX); ef->addRow(tr("层 (0–2)"), m_editY);
+    ef->addRow(tr("颜色"), m_editColor); ef->addRow(tr("方向"), m_editDirection);
+    ef->addRow(tr("墙时长 / 拍"), m_editDuration);
+    ef->addRow(tr("墙宽度"), m_editWidth); ef->addRow(tr("墙高度"), m_editHeight);
+    m_applyButton = new QPushButton(tr("应用属性"), properties);
+    ef->addRow(m_applyButton);
+    connect(m_applyButton, &QPushButton::clicked, this, &MainWindow::applyProperties);
+    rl->addWidget(properties);
+    m_protectionLabel = new QLabel(tr("点击物件查看属性"), right);
+    m_protectionLabel->setWordWrap(true);
+    m_protectionLabel->setStyleSheet("color:#e9c881;");
+    rl->addWidget(m_protectionLabel);
+    auto hint = new QLabel(tr("网格：点击空格放置，点击物件选择\nCtrl：追加选择\n时间轴：拖动物件移动；空白处框选\nShift 拖动：设置循环\n滚轮：缩放；中键拖动：平移\n墙使用下方宽度、高度、时长"), right);
+    hint->setWordWrap(true);
+    hint->setStyleSheet("color:#a9b4c4;");
+    rl->addStretch(); rl->addWidget(hint);
+    split->setStretchFactor(1, 1);
+    auto transport = new QHBoxLayout;
+    m_playButton = new QPushButton(tr("▶ 播放"), ui->centralwidget);
+    auto stop = new QPushButton(tr("停止"), ui->centralwidget);
+    transport->addWidget(m_playButton); transport->addWidget(stop);
+    connect(m_playButton, &QPushButton::clicked, this, [this] {
+        if (m_audio->isPlaying()) m_audio->pause(); else if (!m_busy && isAudioReady()) m_audio->play();
+    });
+    connect(stop, &QPushButton::clicked, m_audio, &AudioService::stop);
+    m_speed = new QComboBox(ui->centralwidget);
+    for (double value : {0.5, 0.75, 1.0, 1.25, 1.5}) m_speed->addItem(QString::number(value) + "×", value);
+    m_speed->setCurrentIndex(2);
+    transport->addWidget(new QLabel(tr("速度"))); transport->addWidget(m_speed);
+    connect(m_speed, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+        if (!m_busy && isAudioReady()) m_audio->setPlaybackSpeed(m_speed->currentData().toDouble());
+    });
+    m_snap = new QComboBox(ui->centralwidget);
+    for (int value : {1, 2, 4, 8, 16}) m_snap->addItem("1/" + QString::number(value) + tr(" 拍"), value);
+    m_snap->setCurrentIndex(2);
+    transport->addWidget(new QLabel(tr("吸附"))); transport->addWidget(m_snap);
+    connect(m_snap, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+        m_timeline->setSnapDivision(m_snap->currentData().toInt());
+        m_editBeat->setSingleStep(1.0 / m_snap->currentData().toInt());
+        m_grid->setBeat(currentBeat());
+    });
+    m_loop = new QCheckBox(tr("循环"), ui->centralwidget);
+    m_metronome = new QCheckBox(tr("节拍器"), ui->centralwidget);
+    transport->addWidget(m_loop); transport->addWidget(m_metronome);
+    connect(m_loop, &QCheckBox::toggled, this, [this](bool on) {
+        m_audio->setLoop(m_loopStart, m_loopEnd, on);
+    });
+    connect(m_metronome, &QCheckBox::toggled, this, [this](bool on) {
+        m_audio->setMetronome(on, m_document->timeMap().baseBpm(), m_document->timeMap().firstBeatSeconds());
+    });
+    m_seekSlider = new QSlider(Qt::Horizontal, ui->centralwidget);
+    m_seekSlider->setRange(0, 10000);
+    transport->addWidget(m_seekSlider, 1);
+    connect(m_seekSlider, &QSlider::valueChanged, this, [this](int value) {
+        seek(m_audio->duration() * value / 10000.0);
+    });
+    m_positionLabel = new QLabel(tr("0.00 秒 · 0.00 拍"), ui->centralwidget);
+    m_positionLabel->setMinimumWidth(180);
+    transport->addWidget(m_positionLabel);
+    outer->addLayout(transport);
+    m_progress = new QProgressBar(this);
+    m_progress->setMaximumWidth(250); m_progress->setMaximumHeight(18); m_progress->hide();
+    m_cancelButton = new QPushButton(tr("取消任务"), this); m_cancelButton->hide();
+    statusBar()->addPermanentWidget(m_progress);
+    statusBar()->addPermanentWidget(m_cancelButton);
+    connect(m_cancelButton, &QPushButton::clicked, this, [this] {
+        m_analyzeNew = m_newPending = m_previewPending = false;
+        ++m_analysisGeneration;
+        ++m_audioGeneration; m_queuedAudio = false;
+        m_analyzer->cancel(); m_audio->cancel();
+        if (m_loader->isRunning()) { m_discardLoad = true; statusBar()->showMessage(tr("等待当前读取结束后取消")); }
+        else setBusy(false);
+    });
+    connect(m_grid, &GridEditor::addRequested, this, &MainWindow::addObject);
+    connect(m_grid, &GridEditor::selectionChanged, this, &MainWindow::selectObjects);
+    connect(m_track, &TrackView::selectionChanged, this, &MainWindow::selectObjects);
+    connect(m_timeline, &TimelineView::selectionChanged, this, &MainWindow::selectObjects);
+    connect(m_timeline, &TimelineView::seekRequested, this, &MainWindow::seek);
+    connect(m_timeline, &TimelineView::objectsMoveRequested, this, &MainWindow::moveObjects);
+    connect(m_timeline, &TimelineView::deleteRequested, this, &MainWindow::deleteObjects);
+    connect(m_timeline, &TimelineView::loopChanged, this, [this](double a, double b) {
+        m_loopStart = a; m_loopEnd = b; m_loop->setChecked(true); m_audio->setLoop(a, b, true);
+    });
+    setStyleSheet("QMainWindow,QWidget{background:#171d28;color:#dae2ef;font-size:13px;}"
+                  "QGroupBox{border:1px solid #384355;border-radius:5px;margin-top:9px;padding-top:9px;}"
+                  "QGroupBox::title{subcontrol-origin:margin;left:9px;}"
+                  "QPushButton,QComboBox,QSpinBox,QDoubleSpinBox,QLineEdit{background:#253044;border:1px solid #41506a;border-radius:3px;padding:4px;}"
+                  "QPushButton:hover{background:#35455e;}QPushButton:disabled{color:#69778c;}"
+                  "QListWidget{background:#121925;border:1px solid #384355;}"
+                  "QListWidget::item:selected{background:#355d88;color:#ffffff;}"
+                  "QMenu,QMenuBar,QToolBar{background:#202937;}QMenu::item:selected{background:#355d88;}"
+                  "QSplitter::handle{background:#2b3648;}QLabel{background:transparent;}");
+}
+
+bool MainWindow::editorCommandAllowed() const {
+    // Text fields keep their own editing shortcuts.
+    const QWidget *focus = QApplication::focusWidget();
+    return !m_busy && m_document->isLoaded() && !qobject_cast<const QLineEdit *>(focus)
+        && !qobject_cast<const QAbstractSpinBox *>(focus);
+}
+
+void MainWindow::buildActions() {
+    auto file = menuBar()->addMenu(tr("文件"));
+    auto edit = menuBar()->addMenu(tr("编辑"));
+    auto toolbar = addToolBar(tr("编辑操作"));
+    toolbar->setMovable(false);
+    auto action = [this](QMenu *menu, const QString &name, const QKeySequence &shortcut, auto callback) {
+        auto a = menu->addAction(name); a->setShortcut(shortcut);
+        connect(a, &QAction::triggered, this, callback); return a;
+    };
+    action(file, tr("新歌"), QKeySequence::New, [this] { newSong(); });
+    action(file, tr("打开歌曲目录"), QKeySequence::Open, [this] {
+        if (m_busy || !confirmDocumentChange()) return;
+        const auto path = QFileDialog::getExistingDirectory(this, tr("选择歌曲目录"));
+        if (!path.isEmpty()) openPath(path);
+    });
+    action(file, tr("打开曲谱 ZIP"), QKeySequence("Ctrl+Shift+O"), [this] {
+        if (m_busy || !confirmDocumentChange()) return;
+        const auto path = QFileDialog::getOpenFileName(this, tr("打开曲谱 ZIP"), {}, "*.zip");
+        if (!path.isEmpty()) openPath(path);
+    });
+    file->addSeparator();
+    m_saveAction = action(file, tr("保存工程"), QKeySequence::Save, [this] { saveProject(); });
+    action(file, tr("工程另存为"), QKeySequence::SaveAs, [this] { saveProject(true); });
+    m_exportAction = action(file, tr("导出歌曲目录"), QKeySequence("Ctrl+E"), [this] { exportSong(); });
+    file->addSeparator();
+    action(file, tr("退出"), QKeySequence("Alt+F4"), [this] { close(); });
+    m_undoAction = action(edit, tr("撤销"), QKeySequence::Undo, [this] {
+        if (editorCommandAllowed() && m_document->undo()) refreshDocument();
+    });
+    m_redoAction = action(edit, tr("重做"), QKeySequence::Redo, [this] {
+        if (editorCommandAllowed() && m_document->redo()) refreshDocument();
+    });
+    m_redoAction->setShortcuts({QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")});
+    edit->addSeparator();
+    action(edit, tr("复制物件"), QKeySequence::Copy, [this] { if (editorCommandAllowed()) copyObjects(); });
+    action(edit, tr("粘贴到当前拍"), QKeySequence::Paste, [this] { if (editorCommandAllowed()) pasteObjects(); });
+    action(edit, tr("左右镜像"), QKeySequence("Ctrl+M"), [this] { if (editorCommandAllowed()) mirrorObjects(); });
+    action(edit, tr("删除物件"), QKeySequence::Delete, [this] { if (editorCommandAllowed()) deleteObjects(); });
+    action(edit, tr("选择全部"), QKeySequence::SelectAll, [this] {
+        if (!editorCommandAllowed()) return;
+        QSet<QString> ids; for (const auto &o : m_document->objects()) ids.insert(o.id); selectObjects(ids);
+    });
+    toolbar->addAction(m_saveAction); toolbar->addAction(m_exportAction); toolbar->addSeparator();
+    toolbar->addAction(m_undoAction); toolbar->addAction(m_redoAction);
+    auto play = new QAction(tr("播放 / 暂停"), this); play->setShortcut(Qt::Key_Space);
+    addAction(play); connect(play, &QAction::triggered, this, [this] {
+        const auto focus = QApplication::focusWidget();
+        if (qobject_cast<QLineEdit *>(focus) || qobject_cast<QAbstractSpinBox *>(focus)) return;
+        if (m_audio->isPlaying()) m_audio->pause(); else if (!m_busy && isAudioReady()) m_audio->play();
+    });
+    auto help = menuBar()->addMenu(tr("帮助"));
+    help->addAction(tr("操作说明"), this, [this] {
+        QMessageBox::information(this, tr("操作说明"),
+            tr("导入文件夹或 ZIP → 选择难度 → 用波形定位、网格放置 → 保存工程 → 导出歌曲目录。\n\n"
+               "工程 .lmsc 与旁边的 assets-*、source-* 资源目录需一起保留。导出的歌曲目录由你手动复制到头显。\n"
+               "循环：时间轴 Shift 拖动；物件框选：空白处拖动。\n"
+               "高级物件与关联音符会保留并锁定，选中可查看原因。\n"
+               "BPM 估计只是建议，需要试听节拍器后校准。"));
+    });
+}
+
+void MainWindow::connectAudio() {
+    connect(m_audio, &AudioService::mediaProbed, this, &MainWindow::showNewSongDialog);
+    connect(m_audio, &AudioService::conversionFinished, this, &MainWindow::finishNewSong);
+    connect(m_audio, &AudioService::audioReady, this, [this](double duration) {
+        if (!m_storageBusy) { m_progress->hide(); m_cancelButton->hide(); }
+        if (m_inMediaDialog) {
+            if (m_previewPending) {
+                m_previewPending = false;
+                m_audio->seek(m_previewStart);
+                m_audio->setLoop(m_previewStart, m_previewEnd, true);
+                m_audio->play();
+            }
+            return;
+        }
+        m_timeline->setDuration(duration);
+        if (m_initializeAudio || m_loopEnd <= m_loopStart) m_loopEnd = duration;
+        m_initializeAudio = false;
+        m_audio->setLoop(m_loopStart, m_loopEnd, m_loop->isChecked());
+        m_playButton->setEnabled(!m_busy);
+        m_estimateButton->setEnabled(!m_busy && m_document->isNewSong() && !m_analyzer->isBusy());
+        m_speed->setEnabled(!m_busy);
+        if (m_analyzeNew) {
+            requestRhythmAnalysis();
+        }
+    });
+    connect(m_audio, &AudioService::waveformReady, this, [this](const QVector<float> &peaks) {
+        if (!m_inMediaDialog) m_timeline->setWaveform(peaks, m_audio->duration());
+    });
+    connect(m_audio, &AudioService::positionChanged, this, [this](double seconds) {
+        if (m_inMediaDialog || m_busy) return;
+        m_timeline->setPlayheadSeconds(seconds); m_track->setPlayheadSeconds(seconds);
+        m_grid->setBeat(currentBeat());
+        const double beat = m_document->timeMap().secondsToBeat(seconds);
+        m_positionLabel->setText(tr("%1 秒 · %2 拍").arg(seconds, 0, 'f', 2).arg(beat, 0, 'f', 2));
+        if (!m_seekSlider->isSliderDown()) {
+            QSignalBlocker blocker(m_seekSlider);
+            m_seekSlider->setValue(m_audio->duration() > 0 ? int(seconds / m_audio->duration() * 10000) : 0);
+        }
+        if (m_metronome->isChecked())
+            m_audio->setMetronome(true, m_document->timeMap().bpmAtBeat(beat),
+                                 m_document->timeMap().beatToSeconds(std::floor(beat)));
+    });
+    connect(m_audio, &AudioService::playbackChanged, this, [this](bool playing) {
+        m_playButton->setText(playing ? tr("Ⅱ 暂停") : tr("▶ 播放"));
+    });
+    connect(m_audio, &AudioService::playbackSpeedChanged, this, [this](double speed) {
+        QSignalBlocker blocker(m_speed);
+        const int index = m_speed->findData(speed);
+        if (index >= 0) m_speed->setCurrentIndex(index);
+    });
+    connect(m_audio, &AudioService::taskProgress, this, [this](const QString &task, int percent) {
+        if (m_storageBusy) return;
+        m_progress->show(); m_cancelButton->show();
+        m_progress->setRange(0, percent < 0 ? 0 : 100);
+        if (percent >= 0) m_progress->setValue(percent);
+        statusBar()->showMessage(task);
+        m_playButton->setEnabled(!m_busy && isAudioReady());
+        m_speed->setEnabled(!m_busy && isAudioReady());
+        if (percent == 100 && !m_audio->isBusy() && !m_busy) {
+            m_progress->hide(); m_cancelButton->hide();
+        }
+    });
+    connect(m_audio, &AudioService::errorOccurred, this, [this](const QString &error) {
+        m_newPending = m_previewPending = m_analyzeNew = false;
+        ++m_analysisGeneration;
+        setBusy(false);
+        if (m_mediaFlow && !m_inMediaDialog) { m_mediaFlow = false; restoreDocumentAudio(); }
+        showError(error);
+    });
+    connect(m_audio, &AudioService::cancelled, this, [this] {
+        if (!m_storageBusy) { m_progress->hide(); m_cancelButton->hide(); }
+        if (!m_loader->isRunning() && !m_queuedAudio) {
+            setBusy(false);
+            if (m_mediaFlow && !m_inMediaDialog) { m_mediaFlow = false; restoreDocumentAudio(); }
+        }
+    });
+    connect(m_analyzer, &RhythmAnalyzer::errorOccurred, this, [this](const QString &error) {
+        m_analyzeNew = false;
+        m_analysisLabel->setText(tr("估拍失败，可手动校准：") + error);
+    });
+}
+
+void MainWindow::openPath(const QString &input) {
+    if (m_busy) return;
+    QString path = QFileInfo(input).absoluteFilePath();
+    // The core handles folder/ZIP snapshots without changing the source.
+    if (QFileInfo(path).suffix().compare("lmsc", Qt::CaseInsensitive) == 0 && !m_testMode
+        && lmsc::BeatmapDocument::hasRecovery(path)) {
+        if (QMessageBox::question(this, tr("恢复自动保存"),
+                                  tr("该工程存在自动保存快照，是否恢复？"),
+                                  QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes)
+            path = lmsc::BeatmapDocument::recoveryPath(path);
+    }
+    m_analyzeNew = false; m_analyzer->cancel(); m_audio->cancel(); m_audio->stop();
+    ++m_analysisGeneration;
+    m_mediaFlow = false;
+    ++m_audioGeneration; m_queuedAudio = false;
+    m_creationLoad = false;
+    m_discardLoad = false;
+    setBusy(true, tr("正在读取曲谱和资源…"));
+    m_loader->setFuture(QtConcurrent::run([path] {
+        DocumentLoadResult result;
+        result.document = std::make_shared<lmsc::BeatmapDocument>();
+        const QFileInfo info(path);
+        bool ok;
+        if (info.suffix().compare("zip", Qt::CaseInsensitive) == 0 && info.isFile())
+            ok = result.document->loadZip(path, &result.error);
+        else if (info.suffix().compare("lmsc", Qt::CaseInsensitive) == 0
+                 || (info.isDir() && QFileInfo(QDir(path).filePath("project.lmsc")).isFile()))
+            ok = result.document->loadProject(path, &result.error);
+        else ok = result.document->loadSong(path, &result.error);
+        if (!ok && result.error.isEmpty()) result.error = QStringLiteral("无法读取工程或曲谱");
+        return result;
+    }));
+}
+
+void MainWindow::replaceDocument(std::shared_ptr<lmsc::BeatmapDocument> document) {
+    m_document = std::move(document);
+    m_initializeAudio = true;
+    m_selection.clear(); m_clipboard.clear(); m_loopStart = 0; m_loopEnd = 0;
+    m_loop->setChecked(false);
+    m_timeline->setWaveform({}, 0);
+    m_analysisLabel->setText(m_document->isNewSong() ? tr("试听节拍器，校准 BPM 与第一拍时间。")
+                                                   : tr("已有曲谱使用原始节拍，不改动歌曲时间参数。"));
+    refreshDocument();
+    if (!m_document->warnings().isEmpty()) {
+        statusBar()->showMessage(m_document->warnings().join("；"), 30000);
+        m_summaryLabel->setToolTip(m_document->warnings().join("\n"));
+    }
+    const QString audioPath = m_document->audioPath();
+    queueAudioTask([this, audioPath] { m_audio->loadAudio(audioPath); });
+    m_audio->setMetronome(m_metronome->isChecked(), m_document->timeMap().baseBpm(),
+                         m_document->timeMap().firstBeatSeconds());
+    emit documentReady();
+}
+
+void MainWindow::refreshDocument() {
+    m_refreshing = true;
+    const bool loaded = m_document->isLoaded();
+    setWindowTitle((loaded ? m_document->title() + (m_document->isModified() ? " *" : "") + " — " : "")
+                   + "Lightsaber Musical Score Creation");
+    m_songLabel->setText(loaded ? m_document->title() : tr("打开曲谱或创建新歌"));
+    const QString project = m_document->projectPath();
+    m_projectLabel->setText(project.isEmpty() ? tr("工程尚未保存") : QFileInfo(project).fileName());
+    m_projectLabel->setToolTip(project);
+    m_recropButton->setEnabled(!m_busy && m_document->isNewSong() && m_document->importSource().isAvailable());
+    m_difficulties->clear();
+    for (const auto &difficulty : m_document->difficulties()) {
+        auto item = new QListWidgetItem(difficulty.characteristic + " · " + difficulty.name, m_difficulties);
+        item->setData(Qt::UserRole, difficulty.id);
+        item->setToolTip(difficulty.filename + " / v" + difficulty.version);
+        if (difficulty.id == m_document->currentDifficultyId()) m_difficulties->setCurrentItem(item);
+    }
+    QVector<EditorObject> display;
+    QSet<QString> valid;
+    int protectedCount = 0;
+    for (const auto &o : m_document->objects()) {
+        EditorObject d;
+        d.id = o.id; d.type = static_cast<int>(o.kind); d.beat = o.beat;
+        d.x = o.x; d.y = o.y; d.color = o.color; d.direction = o.direction;
+        d.duration = o.duration; d.width = o.width; d.height = o.height;
+        d.locked = o.isProtected(); d.protectedReason = o.protectedReason;
+        display.append(d); valid.insert(o.id); protectedCount += d.locked ? 1 : 0;
+    }
+    m_selection.intersect(valid);
+    m_track->setObjects(display); m_grid->setObjects(display); m_timeline->setObjects(display);
+    const auto &time = m_document->timeMap();
+    m_bpm->setValue(time.baseBpm()); m_offset->setValue(time.firstBeatSeconds());
+    m_track->setTempo(time.baseBpm(), time.firstBeatSeconds());
+    m_timeline->setTempo(time.baseBpm(), time.firstBeatSeconds());
+    auto toSeconds = [this](double beat) { return m_document->timeMap().beatToSeconds(beat); };
+    auto toBeat = [this](double seconds) { return m_document->timeMap().secondsToBeat(seconds); };
+    m_track->setTimeMapping(toSeconds, toBeat); m_timeline->setTimeMapping(toSeconds, toBeat);
+    m_grid->setEnabled(loaded && m_document->readOnlyReason().isEmpty() && !m_busy);
+    m_difficulties->setEnabled(!m_busy);
+    for (QWidget *widget : QVector<QWidget *>{m_bpm, m_offset, m_calibrateButton})
+        widget->setEnabled(loaded && m_document->isNewSong() && !m_busy);
+    m_estimateButton->setEnabled(loaded && m_document->isNewSong() && m_audio->isReady() && !m_busy && !m_analyzer->isBusy());
+    m_playButton->setEnabled(isAudioReady() && !m_busy);
+    m_speed->setEnabled(isAudioReady() && !m_busy);
+    m_saveAction->setEnabled(loaded && !m_busy); m_exportAction->setEnabled(loaded && !m_busy);
+    m_undoAction->setEnabled(!m_busy && m_document->canUndo()); m_redoAction->setEnabled(!m_busy && m_document->canRedo());
+    m_summaryLabel->setText(loaded ? tr("%1 个物件 · %2 个受保护\n%3")
+          .arg(display.size()).arg(protectedCount).arg(m_document->readOnlyReason()) : tr("支持 BeatSaver v2/v3 曲谱"));
+    refreshSelection();
+    m_grid->setBeat(currentBeat());
+    m_refreshing = false;
+}
+
+void MainWindow::refreshSelection() {
+    m_track->setSelectedIds(m_selection); m_grid->setSelectedIds(m_selection);
+    m_timeline->setSelectedIds(m_selection);
+    const lmsc::BeatObject *object = nullptr;
+    if (m_selection.size() == 1)
+        for (const auto &o : m_document->objects()) if (m_selection.contains(o.id)) { object = &o; break; }
+    const bool editable = object && !object->isProtected() && m_document->readOnlyReason().isEmpty() && !m_busy;
+    for (QWidget *w : QVector<QWidget *>{m_editBeat, m_editX, m_editY, m_editColor, m_editDirection, m_applyButton})
+        w->setEnabled(editable);
+    // Wall dimensions also serve as placement defaults when nothing is selected.
+    for (QWidget *w : QVector<QWidget *>{m_editDuration, m_editWidth, m_editHeight})
+        w->setEnabled(!m_busy && (!object || (editable && object->kind == lmsc::ObjectKind::Wall)));
+    if (object) {
+        m_editBeat->setValue(object->beat); m_editX->setValue(object->x); m_editY->setValue(object->y);
+        m_editColor->setCurrentIndex(object->color); m_editDirection->setCurrentIndex(object->direction);
+        m_editColor->setEnabled(editable && object->kind == lmsc::ObjectKind::Note);
+        m_editDirection->setEnabled(editable && object->kind == lmsc::ObjectKind::Note);
+        if (object->kind == lmsc::ObjectKind::Wall) {
+            m_editDuration->setValue(object->duration); m_editWidth->setValue(object->width);
+            m_editHeight->setValue(object->height);
+        }
+        m_protectionLabel->setText(object->isProtected() ? tr("已保护：") + object->protectedReason
+                                                        : tr("已选中 1 个物件"));
+    } else m_protectionLabel->setText(m_selection.isEmpty() ? tr("点击物件查看属性")
+                              : tr("已选中 %1 个物件，可拖动、复制、镜像或删除").arg(m_selection.size()));
+    if (!m_document->readOnlyReason().isEmpty()) m_protectionLabel->setText(m_document->readOnlyReason());
+}
+
+void MainWindow::selectObjects(const QSet<QString> &ids) { m_selection = ids; refreshSelection(); }
+QStringList MainWindow::selectedIds() const { return m_selection.values(); }
+double MainWindow::currentBeat() const {
+    const double beat = m_document->timeMap().secondsToBeat(m_audio->position());
+    const int division = m_snap->currentData().toInt();
+    return std::max(0.0, std::round(beat * division) / division);
+}
+void MainWindow::seek(double seconds) {
+    if (m_busy) return;
+    m_audio->seek(seconds);
+    m_timeline->setPlayheadSeconds(seconds); m_track->setPlayheadSeconds(seconds); m_grid->setBeat(currentBeat());
+}
+void MainWindow::addObject(double beat, int x, int y) {
+    if (m_busy || !m_document->isLoaded()) return;
+    lmsc::BeatObject object;
+    object.kind = static_cast<lmsc::ObjectKind>(m_placeType->currentIndex());
+    object.beat = beat; object.x = x; object.y = y;
+    object.color = m_placeColor->currentIndex(); object.direction = m_placeDirection->currentIndex();
+    object.duration = m_editDuration->value(); object.width = m_editWidth->value(); object.height = m_editHeight->value();
+    if (object.kind == lmsc::ObjectKind::Wall && object.height == 5) object.y = 0;
+    if (object.kind == lmsc::ObjectKind::Wall && object.height == 3) object.y = 2;
+    QString error;
+    if (!m_document->addObject(object, &error)) showError(error); else refreshDocument();
+}
+void MainWindow::applyProperties() {
+    if (m_busy || m_selection.size() != 1) return;
+    for (auto object : m_document->objects()) {
+        if (!m_selection.contains(object.id)) continue;
+        object.beat = m_editBeat->value(); object.x = m_editX->value(); object.y = m_editY->value();
+        if (object.kind == lmsc::ObjectKind::Note) { object.color = m_editColor->currentIndex(); object.direction = m_editDirection->currentIndex(); }
+        if (object.kind == lmsc::ObjectKind::Wall) {
+            object.duration = m_editDuration->value(); object.width = m_editWidth->value(); object.height = m_editHeight->value();
+        }
+        QString error;
+        if (!m_document->updateObject(object, &error)) showError(error); else refreshDocument();
+        return;
+    }
+}
+void MainWindow::moveObjects(const QSet<QString> &ids, double beats, int x, int y) {
+    if (m_busy) return;
+    QVector<lmsc::BeatObject> edits;
+    for (auto object : m_document->objects()) if (ids.contains(object.id)) {
+        object.beat += beats; object.x += x; object.y += y; edits.append(object);
+    }
+    QString error;
+    if (!m_document->updateObjects(edits, &error)) showError(error); else refreshDocument();
+}
+void MainWindow::deleteObjects() {
+    if (m_busy || m_selection.isEmpty()) return;
+    QString error;
+    if (!m_document->removeObjects(selectedIds(), &error)) showError(error);
+    else { m_selection.clear(); refreshDocument(); }
+}
+void MainWindow::copyObjects() {
+    QString error;
+    auto copy = m_document->copyObjects(selectedIds(), &error);
+    if (!error.isEmpty()) showError(error);
+    else { m_clipboard = copy; statusBar()->showMessage(tr("已复制 %1 个物件").arg(copy.size()), 3000); }
+}
+void MainWindow::pasteObjects() {
+    if (m_busy || m_clipboard.isEmpty()) return;
+    double first = m_clipboard.first().beat;
+    for (const auto &o : m_clipboard) first = std::min(first, o.beat);
+    QString error;
+    if (!m_document->pasteObjects(m_clipboard, currentBeat() - first, 0, false, &error)) showError(error);
+    else refreshDocument();
+}
+void MainWindow::mirrorObjects() {
+    QString error;
+    if (!m_document->mirrorObjects(selectedIds(), &error)) showError(error); else refreshDocument();
+}
+void MainWindow::calibrateTempo() {
+    if (m_busy) return;
+    m_analyzeNew = false; m_analyzer->cancel();
+    ++m_analysisGeneration;
+    QString error;
+    if (!m_document->setNewSongTempo(m_bpm->value(), m_offset->value(), &error)) showError(error);
+    else { refreshDocument(); statusBar()->showMessage(tr("已更新节拍校准"), 5000); }
+}
+
+void MainWindow::newSong() {
+    if (m_busy || !confirmDocumentChange()) return;
+    const QString path = QFileDialog::getOpenFileName(this, tr("选择新歌音频或视频"), {},
+          tr("音乐和视频 (*.mp3 *.mp4 *.m4a *.ogg *.wav *.flac);;所有文件 (*)"));
+    if (path.isEmpty()) return;
+    m_recropPending = false;
+    m_mediaFlow = true;
+    ++m_analysisGeneration;
+    m_analyzeNew = false; m_analyzer->cancel(); m_audio->cancel(); m_audio->stop();
+    setBusy(true, tr("正在读取音轨…"));
+    queueAudioTask([this, path] { m_audio->probeMedia(path); });
+}
+
+void MainWindow::showNewSongDialog(const MediaInfo &info) {
+    setBusy(false);
+    if (info.tracks.isEmpty()) { m_mediaFlow = false; restoreDocumentAudio(); showError(tr("媒体没有可用音轨")); return; }
+    QDialog dialog(this);
+    dialog.setWindowTitle(tr("创建新歌 · 音轨与裁剪"));
+    dialog.resize(580, 490);
+    auto layout = new QVBoxLayout(&dialog);
+    auto form = new QFormLayout;
+    auto title = new QLineEdit(QFileInfo(info.path).completeBaseName(), &dialog);
+    auto artist = new QLineEdit(&dialog);
+    auto mapper = new QLineEdit("LMSC", &dialog);
+    auto cover = new QLineEdit(&dialog);
+    auto coverRow = new QWidget(&dialog); auto coverLayout = new QHBoxLayout(coverRow);
+    coverLayout->setContentsMargins(0, 0, 0, 0);
+    auto coverBrowse = new QPushButton(tr("选择"), coverRow);
+    coverLayout->addWidget(cover); coverLayout->addWidget(coverBrowse);
+    connect(coverBrowse, &QPushButton::clicked, &dialog, [&] {
+        const auto path = QFileDialog::getOpenFileName(&dialog, tr("选择封面"), {}, tr("图片 (*.png *.jpg *.jpeg)"));
+        if (!path.isEmpty()) cover->setText(path);
+    });
+    auto track = new QComboBox(&dialog);
+    for (const auto &a : info.tracks)
+        track->addItem(tr("音轨 %1 · %2 · %3 声道 %4 %5").arg(a.index).arg(a.codec).arg(a.channels).arg(a.language, a.title), a.index);
+    const double duration = info.duration > 0 ? info.duration : info.tracks.first().duration;
+    if (duration <= 0) { m_mediaFlow = false; restoreDocumentAudio(); showError(tr("无法取得媒体时长，不能可靠裁剪。")); return; }
+    auto start = new QDoubleSpinBox(&dialog), end = new QDoubleSpinBox(&dialog);
+    for (auto spin : {start, end}) { spin->setRange(0, duration); spin->setDecimals(3); spin->setSuffix(tr(" 秒")); }
+    end->setValue(duration);
+    if (m_recropPending) {
+        title->setText(m_document->title());
+        const int preset = track->findData(m_recropPreset.streamIndex);
+        if (preset >= 0) track->setCurrentIndex(preset);
+        start->setValue(std::min(duration, m_recropPreset.startSeconds));
+        end->setValue(std::min(duration, m_recropPreset.endSeconds));
+    }
+    m_recropPending = false;
+    form->addRow(tr("歌曲名"), title); form->addRow(tr("作者 / 歌手"), artist); form->addRow(tr("谱师"), mapper);
+    form->addRow(tr("封面（可选）"), coverRow); form->addRow(tr("提取音轨"), track);
+    form->addRow(tr("裁剪起点"), start); form->addRow(tr("裁剪终点"), end);
+    layout->addLayout(form);
+    auto explanation = new QLabel(tr("默认使用整首，只提取声音。导出为 Ogg/Vorbis。\n"
+            "新歌先创建一张 Standard 曲谱，使用已验证样本的 Expert 标识；\n"
+            "星穹绿洲的四档名称与映射待实机核验。自动估拍后可以手动校准。"), &dialog);
+    explanation->setWordWrap(true); layout->addWidget(explanation);
+    auto preview = new QPushButton(tr("试听所选片段"), &dialog);
+    auto stop = new QPushButton(tr("停止试听"), &dialog);
+    auto previewRow = new QHBoxLayout; previewRow->addWidget(preview); previewRow->addWidget(stop);
+    layout->addLayout(previewRow);
+    connect(preview, &QPushButton::clicked, &dialog, [&] {
+        if (end->value() <= start->value()) { showError(tr("裁剪终点必须晚于起点")); return; }
+        m_audio->cancel(); m_audio->stop();
+        m_previewStart = start->value(); m_previewEnd = end->value(); m_previewPending = true;
+        m_audio->setMetronome(false, 120, 0);
+        const int stream = track->currentData().toInt();
+        queueAudioTask([this, path = info.path, stream] { m_audio->loadAudio(path, stream); });
+    });
+    connect(stop, &QPushButton::clicked, m_audio, &AudioService::stop);
+    auto buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    buttons->button(QDialogButtonBox::Ok)->setText(tr("转换并创建"));
+    layout->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, [&] {
+        if (title->text().trimmed().isEmpty()) { showError(tr("请填写歌曲名")); return; }
+        if (end->value() <= start->value()) { showError(tr("裁剪终点必须晚于起点")); return; }
+        if (!cover->text().isEmpty() && QImage(cover->text()).isNull()) { showError(tr("无法读取封面图片")); return; }
+        dialog.accept();
+    });
+    m_inMediaDialog = true;
+    const int result = dialog.exec();
+    m_inMediaDialog = false; m_previewPending = false;
+    m_audio->stop(); m_audio->cancel(); m_progress->hide(); m_cancelButton->hide();
+    if (result != QDialog::Accepted) {
+        m_mediaFlow = false;
+        restoreDocumentAudio();
+        return;
+    }
+    m_newSettings = {title->text().trimmed(), artist->text().trimmed(), mapper->text().trimmed(),
+                     cover->text(), info.path, track->currentData().toInt(), start->value(), end->value()};
+    m_mediaTemp = std::make_unique<QTemporaryDir>();
+    if (!m_mediaTemp->isValid()) { m_mediaFlow = false; restoreDocumentAudio(); showError(tr("无法创建媒体转换临时目录")); return; }
+    m_newPending = true;
+    setBusy(true, tr("正在裁剪并转换为 Ogg…"));
+    const auto settings = m_newSettings;
+    const QString output = QDir(m_mediaTemp->path()).filePath("song.ogg");
+    queueAudioTask([this, settings, output] {
+        m_audio->convertMedia(settings.source, settings.track, settings.start, settings.end, output);
+    });
+}
+
+void MainWindow::finishNewSong(const QString &output) {
+    if (!m_newPending) return;
+    m_newPending = false;
+    QImage image(m_newSettings.cover);
+    if (image.isNull()) {
+        image = QImage(512, 512, QImage::Format_RGB32); image.fill(QColor("#1b2941"));
+        QPainter painter(&image); painter.setPen(QColor("#55b7ff"));
+        QFont font("Microsoft YaHei UI", 38, QFont::Bold); painter.setFont(font);
+        painter.drawText(image.rect().adjusted(36, 36, -36, -36), Qt::AlignCenter | Qt::TextWordWrap,
+                         m_newSettings.title.left(30));
+    } else {
+        const int side = std::min(image.width(), image.height());
+        image = image.copy((image.width() - side) / 2, (image.height() - side) / 2, side, side)
+                     .scaled(512, 512, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    }
+    const QString cover = QDir(m_mediaTemp->path()).filePath("cover.png");
+    if (!image.save(cover)) { setBusy(false); m_mediaFlow = false; restoreDocumentAudio(); showError(tr("无法保存封面")); return; }
+    m_creationLoad = true;
+    m_discardLoad = false;
+    setBusy(true, tr("正在建立工程和原媒体快照…"));
+    const auto settings = m_newSettings;
+    m_loader->setFuture(QtConcurrent::run([settings, output, cover] {
+        DocumentLoadResult result;
+        result.document = std::make_shared<lmsc::BeatmapDocument>();
+        if (!result.document->createNew(output, settings.title, 120, 0, cover, &result.error)
+            || !result.document->setNewSongMetadata(settings.title, settings.artist, settings.mapper, &result.error)
+            || !result.document->setImportSource(settings.source, settings.track, settings.start, settings.end, &result.error)) {
+            if (result.error.isEmpty()) result.error = QStringLiteral("建立新歌失败");
+        }
+        return result;
+    }));
+}
+
+void MainWindow::applyRhythm(const RhythmEstimate &estimate) {
+    if (!m_analyzeNew || !m_document->isNewSong()) return;
+    if (m_busy) {
+        const auto origin = m_document;
+        const auto generation = m_analysisGeneration;
+        QTimer::singleShot(100, this, [this, estimate, origin, generation] {
+            if (origin == m_document && generation == m_analysisGeneration) applyRhythm(estimate);
+        });
+        return;
+    }
+    m_analyzeNew = false;
+    QString error;
+    if (!m_document->setNewSongTempo(estimate.bpm, estimate.firstBeatSeconds, &error)) { showError(error); return; }
+    refreshDocument();
+    m_analysisLabel->setText(tr("建议 %1 BPM，第一拍 %2 秒\n可信度 %3% · %4\n请用节拍器试听并校准。")
+            .arg(estimate.bpm, 0, 'f', 3).arg(estimate.firstBeatSeconds, 0, 'f', 3)
+            .arg(estimate.confidence * 100, 0, 'f', 0).arg(estimate.message));
+}
+
+bool MainWindow::saveProject(bool saveAs) {
+    if (m_busy || !m_document->isLoaded()) return false;
+    QString path = saveAs ? QString() : m_document->projectPath();
+    if (path.isEmpty()) {
+        path = QFileDialog::getSaveFileName(this, tr("保存独立编辑工程"), safeName(m_document->title()) + ".lmsc",
+                                           tr("编辑工程 (*.lmsc)"));
+        if (path.isEmpty()) return false;
+        if (!path.endsWith(".lmsc", Qt::CaseInsensitive)) path += ".lmsc";
+    }
+    m_storageBusy = true;
+    setBusy(true, tr("正在保存工程与资源…"));
+    auto doc = m_document;
+    QFutureWatcher<StorageResult> watcher;
+    QEventLoop loop;
+    connect(&watcher, &QFutureWatcher<StorageResult>::finished, &loop, &QEventLoop::quit);
+    watcher.setFuture(QtConcurrent::run([doc, path] {
+        StorageResult result; result.ok = doc->saveProject(path, &result.error); return result;
+    }));
+    m_cancelButton->hide(); // Atomic save is allowed to finish.
+    loop.exec();
+    const auto result = watcher.result();
+    m_storageBusy = false;
+    setBusy(false); refreshDocument();
+    if (!result.ok) { showError(result.error); return false; }
+    statusBar()->showMessage(tr("工程已保存；每 30 秒自动保存未保存改动"), 8000);
+    return true;
+}
+
+void MainWindow::exportSong() {
+    if (m_busy || !m_document->isLoaded()) return;
+    const auto parent = QFileDialog::getExistingDirectory(this, tr("选择导出位置（将新建歌曲子目录）"));
+    if (parent.isEmpty()) return;
+    const QString base = QDir(parent).filePath(safeName(m_document->title()));
+    QString path = base;
+    int suffix = 2; while (QFileInfo::exists(path)) path = base + "-" + QString::number(suffix++);
+    m_storageBusy = true;
+    setBusy(true, tr("正在导出完整歌曲目录…"));
+    auto doc = m_document;
+    QFutureWatcher<StorageResult> watcher;
+    QEventLoop loop;
+    connect(&watcher, &QFutureWatcher<StorageResult>::finished, &loop, &QEventLoop::quit);
+    watcher.setFuture(QtConcurrent::run([doc, path] {
+        StorageResult result; result.ok = doc->exportSong(path, &result.error); return result;
+    }));
+    m_cancelButton->hide();
+    loop.exec();
+    const auto result = watcher.result();
+    m_storageBusy = false;
+    setBusy(false);
+    if (!result.ok) { showError(result.error); return; }
+    QMessageBox::information(this, tr("导出完成"),
+        tr("歌曲目录：\n%1\n\n把这个完整目录手动复制到头显的 Custom 文件夹，再在星穹绿洲中验证声音和谱面。").arg(QDir::toNativeSeparators(path)));
+}
+
+bool MainWindow::confirmDocumentChange() {
+    if (!m_document->isModified()) return true;
+    const auto answer = QMessageBox::question(this, tr("保存当前改动"),
+       tr("当前工程有未保存的改动。是否先保存？"),
+       QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel, QMessageBox::Save);
+    if (answer == QMessageBox::Cancel) return false;
+    return answer == QMessageBox::Discard || saveProject();
+}
+void MainWindow::showError(const QString &message) {
+    statusBar()->showMessage(message, 30000);
+    if (!m_testMode) QMessageBox::warning(this, tr("操作未完成"), message);
+}
+void MainWindow::setBusy(bool busy, const QString &message) {
+    if (!busy && (m_storageBusy || m_loader->isRunning())) return;
+    m_busy = busy;
+    m_saveAction->setEnabled(!busy && m_document->isLoaded());
+    m_exportAction->setEnabled(!busy && m_document->isLoaded());
+    m_difficulties->setEnabled(!busy);
+    m_grid->setEnabled(!busy && m_document->isLoaded() && m_document->readOnlyReason().isEmpty());
+    m_bpm->setEnabled(!busy && m_document->isNewSong());
+    m_offset->setEnabled(!busy && m_document->isNewSong());
+    m_calibrateButton->setEnabled(!busy && m_document->isNewSong());
+    m_estimateButton->setEnabled(!busy && m_document->isNewSong() && m_audio->isReady() && !m_analyzer->isBusy());
+    m_recropButton->setEnabled(!busy && m_document->isNewSong() && m_document->importSource().isAvailable());
+    m_playButton->setEnabled(!busy && isAudioReady());
+    m_speed->setEnabled(!busy && isAudioReady());
+    m_undoAction->setEnabled(!busy && m_document->canUndo()); m_redoAction->setEnabled(!busy && m_document->canRedo());
+    if (busy) { m_progress->setRange(0, 0); m_progress->show(); m_cancelButton->show(); }
+    else { m_progress->hide(); m_cancelButton->hide(); }
+    refreshSelection();
+    if (!message.isEmpty()) statusBar()->showMessage(message);
+}
+void MainWindow::closeEvent(QCloseEvent *event) {
+    if (m_busy) { statusBar()->showMessage(tr("请等待当前任务完成或先取消任务"), 8000); event->ignore(); return; }
+    if (!m_testMode && !confirmDocumentChange()) { event->ignore(); return; }
+    m_analyzeNew = m_newPending = false;
+    ++m_analysisGeneration; ++m_audioGeneration; m_queuedAudio = false;
+    m_analyzer->cancel(); m_audio->cancel(); m_audio->stop();
+    event->accept();
+}
+bool MainWindow::isAudioReady() const { return m_document->isLoaded() && !m_queuedAudio && m_audio->isReady() && !m_audio->isBusy(); }
+
+void MainWindow::queueAudioTask(std::function<void()> operation) {
+    const quint64 generation = ++m_audioGeneration;
+    m_queuedAudio = true;
+    m_audio->cancel();
+    auto timer = new QTimer(this);
+    timer->setInterval(25);
+    connect(timer, &QTimer::timeout, this, [this, timer, generation, operation] {
+        if (generation != m_audioGeneration) { timer->stop(); timer->deleteLater(); return; }
+        if (m_audio->isBusy()) return;
+        timer->stop(); timer->deleteLater();
+        m_queuedAudio = false;
+        operation();
+    });
+    timer->start();
+}
+
+void MainWindow::restoreDocumentAudio() {
+    if (!m_document->isLoaded()) { ++m_audioGeneration; m_queuedAudio = false; return; }
+    const QString path = m_document->audioPath();
+    queueAudioTask([this, path] { m_audio->loadAudio(path); });
+    m_audio->setMetronome(m_metronome->isChecked(), m_document->timeMap().baseBpm(),
+                         m_document->timeMap().firstBeatSeconds());
+}
+
+void MainWindow::requestRhythmAnalysis() {
+    const auto document = m_document;
+    const quint64 generation = ++m_analysisGeneration;
+    disconnect(m_rhythmConnection);
+    m_analyzeNew = true;
+    m_analyzer->cancel();
+    m_estimateButton->setEnabled(false);
+    m_analysisLabel->setText(tr("正在分析节拍…"));
+    auto timer = new QTimer(this);
+    timer->setInterval(30);
+    connect(timer, &QTimer::timeout, this, [this, timer, document, generation] {
+        if (document != m_document || generation != m_analysisGeneration || !m_analyzeNew) {
+            timer->stop(); timer->deleteLater(); return;
+        }
+        if (m_analyzer->isBusy()) return;
+        timer->stop(); timer->deleteLater();
+        m_rhythmConnection = connect(m_analyzer, &RhythmAnalyzer::analysisFinished, this,
+                                     [this, document, generation](const RhythmEstimate &estimate) {
+            if (document == m_document && generation == m_analysisGeneration) applyRhythm(estimate);
+        });
+        m_analyzer->analyze(m_audio->pcmCachePath());
+    });
+    timer->start();
+}
+
+bool MainWindow::runEditorCheck(const QString &outputFolder, QString *error) {
+    if (!m_document->isLoaded()) { *error = tr("未加载文档"); return false; }
+    const int before = m_document->objects().size();
+    lmsc::BeatObject object; object.beat = 0.125; object.x = 3; object.y = 2; object.direction = 1;
+    if (!m_document->addObject(object, error)) return false;
+    refreshDocument();
+    if (m_document->objects().size() != before + 1 || !m_document->undo()
+        || m_document->objects().size() != before || !m_document->redo()
+        || m_document->objects().size() != before + 1) { *error = tr("GUI 编辑/撤销/重做检查失败"); return false; }
+    QDir().mkpath(outputFolder);
+    if (!m_document->saveProject(QDir(outputFolder).filePath("smoke.lmsc"), error)
+        || !m_document->exportSong(QDir(outputFolder).filePath("export"), error)) return false;
+    lmsc::BeatmapDocument reopened;
+    if (!reopened.loadProject(QDir(outputFolder).filePath("smoke.lmsc"), error)
+        || reopened.objects().size() != before + 1) { if (error->isEmpty()) *error = tr("工程恢复数量不一致"); return false; }
+    refreshDocument();
+    return true;
+}
