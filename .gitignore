@@ -1,0 +1,27 @@
+# Local Beat Saber reference packages
+/music/
+
+# Qt / CMake build outputs and local IDE settings
+/build*/
+/out/
+/cmake-build-*/
+/.qt/
+/.vs/
+*.pro.user
+*.pro.user.*
+*.qmlproject.user
+*.qmlproject.user.*
+*.autosave
+.qmake.stash
+CMakeUserPresets.json
+
+# Local environments and caches
+/.venv/
+/venv/
+__pycache__/
+*.py[cod]
+
+# Local secrets
+.env
+.env.*
+!.env.example
