@@ -1,6 +1,9 @@
 #include "MainWindow.h"
 #include "ui_MainWindow.h"
 #include "EditorViews.h"
+#include "SettingsDialog.h"
+#include "ThemeManager.h"
+#include "core/AppSettings.h"
 #include "core/AudioService.h"
 #include "core/RhythmAnalyzer.h"
 #include "core/MtpImportService.h"
@@ -70,6 +73,8 @@ MainWindow::MainWindow(QWidget *parent)
       m_mtp(new MtpImportService(this)),
       m_loader(new QFutureWatcher<DocumentLoadResult>(this)) {
     ui->setupUi(this);
+    lmsc::ThemeManager::apply(lmsc::AppSettings().load().themeMode);
+    lmsc::ThemeManager::watchSystemChanges(qApp);
     setWindowIcon(QIcon(QStringLiteral(":/icons/app.png")));
     lmsc::WorkspacePaths::projectsDirectory();
     const QRect available = QGuiApplication::primaryScreen()->availableGeometry();
@@ -162,7 +167,7 @@ void MainWindow::buildEditor() {
     auto leftLayout = new QVBoxLayout(left);
     m_songLabel = new QLabel(tr("打开曲谱或创建新歌"), left);
     m_songLabel->setWordWrap(true);
-    m_songLabel->setStyleSheet("font-size:17px;font-weight:600;color:#ecf0f7;");
+    m_songLabel->setProperty("role", "title");
     m_projectLabel = new QLabel(tr("工程尚未保存"), left);
     m_projectLabel->setWordWrap(true);
     leftLayout->addWidget(m_songLabel);
@@ -305,11 +310,11 @@ void MainWindow::buildEditor() {
     rl->addWidget(properties);
     m_protectionLabel = new QLabel(tr("点击物件查看属性"), right);
     m_protectionLabel->setWordWrap(true);
-    m_protectionLabel->setStyleSheet("color:#e9c881;");
+    m_protectionLabel->setProperty("role", "warning");
     rl->addWidget(m_protectionLabel);
     auto hint = new QLabel(tr("网格：点击空格放置，点击物件选择\nCtrl：追加选择\n时间轴：拖动物件移动；空白处框选\nShift 拖动：设置循环\n滚轮：缩放；中键拖动：平移\n墙使用下方宽度、高度、时长"), right);
     hint->setWordWrap(true);
-    hint->setStyleSheet("color:#a9b4c4;");
+    hint->setProperty("role", "muted");
     rl->addStretch(); rl->addWidget(hint);
     split->setStretchFactor(1, 1);
     auto transport = new QHBoxLayout;
@@ -379,18 +384,6 @@ void MainWindow::buildEditor() {
     connect(m_timeline, &TimelineView::loopChanged, this, [this](double a, double b) {
         m_loopStart = a; m_loopEnd = b; m_loop->setChecked(true); m_audio->setLoop(a, b, true);
     });
-    setStyleSheet("QMainWindow,QWidget{background:#171d28;color:#dae2ef;font-size:13px;}"
-                  "QGroupBox{border:1px solid #384355;border-radius:5px;margin-top:9px;padding-top:9px;}"
-                  "QGroupBox::title{subcontrol-origin:margin;left:9px;}"
-                  "QPushButton,QComboBox,QSpinBox,QDoubleSpinBox,QLineEdit{background:#253044;border:1px solid #41506a;border-radius:3px;padding:4px;}"
-                  "QPushButton:hover{background:#35455e;}QPushButton:disabled{color:#69778c;}"
-                  "QListWidget{background:#121925;border:1px solid #384355;}"
-                  "QListWidget::item:selected{background:#355d88;color:#ffffff;}"
-                  "QMenu,QMenuBar,QToolBar{background:#202937;}QMenu::item:selected{background:#355d88;}"
-                  "QTabWidget::pane{border:1px solid #384355;background:#171d28;}"
-                  "QTabBar::tab{background:#253044;color:#dae2ef;border:1px solid #41506a;padding:7px 14px;margin-right:3px;}"
-                  "QTabBar::tab:selected{background:#355d88;color:#ffffff;}"
-                  "QSplitter::handle{background:#2b3648;}QLabel{background:transparent;}");
 }
 
 bool MainWindow::editorCommandAllowed() const {
@@ -440,6 +433,11 @@ void MainWindow::buildActions() {
     });
     toolbar->addAction(m_saveAction); toolbar->addAction(m_exportAction); toolbar->addSeparator();
     toolbar->addAction(m_undoAction); toolbar->addAction(m_redoAction);
+    auto settings = menuBar()->addMenu(tr("设置"));
+    auto settingsAction = action(settings, tr("偏好设置…"), QKeySequence("Ctrl+,"), [this] { showSettings(); });
+    settingsAction->setObjectName(QStringLiteral("openSettingsAction"));
+    toolbar->addSeparator();
+    toolbar->addAction(settingsAction);
     auto play = new QAction(tr("播放 / 暂停"), this); play->setShortcut(Qt::Key_Space);
     addAction(play); connect(play, &QAction::triggered, this, [this] {
         const auto focus = QApplication::focusWidget();
@@ -456,6 +454,14 @@ void MainWindow::buildActions() {
                "高级物件与关联音符会保留并锁定，选中可查看原因。\n"
                "BPM 估计只是建议，需要试听节拍器后校准。"));
     });
+}
+
+void MainWindow::showSettings() {
+    lmsc::SettingsDialog dialog(this);
+    connect(&dialog, &lmsc::SettingsDialog::preferencesChanged, this, [this] {
+        statusBar()->showMessage(tr("设置已保存"), 5000);
+    });
+    dialog.exec();
 }
 
 void MainWindow::importSongFolder() {

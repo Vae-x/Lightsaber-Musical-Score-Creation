@@ -1,4 +1,5 @@
 #include "EditorViews.h"
+#include "ThemeManager.h"
 
 #include <QKeyEvent>
 #include <QMouseEvent>
@@ -13,18 +14,27 @@
 #include <limits>
 
 namespace {
-const QColor background(18, 24, 35);
-const QColor panel(25, 33, 47);
-const QColor muted(150, 165, 187);
-const QColor gridLine(55, 68, 87);
-const QColor accent(66, 211, 189);
-const QColor selectionColor(255, 217, 94);
+QColor themedColor(const QColor &dark, const QColor &light) {
+    return lmsc::ThemeManager::isDark() ? dark : light;
+}
+QColor background() { return themedColor(QColor(18, 24, 35), QColor(248, 250, 253)); }
+QColor panel() { return themedColor(QColor(25, 33, 47), QColor(233, 239, 247)); }
+QColor muted() { return themedColor(QColor(150, 165, 187), QColor(83, 103, 129)); }
+QColor gridLine() { return themedColor(QColor(55, 68, 87), QColor(195, 208, 222)); }
+QColor accent() { return themedColor(QColor(66, 211, 189), QColor(19, 132, 116)); }
+QColor selectionColor() { return themedColor(QColor(255, 217, 94), QColor(151, 103, 0)); }
+QColor foreground() { return themedColor(QColor(224, 234, 245), QColor(36, 50, 71)); }
+QColor translucentAccent(int alpha) {
+    QColor color = accent();
+    color.setAlpha(alpha);
+    return color;
+}
 constexpr int displayLimit = 2500;
 constexpr double pi = 3.14159265358979323846;
 
 QColor objectColor(const EditorObject &object) {
     if (object.type == EditorObject::Bomb)
-        return QColor(157, 173, 196);
+        return themedColor(QColor(157, 173, 196), QColor(89, 105, 129));
     if (object.type == EditorObject::Wall)
         return QColor(222, 142, 72);
     return object.color == 0 ? QColor(245, 86, 111) : QColor(79, 156, 255);
@@ -69,7 +79,7 @@ void drawObject(QPainter &painter, const QRectF &rect, const EditorObject &objec
     painter.save();
     painter.setOpacity(opacity);
     const QColor color = objectColor(object);
-    painter.setPen(QPen(selected ? selectionColor : color.lighter(125), selected ? 2.5 : 1.0));
+    painter.setPen(QPen(selected ? selectionColor() : color.lighter(125), selected ? 2.5 : 1.0));
     if (object.type == EditorObject::Wall) {
         QColor fill = color;
         fill.setAlpha(42);
@@ -78,7 +88,7 @@ void drawObject(QPainter &painter, const QRectF &rect, const EditorObject &objec
         painter.setPen(QPen(QColor(color.red(), color.green(), color.blue(), 80), 1));
         painter.drawLine(rect.topLeft(), rect.bottomRight());
     } else if (object.type == EditorObject::Bomb) {
-        painter.setBrush(QColor(53, 62, 80));
+        painter.setBrush(themedColor(QColor(53, 62, 80), QColor(204, 213, 226)));
         const double radius = std::min(rect.width(), rect.height()) * 0.38;
         painter.drawEllipse(rect.center(), radius, radius);
         for (int i = 0; i < 8; ++i) {
@@ -308,31 +318,31 @@ void TimelineView::changeSelection(const QSet<QString> &selection) {
 void TimelineView::paintEvent(QPaintEvent *) {
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
-    painter.fillRect(rect(), background);
+    painter.fillRect(rect(), background());
     const QRectF tracks = tracksRect();
     const QRectF content = contentRect();
-    painter.fillRect(QRectF(content.left(), 30, content.width(), 47), panel);
-    painter.setPen(muted);
+    painter.fillRect(QRectF(content.left(), 30, content.width(), 47), panel());
+    painter.setPen(muted());
     painter.drawText(QRectF(3, 28, 45, 47), Qt::AlignCenter, QStringLiteral("波形"));
     for (int lane = 0; lane < 4; ++lane) {
         const double top = tracks.top() + lane * tracks.height() / 4;
         painter.fillRect(QRectF(content.left(), top, content.width(), tracks.height() / 4),
-                         lane % 2 ? panel : background);
-        painter.setPen(muted);
+                         lane % 2 ? panel() : background());
+        painter.setPen(muted());
         painter.drawText(QRectF(2, top, 46, tracks.height() / 4), Qt::AlignCenter,
                          QStringLiteral("列 %1").arg(lane + 1));
-        painter.setPen(gridLine);
+        painter.setPen(gridLine());
         painter.drawLine(QPointF(content.left(), top), QPointF(content.right(), top));
     }
     painter.save();
     painter.setClipRect(content);
     if (m_loopEnd > m_loopStart && m_loopStart >= 0) {
-        QColor loop = accent;
+        QColor loop = accent();
         loop.setAlpha(25);
         const QRectF loopRect(xAtTime(m_loopStart), 0,
                               (m_loopEnd - m_loopStart) * m_pixelsPerSecond, content.height());
         painter.fillRect(loopRect, loop);
-        painter.setPen(QPen(accent, 1, Qt::DashLine));
+        painter.setPen(QPen(accent(), 1, Qt::DashLine));
         painter.drawLine(loopRect.topLeft(), loopRect.bottomLeft());
         painter.drawLine(loopRect.topRight(), loopRect.bottomRight());
     }
@@ -353,10 +363,11 @@ void TimelineView::paintEvent(QPaintEvent *) {
         const double x = xAtTime(beatToSeconds(beat));
         const bool major = std::abs(beat / 4 - std::round(beat / 4)) < 0.001;
         const bool whole = std::abs(beat - std::round(beat)) < 0.001;
-        painter.setPen(QColor(major ? 90 : 51, major ? 112 : 63, major ? 133 : 80));
+        painter.setPen(themedColor(QColor(major ? 90 : 51, major ? 112 : 63, major ? 133 : 80),
+                                  major ? QColor(121, 145, 174) : QColor(207, 218, 232)));
         painter.drawLine(QPointF(x, whole ? 79 : tracks.top()), QPointF(x, content.bottom()));
         if (whole && pixelsPerBeat * std::max(1.0, beatStep) > 38) {
-            painter.setPen(major ? QColor(222, 235, 245) : muted);
+            painter.setPen(major ? foreground() : muted());
             painter.drawText(QRectF(x + 3, 76, 70, 12), Qt::AlignLeft | Qt::AlignVCenter,
                              QString::number(beat, 'f', 0));
         }
@@ -366,13 +377,13 @@ void TimelineView::paintEvent(QPaintEvent *) {
         secondsStep *= 2;
     for (double second = std::ceil(beginSeconds / secondsStep) * secondsStep; second <= endSeconds; second += secondsStep) {
         const double x = xAtTime(second);
-        painter.setPen(muted);
+        painter.setPen(muted());
         painter.drawText(QRectF(x + 3, 2, 74, 23), Qt::AlignLeft | Qt::AlignVCenter, timeLabel(second));
-        painter.setPen(gridLine);
+        painter.setPen(gridLine());
         painter.drawLine(QPointF(x, 25), QPointF(x, 30));
     }
     if (!m_peaks.isEmpty() && m_waveDuration > 0) {
-        painter.setPen(QPen(accent, 1));
+        painter.setPen(QPen(accent(), 1));
         for (int x = static_cast<int>(content.left()); x <= content.right(); ++x) {
             const double seconds = timeAtX(x);
             if (seconds < 0 || seconds >= m_waveDuration)
@@ -386,7 +397,7 @@ void TimelineView::paintEvent(QPaintEvent *) {
             painter.drawLine(QPointF(x, 53 - amplitude), QPointF(x, 53 + amplitude));
         }
     } else {
-        painter.setPen(muted);
+        painter.setPen(muted());
         painter.drawText(QRectF(content.left() + 14, 31, content.width() - 28, 43), Qt::AlignVCenter,
                          QStringLiteral("导入歌曲后显示波形 · 单击定位 · 滚轮缩放 · Shift 拖动设循环"));
     }
@@ -401,24 +412,25 @@ void TimelineView::paintEvent(QPaintEvent *) {
             drawObject(painter, objectRect(object, true), object, m_selected.contains(object.id));
         }
     if (m_drag == BoxSelection) {
-        painter.setPen(QPen(accent, 1));
-        painter.setBrush(QColor(66, 211, 189, 28));
+        painter.setPen(QPen(accent(), 1));
+        painter.setBrush(translucentAccent(28));
         painter.drawRect(QRectF(m_press, m_current).normalized());
     }
     if (m_drag == MakeLoop) {
         painter.fillRect(QRectF(QPointF(std::min(m_press.x(), m_current.x()), 0),
                                  QPointF(std::max(m_press.x(), m_current.x()), content.bottom())),
-                         QColor(66, 211, 189, 40));
+                         translucentAccent(40));
     }
     const double playheadX = xAtTime(m_playhead);
-    painter.setPen(QPen(QColor(252, 240, 175), 1.5));
+    const QColor playheadColor = themedColor(QColor(252, 240, 175), QColor(151, 103, 0));
+    painter.setPen(QPen(playheadColor, 1.5));
     painter.drawLine(QPointF(playheadX, 0), QPointF(playheadX, content.bottom()));
-    painter.setBrush(QColor(252, 240, 175));
+    painter.setBrush(playheadColor);
     QPolygonF marker;
     marker << QPointF(playheadX - 5, 0) << QPointF(playheadX + 5, 0) << QPointF(playheadX, 8);
     painter.drawPolygon(marker);
     if (limited) {
-        painter.setPen(selectionColor);
+        painter.setPen(selectionColor());
         painter.drawText(QRectF(content.left() + 10, content.bottom() - 20, content.width() - 20, 17),
                          Qt::AlignRight, QStringLiteral("密集区仅显示前 %1 个物件，请放大查看；完整数据保留").arg(displayLimit));
     }
@@ -595,17 +607,18 @@ QRectF GridEditor::cellRect(int x, int y) const {
 void GridEditor::paintEvent(QPaintEvent *) {
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
-    painter.fillRect(rect(), background);
-    painter.setPen(QColor(224, 234, 245));
+    painter.fillRect(rect(), background());
+    painter.setPen(foreground());
     painter.drawText(QRectF(14, 8, width() - 28, 23), Qt::AlignLeft | Qt::AlignVCenter,
                      QStringLiteral("放置面板  ·  第 %1 拍").arg(m_beat, 0, 'f', 3));
     for (int x = 0; x < 4; ++x)
         for (int y = 0; y < 3; ++y) {
             const QRectF cell = cellRect(x, y);
-            painter.setBrush(QPoint(x, y) == m_hover ? QColor(43, 59, 76) : panel);
-            painter.setPen(gridLine);
+            painter.setBrush(QPoint(x, y) == m_hover
+                                 ? themedColor(QColor(43, 59, 76), QColor(214, 229, 242)) : panel());
+            painter.setPen(gridLine());
             painter.drawRoundedRect(cell, 5, 5);
-            painter.setPen(QColor(97, 114, 138));
+            painter.setPen(themedColor(QColor(97, 114, 138), QColor(111, 129, 151)));
             painter.drawText(cell.adjusted(5, 2, -5, -2), Qt::AlignLeft | Qt::AlignBottom,
                              QStringLiteral("%1,%2").arg(x + 1).arg(y + 1));
         }
@@ -634,11 +647,11 @@ void GridEditor::paintEvent(QPaintEvent *) {
         ghost.direction = m_direction;
         drawObject(painter, cellRect(m_hover.x(), m_hover.y()).adjusted(6, 6, -6, -6), ghost, false, 0.55);
     } else if (hoverOccupied) {
-        painter.setPen(QPen(accent, 1.5, Qt::DashLine));
+        painter.setPen(QPen(accent(), 1.5, Qt::DashLine));
         painter.setBrush(Qt::NoBrush);
         painter.drawRoundedRect(cellRect(m_hover.x(), m_hover.y()), 5, 5);
     }
-    painter.setPen(muted);
+    painter.setPen(muted());
     painter.drawText(QRectF(8, height() - 32, width() - 16, 24), Qt::AlignCenter,
                      hoverOccupied ? QStringLiteral("此格已有物件 · 点击选择")
                                    : QStringLiteral("左键放置 · 右键选择 · 顶部为第 3 层"));
@@ -749,10 +762,10 @@ void TrackView::paintGL() {
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
     QLinearGradient gradient(0, 0, 0, height());
-    gradient.setColorAt(0, QColor(12, 18, 32));
-    gradient.setColorAt(1, QColor(29, 40, 58));
+    gradient.setColorAt(0, themedColor(QColor(12, 18, 32), QColor(245, 249, 255)));
+    gradient.setColorAt(1, themedColor(QColor(29, 40, 58), QColor(220, 231, 245)));
     painter.fillRect(rect(), gradient);
-    painter.setPen(QPen(QColor(63, 91, 122), 1));
+    painter.setPen(QPen(themedColor(QColor(63, 91, 122), QColor(160, 184, 209)), 1));
     for (int x = -2; x <= 2; ++x)
         painter.drawLine(project(x, 0, -0.1), project(x, 0, m_lookAhead));
     const double currentBeat = secondsToBeat(m_playhead);
@@ -763,7 +776,10 @@ void TrackView::paintGL() {
         if (seconds < -0.2)
             continue;
         const bool measure = std::fmod(beat, 4.0) == 0;
-        painter.setPen(QPen(measure ? QColor(77, 116, 146) : QColor(48, 69, 91), measure ? 1.4 : 1));
+        painter.setPen(QPen(measure
+                               ? themedColor(QColor(77, 116, 146), QColor(111, 146, 179))
+                               : themedColor(QColor(48, 69, 91), QColor(181, 202, 223)),
+                            measure ? 1.4 : 1));
         painter.drawLine(project(-2, 0, seconds), project(2, 0, seconds));
     }
     bool limited = false;
@@ -786,7 +802,7 @@ void TrackView::paintGL() {
             QColor wall = objectColor(object);
             QColor fill = wall;
             fill.setAlpha(22);
-            painter.setPen(QPen(m_selected.contains(object.id) ? selectionColor : wall, 1));
+            painter.setPen(QPen(m_selected.contains(object.id) ? selectionColor() : wall, 1));
             painter.setBrush(fill);
             QPolygonF top;
             top << nearFace.topLeft() << farFace.topLeft() << farFace.topRight() << nearFace.topRight();
@@ -819,16 +835,16 @@ void TrackView::paintGL() {
             m_hits.append(qMakePair(face, index));
         }
     }
-    painter.setPen(QPen(QColor(81, 217, 192, 105), 1, Qt::DashLine));
+    painter.setPen(QPen(translucentAccent(105), 1, Qt::DashLine));
     for (int x = -2; x <= 2; ++x)
         painter.drawLine(project(x, 0, 0), project(x, 3, 0));
     for (int y = 0; y <= 3; ++y)
         painter.drawLine(project(-2, y, 0), project(2, y, 0));
-    painter.setPen(QColor(224, 234, 245));
+    painter.setPen(foreground());
     painter.drawText(QRectF(14, 10, width() - 28, 24), Qt::AlignLeft | Qt::AlignVCenter,
                      QStringLiteral("轨道预览  ·  %1  ·  第 %2 拍")
                          .arg(timeLabel(m_playhead)).arg(currentBeat, 0, 'f', 2));
-    painter.setPen(muted);
+    painter.setPen(muted());
     painter.drawText(QRectF(14, height() - 29, width() - 28, 20), Qt::AlignRight | Qt::AlignVCenter,
                      limited ? QStringLiteral("密集区显示上限 %1 · 完整数据保留").arg(displayLimit)
                              : QStringLiteral("点击选择 · Ctrl 多选 · 滚轮调整预览距离"));

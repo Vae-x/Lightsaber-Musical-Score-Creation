@@ -17,7 +17,7 @@ set(CMAKE_AUTOUIC ON)
 if (WIN32 AND MINGW)
     get_filename_component(LMSC_MINGW_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
 endif ()
-find_package(Qt5 5.12 REQUIRED COMPONENTS Core Widgets Multimedia Concurrent)
+find_package(Qt5 5.12 REQUIRED COMPONENTS Core Widgets Multimedia Concurrent Network)
 
 add_library(lmsc_core STATIC
         core/BeatmapDocument.cpp
@@ -30,10 +30,17 @@ add_library(lmsc_core STATIC
         core/AudioService.h
         core/RhythmAnalyzer.cpp
         core/RhythmAnalyzer.h
+        core/AppSettings.cpp core/AppSettings.h
+        core/ApiModelClient.cpp core/ApiModelClient.h
+        core/WinHttpModelTransport.cpp core/WinHttpModelTransport.h
+        core/CodexAccountClient.cpp core/CodexAccountClient.h
         core/WorkspacePaths.cpp core/WorkspacePaths.h
         core/MtpImportService.cpp core/MtpImportService.h)
 target_include_directories(lmsc_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(lmsc_core PUBLIC Qt5::Core Qt5::Multimedia)
+target_link_libraries(lmsc_core PUBLIC Qt5::Core Qt5::Multimedia Qt5::Network)
+if (WIN32)
+    target_link_libraries(lmsc_core PRIVATE crypt32 winhttp)
+endif ()
 
 add_executable(src WIN32
         app/main.cpp
@@ -42,6 +49,8 @@ add_executable(src WIN32
         gui/MainWindow.ui
         gui/EditorViews.cpp
         gui/EditorViews.h
+        gui/SettingsDialog.cpp gui/SettingsDialog.h
+        gui/ThemeManager.cpp gui/ThemeManager.h
         ../resources/app.qrc)
 if (WIN32)
     if (MINGW)
@@ -131,6 +140,7 @@ if (WIN32 AND NOT CMAKE_CROSSCOMPILING)
 endif ()
 
 if (BUILD_TESTING)
+    find_package(Qt5 5.12 REQUIRED COMPONENTS Test)
     # Both entry points use these same tests; the paths are independent of cwd.
     add_executable(core_tests "${LMSC_REPOSITORY_DIR}/tests/core_tests.cpp")
     target_link_libraries(core_tests PRIVATE lmsc_core)
@@ -147,6 +157,26 @@ if (BUILD_TESTING)
     endif ()
 
     add_test(NAME core_editing COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:core_tests>")
+    add_executable(ai_settings_tests "${LMSC_REPOSITORY_DIR}/tests/AiSettingsTest.cpp")
+    target_link_libraries(ai_settings_tests PRIVATE lmsc_core Qt5::Test)
+    set_target_properties(ai_settings_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_test(NAME ai_settings COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:ai_settings_tests>")
+    set_tests_properties(ai_settings PROPERTIES TIMEOUT 60 LABELS "settings;network")
+    add_executable(codex_account_tests "${LMSC_REPOSITORY_DIR}/tests/CodexAccountTest.cpp")
+    target_link_libraries(codex_account_tests PRIVATE lmsc_core Qt5::Test)
+    set_target_properties(codex_account_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_test(NAME codex_account COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:codex_account_tests>")
+    set_tests_properties(codex_account PROPERTIES TIMEOUT 90 LABELS "settings;codex")
+    add_executable(settings_dialog_tests
+            "${LMSC_REPOSITORY_DIR}/tests/SettingsDialogTest.cpp"
+            gui/SettingsDialog.cpp gui/SettingsDialog.h
+            gui/ThemeManager.cpp gui/ThemeManager.h
+            gui/EditorViews.cpp gui/EditorViews.h)
+    target_sources(settings_dialog_tests PRIVATE ../resources/app.qrc)
+    target_link_libraries(settings_dialog_tests PRIVATE lmsc_core Qt5::Widgets Qt5::Test)
+    set_target_properties(settings_dialog_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_test(NAME settings_dialog COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:settings_dialog_tests>")
+    set_tests_properties(settings_dialog PROPERTIES TIMEOUT 90 LABELS "settings;gui")
     add_executable(mtp_import_tests "${LMSC_REPOSITORY_DIR}/tests/MtpImportTest.cpp")
     target_link_libraries(mtp_import_tests PRIVATE lmsc_core)
     set_target_properties(mtp_import_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
@@ -196,6 +226,9 @@ if (BUILD_TESTING)
                 "${LMSC_REPOSITORY_DIR}/tests/MainWindowTest.cpp"
                 gui/MainWindow.cpp gui/MainWindow.h gui/MainWindow.ui
                 gui/EditorViews.cpp gui/EditorViews.h)
+        target_sources(main_window_tests PRIVATE
+                gui/SettingsDialog.cpp gui/SettingsDialog.h
+                gui/ThemeManager.cpp gui/ThemeManager.h)
         target_sources(main_window_tests PRIVATE ../resources/app.qrc)
         target_link_libraries(main_window_tests PRIVATE
                 lmsc_core Qt5::Widgets Qt5::Concurrent Qt5::Test)

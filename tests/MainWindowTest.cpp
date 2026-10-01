@@ -1,5 +1,6 @@
 #include "gui/MainWindow.h"
 #include "gui/EditorViews.h"
+#include "gui/ThemeManager.h"
 #include "core/AudioService.h"
 #include "core/MtpImportService.h"
 #include "core/ProjectStore.h"
@@ -76,6 +77,7 @@ class MainWindowTest : public QObject {
 private slots:
     void initTestCase();
     void chineseBrandIconAndAboutLicense();
+    void settingsEntryAndThemeCancel();
     void clickPlaceApplyUndoAndDifficulty();
     void protectedSelectionRejectsEntireDrag();
     void importMp3AndCropThroughDialogs_data();
@@ -87,6 +89,33 @@ private:
     QTemporaryDir m_temp;
     QString m_song;
 };
+
+void MainWindowTest::settingsEntryAndThemeCancel() {
+    MainWindow window;
+    window.setTestMode(true);
+    window.show();
+    auto action = window.findChild<QAction *>(QStringLiteral("openSettingsAction"));
+    QVERIFY(action);
+    QCOMPARE(action->shortcut(), QKeySequence(QStringLiteral("Ctrl+,")));
+    const QString originalTheme = lmsc::ThemeManager::mode();
+    bool opened = false;
+    QTimer::singleShot(60, &window, [&] {
+        auto dialog = window.findChild<QDialog *>(QStringLiteral("settingsDialog"));
+        if (!dialog) return;
+        auto combo = dialog->findChild<QComboBox *>(QStringLiteral("themeMode"));
+        auto buttons = dialog->findChild<QDialogButtonBox *>(QStringLiteral("settingsButtons"));
+        if (!combo || !buttons) { dialog->reject(); return; }
+        opened = true;
+        combo->setCurrentIndex(combo->findData(QStringLiteral("dark")));
+        buttons->button(QDialogButtonBox::Cancel)->click();
+    });
+    QTimer::singleShot(3000, &window, [&] {
+        if (auto dialog = window.findChild<QDialog *>(QStringLiteral("settingsDialog"))) dialog->reject();
+    });
+    action->trigger();
+    QVERIFY(opened);
+    QCOMPARE(lmsc::ThemeManager::mode(), originalTheme);
+}
 
 void MainWindowTest::importHeadsetThroughDialog() {
     if (!qEnvironmentVariableIsSet("LMSC_TEST_HEADSET"))

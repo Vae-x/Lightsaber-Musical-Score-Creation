@@ -1,0 +1,477 @@
+#include "SettingsDialog.h"
+#include "ThemeManager.h"
+#include "core/ApiModelClient.h"
+#include "core/CodexAccountClient.h"
+#include <QApplication>
+#include <QCheckBox>
+#include <QComboBox>
+#include <QCryptographicHash>
+#include <QDesktopServices>
+#include <QDialogButtonBox>
+#include <QFileDialog>
+#include <QFormLayout>
+#include <QGroupBox>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QLineEdit>
+#include <QListWidget>
+#include <QPushButton>
+#include <QScrollArea>
+#include <QScreen>
+#include <QSignalBlocker>
+#include <QStackedWidget>
+#include <QStyle>
+#include <QUrl>
+#include <QVBoxLayout>
+
+namespace lmsc {
+namespace {
+QLabel *description(const QString &text, QWidget *parent, const char *role = "muted") {
+    auto label = new QLabel(text, parent);
+    label->setWordWrap(true);
+    label->setProperty("role", role);
+    return label;
+}
+void statusText(QLabel *label, const QString &text, const char *role) {
+    label->setText(text);
+    label->setProperty("role", role);
+    label->style()->unpolish(label);
+    label->style()->polish(label);
+    label->update();
+}
+QWidget *scrollPage(QWidget *content) {
+    auto scroll = new QScrollArea;
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setWidgetResizable(true);
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    scroll->setWidget(content);
+    return scroll;
+}
+}
+
+SettingsDialog::SettingsDialog(QWidget *parent, const QString &settingsFile)
+    : QDialog(parent), m_store(settingsFile),
+      m_api(new ApiModelClient(this)), m_codex(new CodexAccountClient(this)) {
+    setObjectName(QStringLiteral("settingsDialog"));
+    setWindowTitle(tr("设置 · 光剑曲谱制作"));
+    const auto screen = QApplication::primaryScreen();
+    const QSize available = screen ? screen->availableGeometry().size() - QSize(50, 80) : QSize(940, 690);
+    resize(qMin(940, available.width()), qMin(690, available.height()));
+    setMinimumSize(qMin(760, available.width()), qMin(500, available.height()));
+    QString loadError;
+    m_preferences = m_store.load(&loadError);
+    m_savedTheme = ThemeManager::mode();
+
+    auto outer = new QVBoxLayout(this);
+    outer->setContentsMargins(20, 18, 20, 16);
+    outer->setSpacing(14);
+    auto title = description(tr("设置"), this, "title");
+    outer->addWidget(title);
+    outer->addWidget(description(tr("调整编辑器外观，配置用于后续自动制谱的 AI。"), this));
+    auto body = new QHBoxLayout;
+    body->setSpacing(18);
+    m_navigation = new QListWidget(this);
+    m_navigation->setObjectName(QStringLiteral("settingsNavigation"));
+    m_navigation->setFixedWidth(145);
+    m_navigation->addItems({tr("外观"), tr("大语言模型"), tr("账号授权")});
+    m_pages = new QStackedWidget(this);
+    m_pages->addWidget(scrollPage(buildAppearancePage()));
+    m_pages->addWidget(scrollPage(buildModelPage()));
+    m_pages->addWidget(scrollPage(buildAccountPage()));
+    body->addWidget(m_navigation);
+    body->addWidget(m_pages, 1);
+    outer->addLayout(body, 1);
+    m_saveStatus = description(loadError, this, loadError.isEmpty() ? "muted" : "warning");
+    m_saveStatus->setObjectName(QStringLiteral("settingsSaveStatus"));
+    outer->addWidget(m_saveStatus);
+    auto buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Apply | QDialogButtonBox::Cancel, this);
+    buttons->setObjectName(QStringLiteral("settingsButtons"));
+    buttons->button(QDialogButtonBox::Save)->setText(tr("保存并关闭"));
+    buttons->button(QDialogButtonBox::Apply)->setText(tr("应用"));
+    buttons->button(QDialogButtonBox::Cancel)->setText(tr("取消"));
+    connect(buttons, &QDialogButtonBox::accepted, this, [this] { if (savePreferences()) accept(); });
+    connect(buttons->button(QDialogButtonBox::Apply), &QPushButton::clicked, this, [this] { savePreferences(); });
+    connect(buttons, &QDialogButtonBox::rejected, this, &SettingsDialog::reject);
+    outer->addWidget(buttons);
+
+    connect(m_navigation, &QListWidget::currentRowChanged, this, [this](int row) {
+        m_pages->setCurrentIndex(row);
+        if (row == 2 && !m_accountChecked) {
+            m_accountChecked = true;
+            configureCodex();
+            m_codex->checkAccount();
+        }
+    });
+    connect(m_api, &ApiModelClient::modelsReady, this, [this](const QStringList &models) {
+        m_fetchModels->setEnabled(true);
+        m_cancelFetch->hide();
+        if (m_requestProvider != m_currentProvider) return;
+        const QString selected = m_models->currentText().trimmed();
+        replaceModelList(m_models, models, selected);
+        captureProvider();
+        m_preferences.providers[m_currentProvider].models = models;
+        setApiStatus(tr("已连接，读取到 %1 个模型。请选择模型后保存。列表中的模型不一定都支持对话。").arg(models.size()), "success");
+    });
+    connect(m_api, &ApiModelClient::requestFailed, this, [this](const QString &error) {
+        m_fetchModels->setEnabled(true);
+        m_cancelFetch->hide();
+        m_lastRequest.clear();
+        setApiStatus(error + tr("\n可以修正配置后重试，或手动填写模型名。"), "error");
+    });
+    connect(m_codex, &CodexAccountClient::accountStatus, this, [this](const QString &message, bool loggedIn) {
+        setAccountStatus(message, loggedIn ? "success" : "muted");
+        if (loggedIn && m_codexModels->count() == 0) m_codex->fetchModels();
+    });
+    connect(m_codex, &CodexAccountClient::authorizationRequired, this, [this](const QUrl &url) {
+        if (url.scheme() != QStringLiteral("https")) {
+            m_codex->cancelLogin();
+            setAccountStatus(tr("授权地址无效，请检查 Codex 程序。"), "error");
+            return;
+        }
+        m_loginLink->setText(tr("浏览器未打开时，可<a href=\"%1\">点击这里继续授权</a>。").arg(url.toString().toHtmlEscaped()));
+        m_loginLink->show();
+        setAccountStatus(tr("请在浏览器中完成 ChatGPT 登录，完成后会自动读取账号与模型。"));
+        QDesktopServices::openUrl(url);
+    });
+    connect(m_codex, &CodexAccountClient::loginFinished, this, [this](bool success, const QString &message) {
+        m_login->setEnabled(true);
+        m_cancelLogin->hide();
+        m_loginLink->hide();
+        setAccountStatus(message, success ? "success" : "warning");
+        if (success) { m_codex->checkAccount(); m_codex->fetchModels(); }
+    });
+    connect(m_codex, &CodexAccountClient::modelsReady, this, [this](const QStringList &models) {
+        replaceModelList(m_codexModels, models, m_codexModels->currentText().trimmed());
+        setAccountStatus(models.isEmpty() ? tr("账号未返回可用模型，请检查权限或手动填写模型名。")
+                                         : tr("账号模型列表已更新，共 %1 个模型。").arg(models.size()),
+                         models.isEmpty() ? "warning" : "success");
+    });
+    connect(m_codex, &CodexAccountClient::requestFailed, this, [this](const QString &message) {
+        m_login->setEnabled(true);
+        m_cancelLogin->hide();
+        m_loginLink->hide();
+        setAccountStatus(message, "error");
+    });
+
+    selectProvider(m_preferences.providerId);
+    m_navigation->setCurrentRow(0);
+}
+
+SettingsDialog::~SettingsDialog() { m_api->cancel(); m_codex->stop(); }
+
+QWidget *SettingsDialog::buildAppearancePage() {
+    auto page = new QWidget;
+    auto layout = new QVBoxLayout(page);
+    layout->setContentsMargins(4, 4, 12, 4);
+    layout->setSpacing(16);
+    layout->addWidget(description(tr("外观"), page, "title"));
+    layout->addWidget(description(tr("主题会立即预览；点击应用或保存后，下次启动会沿用。取消会恢复上次应用的主题。"), page));
+    auto group = new QGroupBox(tr("主题模式"), page);
+    auto form = new QFormLayout(group);
+    m_theme = new QComboBox(group);
+    m_theme->setObjectName(QStringLiteral("themeMode"));
+    m_theme->addItem(tr("跟随系统"), QStringLiteral("system"));
+    m_theme->addItem(tr("浅色"), QStringLiteral("light"));
+    m_theme->addItem(tr("深色"), QStringLiteral("dark"));
+    m_theme->setCurrentIndex(qMax(0, m_theme->findData(m_preferences.themeMode)));
+    form->addRow(tr("界面主题"), m_theme);
+    form->addRow(description(tr("编辑网格、波形时间轴和轨道预览也会同步切换。"), group));
+    connect(m_theme, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this] {
+        ThemeManager::apply(m_theme->currentData().toString());
+    });
+    layout->addWidget(group);
+    layout->addWidget(description(tr("方块的红蓝颜色、切割箭头和选中标记保留一致，便于辨认左右手。"), page));
+    layout->addStretch();
+    return page;
+}
+
+QWidget *SettingsDialog::buildModelPage() {
+    auto page = new QWidget;
+    auto layout = new QVBoxLayout(page);
+    layout->setContentsMargins(4, 4, 12, 4);
+    layout->setSpacing(12);
+    layout->addWidget(description(tr("大语言模型"), page, "title"));
+    auto connectionForm = new QFormLayout;
+    m_connection = new QComboBox(page);
+    m_connection->setObjectName(QStringLiteral("aiConnection"));
+    m_connection->addItem(tr("API Key · OpenAI 兼容协议"), QStringLiteral("api"));
+    m_connection->addItem(tr("Codex · ChatGPT 账号授权"), QStringLiteral("codex"));
+    m_connection->setCurrentIndex(qMax(0, m_connection->findData(m_preferences.aiConnection)));
+    connectionForm->addRow(tr("使用方式"), m_connection);
+    layout->addLayout(connectionForm);
+    m_connectionPages = new QStackedWidget(page);
+    auto apiPage = new QWidget;
+    auto apiLayout = new QVBoxLayout(apiPage);
+    apiLayout->setContentsMargins(0, 0, 0, 0);
+    apiLayout->setSpacing(12);
+    auto form = new QFormLayout;
+    form->setSpacing(10);
+    m_provider = new QComboBox(apiPage);
+    m_provider->setObjectName(QStringLiteral("aiProvider"));
+    for (const auto &preset : AppSettings::providerPresets()) m_provider->addItem(preset.name, preset.id);
+    form->addRow(tr("提供商"), m_provider);
+    auto urlRow = new QWidget(apiPage);
+    auto urlLayout = new QHBoxLayout(urlRow);
+    urlLayout->setContentsMargins(0, 0, 0, 0);
+    m_baseUrl = new QLineEdit(urlRow);
+    m_baseUrl->setObjectName(QStringLiteral("aiBaseUrl"));
+    m_baseUrl->setPlaceholderText(QStringLiteral("https://example.com/v1"));
+    auto resetUrl = new QPushButton(tr("恢复预设"), urlRow);
+    resetUrl->setObjectName(QStringLiteral("resetProviderUrl"));
+    urlLayout->addWidget(m_baseUrl, 1);
+    urlLayout->addWidget(resetUrl);
+    form->addRow(tr("API 地址"), urlRow);
+    auto keyRow = new QWidget(apiPage);
+    auto keyLayout = new QHBoxLayout(keyRow);
+    keyLayout->setContentsMargins(0, 0, 0, 0);
+    m_apiKey = new QLineEdit(keyRow);
+    m_apiKey->setObjectName(QStringLiteral("aiApiKey"));
+    m_apiKey->setEchoMode(QLineEdit::Password);
+    m_apiKey->setPlaceholderText(tr("填入该提供商的 API Key"));
+    auto showKey = new QCheckBox(tr("显示"), keyRow);
+    showKey->setObjectName(QStringLiteral("showApiKey"));
+    auto clearKey = new QPushButton(tr("清除"), keyRow);
+    keyLayout->addWidget(m_apiKey, 1);
+    keyLayout->addWidget(showKey);
+    keyLayout->addWidget(clearKey);
+    form->addRow(tr("API Key"), keyRow);
+    m_models = new QComboBox(apiPage);
+    m_models->setObjectName(QStringLiteral("aiModel"));
+    m_models->setEditable(true);
+    m_models->setInsertPolicy(QComboBox::NoInsert);
+    m_models->lineEdit()->setPlaceholderText(tr("获取后选择，或手动输入模型名"));
+    form->addRow(tr("模型"), m_models);
+    apiLayout->addLayout(form);
+    apiLayout->addWidget(description(tr("填入密钥后离开输入框，会自动读取模型。每个提供商的地址、密钥与模型分别保存。"), apiPage));
+    auto fetchRow = new QHBoxLayout;
+    m_fetchModels = new QPushButton(tr("获取模型 / 检查连接"), apiPage);
+    m_fetchModels->setObjectName(QStringLiteral("fetchApiModels"));
+    m_cancelFetch = new QPushButton(tr("取消读取"), apiPage);
+    m_cancelFetch->setObjectName(QStringLiteral("cancelApiModels"));
+    m_cancelFetch->hide();
+    fetchRow->addWidget(m_fetchModels);
+    fetchRow->addWidget(m_cancelFetch);
+    fetchRow->addStretch();
+    apiLayout->addLayout(fetchRow);
+    m_apiStatus = description(tr("选择提供商，填入 API Key。"), apiPage);
+    m_apiStatus->setObjectName(QStringLiteral("apiConnectionStatus"));
+    apiLayout->addWidget(m_apiStatus);
+    m_providerLink = description({}, apiPage);
+    m_providerLink->setOpenExternalLinks(true);
+    apiLayout->addWidget(m_providerLink);
+    apiLayout->addStretch();
+    m_connectionPages->addWidget(apiPage);
+    auto accountPage = new QWidget;
+    auto accountLayout = new QVBoxLayout(accountPage);
+    accountLayout->setContentsMargins(0, 0, 0, 0);
+    accountLayout->addWidget(description(tr("使用已授权的 ChatGPT 账号及其可用 Codex 模型。"), accountPage));
+    auto configure = new QPushButton(tr("配置 Codex 账号授权"), accountPage);
+    accountLayout->addWidget(configure, 0, Qt::AlignLeft);
+    connect(configure, &QPushButton::clicked, this, [this] { m_navigation->setCurrentRow(2); });
+    accountLayout->addStretch();
+    m_connectionPages->addWidget(accountPage);
+    m_connectionPages->setCurrentIndex(m_connection->currentIndex());
+    connect(m_connection, QOverload<int>::of(&QComboBox::currentIndexChanged), m_connectionPages, &QStackedWidget::setCurrentIndex);
+    layout->addWidget(m_connectionPages, 1);
+    layout->addWidget(description(tr("当前完成连接与模型配置，自动制谱将在后续接入。Windows 会为当前用户加密保存 API Key；设置不会进入歌曲工程或导出包。"), page));
+    connect(m_provider, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this] {
+        if (!m_loadingProvider) selectProvider(m_provider->currentData().toString());
+    });
+    connect(resetUrl, &QPushButton::clicked, this, [this] {
+        for (const auto &preset : AppSettings::providerPresets()) if (preset.id == m_currentProvider) {
+            m_api->cancel(); m_lastRequest.clear();
+            m_fetchModels->setEnabled(true); m_cancelFetch->hide();
+            m_baseUrl->setText(preset.baseUrl);
+            setApiStatus(tr("已恢复 API 地址预设。"));
+            return;
+        }
+    });
+    connect(showKey, &QCheckBox::toggled, this, [this](bool visible) {
+        m_apiKey->setEchoMode(visible ? QLineEdit::Normal : QLineEdit::Password);
+    });
+    connect(clearKey, &QPushButton::clicked, m_apiKey, &QLineEdit::clear);
+    const auto invalidate = [this] {
+        if (m_loadingProvider) return;
+        m_api->cancel(); m_lastRequest.clear();
+        m_fetchModels->setEnabled(true); m_cancelFetch->hide();
+        m_preferences.providers[m_currentProvider].models.clear();
+        replaceModelList(m_models, {}, m_models->currentText());
+        setApiStatus(tr("配置已修改，请重新获取模型。"));
+    };
+    connect(m_baseUrl, &QLineEdit::textChanged, this, invalidate);
+    connect(m_apiKey, &QLineEdit::textChanged, this, invalidate);
+    connect(m_apiKey, &QLineEdit::editingFinished, this, [this] { fetchApiModels(false); });
+    connect(m_baseUrl, &QLineEdit::editingFinished, this, [this] { fetchApiModels(false); });
+    connect(m_fetchModels, &QPushButton::clicked, this, [this] { fetchApiModels(); });
+    connect(m_cancelFetch, &QPushButton::clicked, this, [this] {
+        m_api->cancel(); m_lastRequest.clear();
+        m_fetchModels->setEnabled(true); m_cancelFetch->hide();
+        setApiStatus(tr("已取消模型读取。"));
+    });
+    return page;
+}
+
+QWidget *SettingsDialog::buildAccountPage() {
+    auto page = new QWidget;
+    auto layout = new QVBoxLayout(page);
+    layout->setContentsMargins(4, 4, 12, 4);
+    layout->setSpacing(12);
+    layout->addWidget(description(tr("Codex 账号授权"), page, "title"));
+    layout->addWidget(description(tr("通过 Codex 的官方登录流程连接 ChatGPT 账号。授权和续期由 Codex 管理，可读取账号状态与模型列表。"), page));
+    auto form = new QFormLayout;
+    auto executable = new QWidget(page);
+    auto executableLayout = new QHBoxLayout(executable);
+    executableLayout->setContentsMargins(0, 0, 0, 0);
+    m_codexPath = new QLineEdit(executable);
+    m_codexPath->setObjectName(QStringLiteral("codexExecutable"));
+    m_codexPath->setPlaceholderText(tr("留空自动查找 Codex；也可选择 codex.exe"));
+    m_codexPath->setText(m_preferences.codexExecutable);
+    auto browse = new QPushButton(tr("浏览"), executable);
+    executableLayout->addWidget(m_codexPath, 1);
+    executableLayout->addWidget(browse);
+    form->addRow(tr("Codex 程序"), executable);
+    m_codexModels = new QComboBox(page);
+    m_codexModels->setObjectName(QStringLiteral("codexModel"));
+    m_codexModels->setEditable(true);
+    m_codexModels->setInsertPolicy(QComboBox::NoInsert);
+    m_codexModels->lineEdit()->setPlaceholderText(tr("授权后获取，或手动填写模型名"));
+    m_codexModels->setEditText(m_preferences.codexModel);
+    form->addRow(tr("账号模型"), m_codexModels);
+    layout->addLayout(form);
+    auto actions = new QHBoxLayout;
+    auto check = new QPushButton(tr("检查授权"), page);
+    check->setObjectName(QStringLiteral("checkCodexAccount"));
+    m_login = new QPushButton(tr("使用 ChatGPT 登录"), page);
+    m_login->setObjectName(QStringLiteral("loginCodexAccount"));
+    m_cancelLogin = new QPushButton(tr("取消授权"), page);
+    m_cancelLogin->hide();
+    actions->addWidget(check);
+    actions->addWidget(m_login);
+    actions->addWidget(m_cancelLogin);
+    actions->addStretch();
+    layout->addLayout(actions);
+    auto fetch = new QPushButton(tr("获取账号模型"), page);
+    fetch->setObjectName(QStringLiteral("fetchCodexModels"));
+    layout->addWidget(fetch, 0, Qt::AlignLeft);
+    m_accountStatus = description(tr("打开本页后自动检查本机 Codex 授权。"), page);
+    m_accountStatus->setObjectName(QStringLiteral("codexAccountStatus"));
+    layout->addWidget(m_accountStatus);
+    m_loginLink = description({}, page);
+    m_loginLink->setOpenExternalLinks(true);
+    m_loginLink->hide();
+    layout->addWidget(m_loginLink);
+    layout->addWidget(description(tr("需要本机安装 Codex CLI。已有账号授权可直接使用；登录状态保存在 Codex 自己的凭据存储中。取消本窗口不会退出已有账号。"), page));
+    auto documentation = description(tr("<a href=\"https://developers.openai.com/codex/app-server\">官方接入文档</a> · <a href=\"https://github.com/openai/codex\">Codex 开源项目</a>"), page);
+    documentation->setOpenExternalLinks(true);
+    layout->addWidget(documentation);
+    layout->addStretch();
+    connect(browse, &QPushButton::clicked, this, [this] {
+        const QString path = QFileDialog::getOpenFileName(this, tr("选择 Codex 程序"), {}, tr("可执行程序 (*.exe);;所有文件 (*)"));
+        if (!path.isEmpty()) m_codexPath->setText(path);
+    });
+    connect(check, &QPushButton::clicked, this, [this] {
+        configureCodex(); setAccountStatus(tr("正在检查账号授权…")); m_codex->checkAccount();
+    });
+    connect(m_login, &QPushButton::clicked, this, [this] {
+        configureCodex();
+        m_login->setEnabled(false); m_cancelLogin->show();
+        setAccountStatus(tr("正在准备浏览器授权…"));
+        m_codex->beginLogin();
+    });
+    connect(m_cancelLogin, &QPushButton::clicked, this, [this] { m_codex->cancelLogin(); });
+    connect(fetch, &QPushButton::clicked, this, [this] {
+        configureCodex(); setAccountStatus(tr("正在读取账号模型…")); m_codex->fetchModels();
+    });
+    return page;
+}
+
+void SettingsDialog::configureCodex() { m_codex->setExecutablePath(m_codexPath->text().trimmed()); }
+
+void SettingsDialog::captureProvider() {
+    if (m_currentProvider.isEmpty()) return;
+    auto &config = m_preferences.providers[m_currentProvider];
+    config.baseUrl = m_baseUrl->text().trimmed();
+    config.apiKey = m_apiKey->text().trimmed();
+    config.model = m_models->currentText().trimmed();
+}
+
+void SettingsDialog::selectProvider(const QString &id) {
+    captureProvider();
+    m_api->cancel(); m_lastRequest.clear();
+    m_fetchModels->setEnabled(true); m_cancelFetch->hide();
+    m_loadingProvider = true;
+    int index = m_provider->findData(id);
+    if (index < 0) index = 0;
+    m_provider->setCurrentIndex(index);
+    m_currentProvider = m_provider->currentData().toString();
+    auto config = m_preferences.providers.value(m_currentProvider);
+    for (const auto &preset : AppSettings::providerPresets()) if (preset.id == m_currentProvider) {
+        if (!m_preferences.providers.contains(m_currentProvider)) config.baseUrl = preset.baseUrl;
+        m_providerLink->setText(preset.documentationUrl.isEmpty() ? QString() : tr("<a href=\"%1\">查看提供商文档与密钥说明</a>").arg(preset.documentationUrl.toHtmlEscaped()));
+        break;
+    }
+    m_baseUrl->setText(config.baseUrl);
+    m_apiKey->setText(config.apiKey);
+    m_apiKey->setEchoMode(QLineEdit::Password);
+    if (auto *show = findChild<QCheckBox *>(QStringLiteral("showApiKey"))) {
+        const QSignalBlocker blocker(show);
+        show->setChecked(false);
+    }
+    replaceModelList(m_models, config.models, config.model);
+    m_preferences.providers[m_currentProvider] = config;
+    m_loadingProvider = false;
+    setApiStatus(config.models.isEmpty() ? tr("填入 API Key 后可自动获取模型，也支持手动填写。")
+                                       : tr("显示上次获取的 %1 个模型；可重新读取以检查连接。").arg(config.models.size()));
+}
+
+void SettingsDialog::replaceModelList(QComboBox *box, const QStringList &models, const QString &selected) {
+    const QSignalBlocker blocker(box);
+    box->clear();
+    box->addItems(models);
+    if (!selected.isEmpty()) box->setEditText(selected);
+    else if (!models.isEmpty()) box->setCurrentIndex(0);
+    else box->setEditText({});
+}
+
+void SettingsDialog::fetchApiModels(bool force) {
+    if (m_loadingProvider || m_connection->currentData().toString() != QStringLiteral("api")) return;
+    const QString base = m_baseUrl->text().trimmed();
+    const QString key = m_apiKey->text().trimmed();
+    if (!force && (key.isEmpty() || base.isEmpty())) return;
+    const QByteArray fingerprint = QCryptographicHash::hash((m_currentProvider + QChar(0) + base + QChar(0) + key).toUtf8(), QCryptographicHash::Sha256);
+    if (!force && fingerprint == m_lastRequest) return;
+    captureProvider();
+    m_requestProvider = m_currentProvider;
+    m_lastRequest = fingerprint;
+    m_fetchModels->setEnabled(false); m_cancelFetch->show();
+    setApiStatus(tr("正在连接并读取模型列表…"));
+    m_api->fetchModels(base, key, m_currentProvider);
+}
+
+bool SettingsDialog::savePreferences() {
+    captureProvider();
+    m_preferences.themeMode = m_theme->currentData().toString();
+    m_preferences.aiConnection = m_connection->currentData().toString();
+    m_preferences.providerId = m_currentProvider;
+    m_preferences.codexExecutable = m_codexPath->text().trimmed();
+    m_preferences.codexModel = m_codexModels->currentText().trimmed();
+    QString error;
+    if (!m_store.save(m_preferences, &error)) {
+        statusText(m_saveStatus, tr("保存失败：") + error, "error");
+        return false;
+    }
+    m_savedTheme = m_preferences.themeMode;
+    ThemeManager::apply(m_savedTheme);
+    statusText(m_saveStatus, tr("设置已保存。"), "success");
+    emit preferencesChanged(m_preferences);
+    return true;
+}
+
+void SettingsDialog::reject() {
+    ThemeManager::apply(m_savedTheme);
+    m_api->cancel(); m_codex->stop();
+    QDialog::reject();
+}
+void SettingsDialog::setApiStatus(const QString &text, const char *role) { statusText(m_apiStatus, text, role); }
+void SettingsDialog::setAccountStatus(const QString &text, const char *role) { statusText(m_accountStatus, text, role); }
+} // namespace lmsc

@@ -61,6 +61,7 @@ private:
     void newSong();
     void importSongFolder();
     void showAbout();
+    void showSettings();
     void showNewSongDialog(const MediaInfo &info);
     void finishNewSong(const QString &output);
     void applyRhythm(const RhythmEstimate &estimate);

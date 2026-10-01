@@ -1,6 +1,8 @@
 <RCC>
     <qresource prefix="/icons">
         <file alias="app.png">icons/app.png</file>
+        <file alias="chevron-dark.svg">icons/chevron-dark.svg</file>
+        <file alias="chevron-light.svg">icons/chevron-light.svg</file>
     </qresource>
     <qresource prefix="/licenses">
         <file alias="GPL-3.0.txt">../LICENSE</file>

@@ -98,7 +98,7 @@ foreach ($module in @('qtbase', 'qtmultimedia', 'qtsvg', 'qtimageformats')) {
 $readme = @'
 # 光剑曲谱制作 0.2.0
 
-双击 LightsaberMusicalScoreCreation.exe 启动。请保留同目录的 DLL、audio、platforms、imageformats 和 tools 等资源；无需安装 Qt、FFmpeg 或 Python。
+双击 LightsaberMusicalScoreCreation.exe 启动。请保留同目录的 DLL、audio、platforms、imageformats 和 tools 等资源；无需安装 Qt、FFmpeg 或 Python。基础编辑可离线运行，AI 连接需要联网；Codex 账号方式需要本机安装官方 Codex CLI。
 
 当前包面向 Windows 64 位电脑。Qt 编辑器为 32 位，随包音频工具为独立的 64 位进程。Windows 10 兼容性仍需独立验证。
 
@@ -114,6 +114,8 @@ $readme = @'
 Ctrl+O 选择电脑或头显歌曲来源；Ctrl+S 保存；Ctrl+E 导出；Ctrl+Z 撤销；Ctrl+Shift+Z 重做；Ctrl+C/Ctrl+V 复制粘贴；Delete 删除。其余操作使用界面菜单和控制区。
 
 软件提供手动编辑流程。编辑器导出的修改谱与新歌仍需戴头显实际游玩验收。自动制谱、模组效果的完整预览、《光之乐团》与 APK 在后续阶段。
+
+开发版新增“设置 → 偏好设置…”（Ctrl+,）：浅色、深色、跟随系统主题，以及 DeepSeek、Kimi、MiMo、OpenAI、通义千问和自定义 API 预设。填入 API Key 后可自动获取模型，也可手动填模型名。各提供商配置分别保存，Windows 密钥使用当前账户 DPAPI 加密；设置不进入歌曲工程与导出。Codex / ChatGPT 模式通过本机官方 CLI 检查已有授权、启动浏览器登录及获取账号模型。当前只完成设置与连接，尚未接入 AI 分析或自动制谱。
 
 项目采用 GNU GPL 第 3 版，官方条款全文在根目录 LICENSE；更新记录见 CHANGELOG.md。帮助菜单的“关于光剑曲谱制作”可查看版本，再点击“查看 GPLv3 许可”阅读原文。第三方组件遵循各自许可。
 
