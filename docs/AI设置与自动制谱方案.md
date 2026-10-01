@@ -9,6 +9,8 @@
 - API Key 使用 Windows 当前账户 DPAPI 加密后原子保存到应用配置目录。歌曲文档、工程和游戏导出不携带密钥。
 - Codex 账号方式通过本机官方 CLI 的 App Server 标准输入输出通信，完成初始化、账号读取、浏览器授权与 `model/list` 分页读取。账号令牌由 Codex 持有与续期；本程序不读取令牌文件。设置阶段不创建 Codex thread/turn。
 - Windows 模型请求使用系统 WinHTTP 的 TLS、证书校验与代理支持，避免依赖 Qt 5.12 安装包缺失的 OpenSSL 运行库。请求可取消、有超时与大小限制，重定向不会携带密钥自动跳转。
+- 网络代理默认自动，API 使用系统代理，Codex 自动沿用 CLI 的运行环境。手动 HTTP 代理地址、端口独立保存在应用设置中，并用于 API 以及本程序启动的 Codex 子进程，本机服务保持直连；不修改 Windows 系统代理。旧设置没有代理字段时继续使用自动模式，非法手动配置不会保存或发起请求。
+- 设置窗口的“关于”和帮助菜单共享应用名称、版本、作者与项目主页信息，主页按钮调用默认浏览器。
 
 来源：[DeepSeek 接入](https://api-docs.deepseek.com/zh-cn/)、[Kimi 接口](https://platform.kimi.com/docs/api/overview)、[MiMo 平台](https://platform.xiaomimimo.com/)、[通义千问兼容接口](https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope)、[OpenAI 模型列表](https://developers.openai.com/api/reference/resources/models/methods/list)、[Codex App Server](https://developers.openai.com/codex/app-server)、[Codex 开源实现](https://github.com/openai/codex/tree/main/codex-rs/app-server)。提供商模型名称动态读取，列表存在不代表该模型一定适合对话或制谱。
 

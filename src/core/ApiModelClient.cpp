@@ -8,6 +8,9 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QNetworkAccessManager>
+#include <QNetworkProxy>
+#include <QNetworkProxyFactory>
+#include <QNetworkProxyQuery>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QSslSocket>
@@ -72,6 +75,12 @@ bool ApiModelClient::isBusy() const {
     return m_busy;
 }
 
+void ApiModelClient::setProxyConfig(const NetworkProxyConfig &proxy) {
+    if (m_proxy.mode == proxy.mode && m_proxy.host == proxy.host && m_proxy.port == proxy.port) return;
+    cancel();
+    m_proxy = proxy;
+}
+
 void ApiModelClient::cancel() {
     ++m_generation;
     m_busy = false;
@@ -89,6 +98,11 @@ void ApiModelClient::cancel() {
 void ApiModelClient::fetchModels(const QString &baseUrl, const QString &apiKey,
                                 const QString &providerId, int timeoutMs) {
     cancel();
+    const QString proxyError = AppSettings::validateProxy(m_proxy);
+    if (!proxyError.isEmpty()) {
+        emit requestFailed(proxyError);
+        return;
+    }
     QUrl url(baseUrl.trimmed(), QUrl::StrictMode);
     const QString addressError = validateAddress(url);
     if (!addressError.isEmpty()) {
@@ -119,8 +133,20 @@ void ApiModelClient::fetchModels(const QString &baseUrl, const QString &apiKey,
     m_busy = true;
     m_timeout->start(qMax(1, timeoutMs));
 #ifdef Q_OS_WIN
-    m_native->fetch(url, key, providerId, timeoutMs);
+    m_native->fetch(url, key, providerId, timeoutMs, m_proxy);
 #else
+    // Local gateways stay on this computer in either proxy mode.
+    const bool loopback = url.host().compare(QStringLiteral("localhost"), Qt::CaseInsensitive) == 0
+            || QHostAddress(url.host()).isLoopback();
+    if (loopback) {
+        m_network->setProxy(QNetworkProxy(QNetworkProxy::NoProxy));
+    } else if (m_proxy.mode == QStringLiteral("manual")) {
+        m_network->setProxy(QNetworkProxy(QNetworkProxy::HttpProxy, m_proxy.host.trimmed(),
+                                         static_cast<quint16>(m_proxy.port)));
+    } else {
+        const auto proxies = QNetworkProxyFactory::systemProxyForQuery(QNetworkProxyQuery(url));
+        m_network->setProxy(proxies.isEmpty() ? QNetworkProxy(QNetworkProxy::NoProxy) : proxies.first());
+    }
     const quint64 generation = m_generation;
     QNetworkRequest request(url);
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,

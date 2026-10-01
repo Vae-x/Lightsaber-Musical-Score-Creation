@@ -20,6 +20,7 @@ endif ()
 find_package(Qt5 5.12 REQUIRED COMPONENTS Core Widgets Multimedia Concurrent Network)
 
 add_library(lmsc_core STATIC
+        core/AppInfo.h
         core/BeatmapDocument.cpp
         core/BeatmapDocument.h
         core/TimeMap.cpp

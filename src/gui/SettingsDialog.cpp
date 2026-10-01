@@ -1,6 +1,7 @@
 #include "SettingsDialog.h"
 #include "ThemeManager.h"
 #include "core/ApiModelClient.h"
+#include "core/AppInfo.h"
 #include "core/CodexAccountClient.h"
 #include <QApplication>
 #include <QCheckBox>
@@ -12,6 +13,7 @@
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -20,6 +22,7 @@
 #include <QScreen>
 #include <QSignalBlocker>
 #include <QStackedWidget>
+#include <QSpinBox>
 #include <QStyle>
 #include <QUrl>
 #include <QVBoxLayout>
@@ -67,17 +70,19 @@ SettingsDialog::SettingsDialog(QWidget *parent, const QString &settingsFile)
     outer->setSpacing(14);
     auto title = description(tr("设置"), this, "title");
     outer->addWidget(title);
-    outer->addWidget(description(tr("调整编辑器外观，配置用于后续自动制谱的 AI。"), this));
+    outer->addWidget(description(tr("调整外观、AI 连接与网络，查看应用信息。"), this));
     auto body = new QHBoxLayout;
     body->setSpacing(18);
     m_navigation = new QListWidget(this);
     m_navigation->setObjectName(QStringLiteral("settingsNavigation"));
     m_navigation->setFixedWidth(145);
-    m_navigation->addItems({tr("外观"), tr("大语言模型"), tr("账号授权")});
+    m_navigation->addItems({tr("外观"), tr("大语言模型"), tr("账号授权"), tr("网络"), tr("关于")});
     m_pages = new QStackedWidget(this);
     m_pages->addWidget(scrollPage(buildAppearancePage()));
     m_pages->addWidget(scrollPage(buildModelPage()));
     m_pages->addWidget(scrollPage(buildAccountPage()));
+    m_pages->addWidget(scrollPage(buildNetworkPage()));
+    m_pages->addWidget(scrollPage(buildAboutPage()));
     body->addWidget(m_navigation);
     body->addWidget(m_pages, 1);
     outer->addLayout(body, 1);
@@ -98,8 +103,7 @@ SettingsDialog::SettingsDialog(QWidget *parent, const QString &settingsFile)
         m_pages->setCurrentIndex(row);
         if (row == 2 && !m_accountChecked) {
             m_accountChecked = true;
-            configureCodex();
-            m_codex->checkAccount();
+            if (configureCodex()) m_codex->checkAccount();
         }
     });
     connect(m_api, &ApiModelClient::modelsReady, this, [this](const QStringList &models) {
@@ -370,22 +374,135 @@ QWidget *SettingsDialog::buildAccountPage() {
         if (!path.isEmpty()) m_codexPath->setText(path);
     });
     connect(check, &QPushButton::clicked, this, [this] {
-        configureCodex(); setAccountStatus(tr("正在检查账号授权…")); m_codex->checkAccount();
+        if (!configureCodex()) return;
+        setAccountStatus(tr("正在检查账号授权…")); m_codex->checkAccount();
     });
     connect(m_login, &QPushButton::clicked, this, [this] {
-        configureCodex();
+        if (!configureCodex()) return;
         m_login->setEnabled(false); m_cancelLogin->show();
         setAccountStatus(tr("正在准备浏览器授权…"));
         m_codex->beginLogin();
     });
     connect(m_cancelLogin, &QPushButton::clicked, this, [this] { m_codex->cancelLogin(); });
     connect(fetch, &QPushButton::clicked, this, [this] {
-        configureCodex(); setAccountStatus(tr("正在读取账号模型…")); m_codex->fetchModels();
+        if (!configureCodex()) return;
+        setAccountStatus(tr("正在读取账号模型…")); m_codex->fetchModels();
     });
     return page;
 }
 
-void SettingsDialog::configureCodex() { m_codex->setExecutablePath(m_codexPath->text().trimmed()); }
+QWidget *SettingsDialog::buildNetworkPage() {
+    auto page = new QWidget;
+    auto layout = new QVBoxLayout(page);
+    layout->setContentsMargins(4, 4, 12, 4);
+    layout->setSpacing(16);
+    layout->addWidget(description(tr("网络"), page, "title"));
+    layout->addWidget(description(tr("默认自动配置，也可指定 HTTP 代理。当前配置用于 AI 连接；点击应用或保存后，下次启动会沿用。"), page));
+    auto group = new QGroupBox(tr("代理设置"), page);
+    auto groupLayout = new QVBoxLayout(group);
+    auto modeForm = new QFormLayout;
+    m_proxyMode = new QComboBox(group);
+    m_proxyMode->setObjectName(QStringLiteral("networkProxyMode"));
+    m_proxyMode->addItem(tr("自动（系统代理）"), QStringLiteral("system"));
+    m_proxyMode->addItem(tr("手动（HTTP 代理）"), QStringLiteral("manual"));
+    m_proxyMode->setCurrentIndex(qMax(0, m_proxyMode->findData(m_preferences.networkProxy.mode)));
+    modeForm->addRow(tr("代理模式"), m_proxyMode);
+    groupLayout->addLayout(modeForm);
+    m_manualProxy = new QWidget(group);
+    auto manualForm = new QFormLayout(m_manualProxy);
+    manualForm->setContentsMargins(0, 0, 0, 0);
+    m_proxyHost = new QLineEdit(m_manualProxy);
+    m_proxyHost->setObjectName(QStringLiteral("networkProxyHost"));
+    m_proxyHost->setPlaceholderText(tr("例如 127.0.0.1 或 proxy.example.com"));
+    m_proxyHost->setText(m_preferences.networkProxy.host);
+    manualForm->addRow(tr("代理地址"), m_proxyHost);
+    m_proxyPort = new QSpinBox(m_manualProxy);
+    m_proxyPort->setObjectName(QStringLiteral("networkProxyPort"));
+    m_proxyPort->setRange(1, 65535);
+    m_proxyPort->setValue(m_preferences.networkProxy.port);
+    manualForm->addRow(tr("端口"), m_proxyPort);
+    manualForm->addRow(description(tr("地址只填 IP 或域名，端口单独填写。"), m_manualProxy));
+    groupLayout->addWidget(m_manualProxy);
+    m_manualProxy->setEnabled(m_proxyMode->currentData().toString() == QStringLiteral("manual"));
+    layout->addWidget(group);
+    layout->addWidget(description(tr("自动模式下，API 使用系统代理，Codex 使用自身的默认网络配置。手动代理用于两种 AI 连接，本机服务保持直连。"), page));
+    layout->addWidget(description(tr("打开项目主页或浏览器授权时，浏览器沿用自己的网络设置。"), page));
+    layout->addStretch();
+    const auto changed = [this] {
+        m_manualProxy->setEnabled(m_proxyMode->currentData().toString() == QStringLiteral("manual"));
+        m_api->cancel(); m_lastRequest.clear();
+        m_fetchModels->setEnabled(true); m_cancelFetch->hide();
+        m_codex->stop(); m_accountChecked = false;
+        m_login->setEnabled(true); m_cancelLogin->hide(); m_loginLink->hide();
+        setApiStatus(tr("代理设置已修改，请重新获取模型。"));
+        setAccountStatus(tr("代理设置已修改，请重新检查授权或获取模型。"));
+    };
+    connect(m_proxyMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, changed);
+    connect(m_proxyHost, &QLineEdit::textChanged, this, changed);
+    connect(m_proxyPort, QOverload<int>::of(&QSpinBox::valueChanged), this, changed);
+    return page;
+}
+
+QWidget *SettingsDialog::buildAboutPage() {
+    auto page = new QWidget;
+    auto layout = new QVBoxLayout(page);
+    layout->setContentsMargins(4, 4, 12, 4);
+    layout->setSpacing(16);
+    layout->addWidget(description(tr("关于"), page, "title"));
+    auto heading = new QHBoxLayout;
+    auto icon = new QLabel(page);
+    icon->setPixmap(QIcon(QStringLiteral(":/icons/app.png")).pixmap(64, 64));
+    heading->addWidget(icon);
+    heading->addWidget(description(AppInfo::name(), page, "title"), 1);
+    layout->addLayout(heading);
+    auto group = new QGroupBox(tr("应用信息"), page);
+    auto form = new QFormLayout(group);
+    auto version = new QLabel(AppInfo::version(), group);
+    version->setObjectName(QStringLiteral("aboutVersion"));
+    version->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    form->addRow(tr("版本"), version);
+    auto author = new QLabel(AppInfo::author(), group);
+    author->setObjectName(QStringLiteral("aboutAuthor"));
+    author->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    form->addRow(tr("作者"), author);
+    form->addRow(tr("许可"), new QLabel(tr("GNU GPL 第 3 版"), group));
+    layout->addWidget(group);
+    auto homepage = new QPushButton(tr("打开项目主页"), page);
+    homepage->setObjectName(QStringLiteral("openProjectHomepage"));
+    homepage->setToolTip(AppInfo::homepageUrl());
+    layout->addWidget(homepage, 0, Qt::AlignLeft);
+    auto status = description({}, page);
+    status->setObjectName(QStringLiteral("aboutHomepageStatus"));
+    status->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    layout->addWidget(status);
+    connect(homepage, &QPushButton::clicked, this, [status] {
+        if (QDesktopServices::openUrl(QUrl(AppInfo::homepageUrl()))) {
+            statusText(status, tr("已在默认浏览器打开项目主页。"), "success");
+        } else {
+            statusText(status, tr("无法打开浏览器，请复制地址后访问：\n%1").arg(AppInfo::homepageUrl()), "error");
+        }
+    });
+    layout->addWidget(description(tr("基于 Qt5 / C++ 的曲谱编辑器。第三方组件分别遵循各自许可，可在帮助菜单查看许可全文。"), page));
+    layout->addStretch();
+    return page;
+}
+
+NetworkProxyConfig SettingsDialog::proxyConfig() const {
+    NetworkProxyConfig proxy;
+    proxy.mode = m_proxyMode->currentData().toString();
+    proxy.host = m_proxyHost->text().trimmed();
+    proxy.port = m_proxyPort->value();
+    return proxy;
+}
+
+bool SettingsDialog::configureCodex() {
+    const auto proxy = proxyConfig();
+    const QString error = AppSettings::validateProxy(proxy);
+    if (!error.isEmpty()) { setAccountStatus(error, "error"); return false; }
+    m_codex->setProxyConfig(proxy);
+    m_codex->setExecutablePath(m_codexPath->text().trimmed());
+    return true;
+}
 
 void SettingsDialog::captureProvider() {
     if (m_currentProvider.isEmpty()) return;
@@ -438,6 +555,9 @@ void SettingsDialog::fetchApiModels(bool force) {
     const QString base = m_baseUrl->text().trimmed();
     const QString key = m_apiKey->text().trimmed();
     if (!force && (key.isEmpty() || base.isEmpty())) return;
+    const auto proxy = proxyConfig();
+    const QString proxyError = AppSettings::validateProxy(proxy);
+    if (!proxyError.isEmpty()) { setApiStatus(proxyError, "error"); return; }
     const QByteArray fingerprint = QCryptographicHash::hash((m_currentProvider + QChar(0) + base + QChar(0) + key).toUtf8(), QCryptographicHash::Sha256);
     if (!force && fingerprint == m_lastRequest) return;
     captureProvider();
@@ -445,6 +565,7 @@ void SettingsDialog::fetchApiModels(bool force) {
     m_lastRequest = fingerprint;
     m_fetchModels->setEnabled(false); m_cancelFetch->show();
     setApiStatus(tr("正在连接并读取模型列表…"));
+    m_api->setProxyConfig(proxy);
     m_api->fetchModels(base, key, m_currentProvider);
 }
 
@@ -455,6 +576,7 @@ bool SettingsDialog::savePreferences() {
     m_preferences.providerId = m_currentProvider;
     m_preferences.codexExecutable = m_codexPath->text().trimmed();
     m_preferences.codexModel = m_codexModels->currentText().trimmed();
+    m_preferences.networkProxy = proxyConfig();
     QString error;
     if (!m_store.save(m_preferences, &error)) {
         statusText(m_saveStatus, tr("保存失败：") + error, "error");

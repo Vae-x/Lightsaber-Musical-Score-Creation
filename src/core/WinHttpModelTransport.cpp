@@ -1,6 +1,7 @@
 #include "WinHttpModelTransport.h"
 
 #ifdef Q_OS_WIN
+#include <QHostAddress>
 #include <QThread>
 #include <algorithm>
 #include <array>
@@ -87,7 +88,7 @@ QString nativeError(DWORD code) {
             || code == ERROR_WINHTTP_SECURE_CERT_CN_INVALID
             || code == ERROR_WINHTTP_SECURE_INVALID_CA)
         return QStringLiteral("TLS 安全连接失败，请检查系统时间、证书与服务地址。");
-    return QStringLiteral("无法连接模型服务，请检查网络、系统代理与服务地址（Windows 网络错误 %1）。")
+    return QStringLiteral("无法连接模型服务，请检查网络、代理设置与服务地址（Windows 网络错误 %1）。")
             .arg(code);
 }
 
@@ -141,15 +142,22 @@ struct Handles {
 
 void performRequest(const std::shared_ptr<WinHttpRequestState> &state,
                     const QUrl &url, const QString &key,
-                    const QString &providerId, int timeoutMs) {
+                    const QString &providerId, int timeoutMs, const NetworkProxyConfig &proxy) {
     if (cancelled(state)) return;
     Handles handles;
-    // Only loopback HTTP passed validation. Send local gateway credentials
-    // directly; HTTPS uses the user's and system's automatic proxy settings.
+    // Keep local gateways direct in both modes. Other requests use Windows
+    // automatic selection or the manual proxy configured only for this session.
+    const bool loopback = url.host().compare(QStringLiteral("localhost"), Qt::CaseInsensitive) == 0
+            || QHostAddress(url.host()).isLoopback();
+    const bool manual = !loopback && proxy.mode == QStringLiteral("manual");
+    QString proxyHost = proxy.host.trimmed();
+    if (proxyHost.contains(QLatin1Char(':'))) proxyHost = QLatin1Char('[') + proxyHost + QLatin1Char(']');
+    const std::wstring proxyName = QStringLiteral("%1:%2").arg(proxyHost).arg(proxy.port).toStdWString();
     handles.session = WinHttpOpen(L"Lightsaber Musical Score Creation/0.2",
-                                  url.scheme() == QStringLiteral("http")
-                                      ? WINHTTP_ACCESS_TYPE_NO_PROXY : automaticProxyAccess,
-                                  WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS,
+                                  loopback ? WINHTTP_ACCESS_TYPE_NO_PROXY
+                                           : manual ? WINHTTP_ACCESS_TYPE_NAMED_PROXY : automaticProxyAccess,
+                                  manual ? proxyName.c_str() : WINHTTP_NO_PROXY_NAME,
+                                  WINHTTP_NO_PROXY_BYPASS,
                                   WINHTTP_FLAG_ASYNC);
     if (!handles.session) {
         state->error = nativeError(GetLastError());
@@ -276,13 +284,14 @@ void WinHttpModelTransport::cancel() {
 }
 
 void WinHttpModelTransport::fetch(const QUrl &url, const QString &key,
-                                const QString &providerId, int timeoutMs) {
+                                const QString &providerId, int timeoutMs,
+                                const NetworkProxyConfig &proxy) {
     cancel();
     const quint64 generation = m_generation;
     const auto state = std::make_shared<WinHttpRequestState>();
     state->deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(qMax(1, timeoutMs));
-    QThread *thread = QThread::create([state, url, key, providerId, timeoutMs] {
-        performRequest(state, url, key, providerId, qMax(1, timeoutMs));
+    QThread *thread = QThread::create([state, url, key, providerId, timeoutMs, proxy] {
+        performRequest(state, url, key, providerId, qMax(1, timeoutMs), proxy);
     });
     m_tasks.insert(thread, state);
     connect(thread, &QThread::finished, this, [this, thread, state, generation] {

@@ -21,6 +21,12 @@ struct AiProviderConfig {
     QStringList models;
 };
 
+struct NetworkProxyConfig {
+    QString mode = QStringLiteral("system");
+    QString host;
+    int port = 8080;
+};
+
 struct AppPreferences {
     QString themeMode = QStringLiteral("system");
     QString aiConnection = QStringLiteral("api");
@@ -28,6 +34,7 @@ struct AppPreferences {
     QMap<QString, AiProviderConfig> providers;
     QString codexExecutable;
     QString codexModel;
+    NetworkProxyConfig networkProxy;
 };
 
 // Application-wide preferences are separate from songs and project documents.
@@ -39,6 +46,7 @@ public:
     bool save(const AppPreferences &preferences, QString *error = nullptr) const;
     QString filePath() const;
     static QVector<AiProviderPreset> providerPresets();
+    static QString validateProxy(const NetworkProxyConfig &proxy);
 
 private:
     QString m_filePath;

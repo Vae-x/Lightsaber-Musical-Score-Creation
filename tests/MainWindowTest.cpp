@@ -1,6 +1,7 @@
 #include "gui/MainWindow.h"
 #include "gui/EditorViews.h"
 #include "gui/ThemeManager.h"
+#include "core/AppInfo.h"
 #include "core/AudioService.h"
 #include "core/MtpImportService.h"
 #include "core/ProjectStore.h"
@@ -10,6 +11,7 @@
 #include <QComboBox>
 #include <QCryptographicHash>
 #include <QDialogButtonBox>
+#include <QDesktopServices>
 #include <QDoubleSpinBox>
 #include <QFileDialog>
 #include <QFormLayout>
@@ -29,9 +31,30 @@
 #include <QTemporaryDir>
 #include <QTextBrowser>
 #include <QTimer>
+#include <QUrl>
 #include <cmath>
 
+class HomepageUrlReceiver : public QObject {
+    Q_OBJECT
+public:
+    QUrl openedUrl;
+    int openedCount = 0;
+public slots:
+    void openUrl(const QUrl &url) {
+        openedUrl = url;
+        ++openedCount;
+    }
+};
+
 namespace {
+class ScopedHttpsUrlHandler {
+public:
+    explicit ScopedHttpsUrlHandler(QObject *receiver) {
+        QDesktopServices::setUrlHandler(QStringLiteral("https"), receiver, "openUrl");
+    }
+    ~ScopedHttpsUrlHandler() { QDesktopServices::unsetUrlHandler(QStringLiteral("https")); }
+};
+
 template<typename T> T *field(QWidget &root, const QString &labelText) {
     for (auto *form : root.findChildren<QFormLayout *>())
         for (int row = 0; row < form->rowCount(); ++row) {
@@ -77,6 +100,7 @@ class MainWindowTest : public QObject {
 private slots:
     void initTestCase();
     void chineseBrandIconAndAboutLicense();
+    void aboutHomepageOpensProject();
     void settingsEntryAndThemeCancel();
     void clickPlaceApplyUndoAndDifficulty();
     void protectedSelectionRejectsEntireDrag();
@@ -226,6 +250,7 @@ void MainWindowTest::chineseBrandIconAndAboutLicense() {
     bool sawAbout = false;
     bool sawLicense = false;
     bool aboutIconPresent = false;
+    bool homepageButtonPresent = false;
     QString aboutTitle, aboutBody, displayedLicense, licenseTitle;
     QTimer driver;
     connect(&driver, &QTimer::timeout, &window, [&] {
@@ -236,6 +261,7 @@ void MainWindowTest::chineseBrandIconAndAboutLicense() {
             aboutTitle = about->windowTitle();
             aboutBody = about->text();
             aboutIconPresent = !about->iconPixmap().isNull();
+            homepageButtonPresent = about->findChild<QPushButton *>(QStringLiteral("aboutHomepageButton")) != nullptr;
             sawAbout = true;
             if (showLicense) QTest::mouseClick(showLicense, Qt::LeftButton);
             else about->reject();
@@ -260,13 +286,48 @@ void MainWindowTest::chineseBrandIconAndAboutLicense() {
     driver.stop();
     QVERIFY(sawAbout);
     QVERIFY(aboutIconPresent);
+    QVERIFY(homepageButtonPresent);
     QCOMPARE(aboutTitle, QStringLiteral("关于光剑曲谱制作"));
     QVERIFY(aboutBody.contains(QStringLiteral("版本 0.2.0")));
+    QVERIFY(aboutBody.contains(QStringLiteral("作者：Vae-x")));
     QVERIFY(aboutBody.contains(QStringLiteral("GNU GPL 第 3 版许可")));
     QVERIFY(aboutBody.contains(QStringLiteral("第三方组件")));
     QVERIFY(sawLicense);
     QCOMPARE(licenseTitle, QStringLiteral("GNU GPL 第 3 版许可"));
     QCOMPARE(displayedLicense.trimmed(), officialLicense.trimmed());
+    window.close();
+}
+
+void MainWindowTest::aboutHomepageOpensProject() {
+    HomepageUrlReceiver receiver;
+    ScopedHttpsUrlHandler handler(&receiver);
+    MainWindow window; window.setTestMode(true); window.show();
+    QAction *aboutAction = nullptr;
+    for (auto *action : window.findChildren<QAction *>())
+        if (action->text() == QStringLiteral("关于光剑曲谱制作")) aboutAction = action;
+    QVERIFY(aboutAction);
+
+    bool clickedHomepage = false;
+    QTimer driver;
+    connect(&driver, &QTimer::timeout, &window, [&] {
+        auto *about = window.findChild<QMessageBox *>(QStringLiteral("aboutDialog"));
+        if (!about || !about->isVisible()) return;
+        auto *homepage = about->findChild<QPushButton *>(QStringLiteral("aboutHomepageButton"));
+        driver.stop();
+        if (!homepage) { about->reject(); return; }
+        clickedHomepage = true;
+        QTest::mouseClick(homepage, Qt::LeftButton);
+    });
+    driver.start(10);
+    QTimer::singleShot(3000, &window, [&] {
+        driver.stop();
+        if (auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget())) dialog->reject();
+    });
+    aboutAction->trigger();
+    driver.stop();
+    QVERIFY(clickedHomepage);
+    QCOMPARE(receiver.openedCount, 1);
+    QCOMPARE(receiver.openedUrl, QUrl(lmsc::AppInfo::homepageUrl()));
     window.close();
 }
 

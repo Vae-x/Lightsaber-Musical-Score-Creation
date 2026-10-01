@@ -1,10 +1,12 @@
 #include "CodexAccountClient.h"
+#include "AppInfo.h"
 
 #include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QProcessEnvironment>
 #include <QRegularExpression>
 #include <QStandardPaths>
 #ifdef Q_OS_WIN
@@ -76,7 +78,7 @@ CodexAccountClient::CodexAccountClient(QObject *parent) : QObject(parent) {
         }
         m_startDeadline = 0;
         const QJsonObject client{{"name", "lightsaber_score_settings"},
-                                 {"title", QStringLiteral("光剑曲谱制作")}, {"version", "0.2.0"}};
+                                 {"title", AppInfo::name()}, {"version", AppInfo::version()}};
         sendRequest(QStringLiteral("initialize"), QJsonObject{{"clientInfo", client}});
     });
     connect(&m_process, &QProcess::readyReadStandardOutput, this, &CodexAccountClient::readOutput);
@@ -133,6 +135,12 @@ void CodexAccountClient::setExecutablePath(const QString &path) {
     if (trimmed == m_executable) return;
     stop();
     m_executable = trimmed;
+}
+
+void CodexAccountClient::setProxyConfig(const NetworkProxyConfig &proxy) {
+    if (m_proxy.mode == proxy.mode && m_proxy.host == proxy.host && m_proxy.port == proxy.port) return;
+    stop();
+    m_proxy = proxy;
 }
 
 QString CodexAccountClient::executablePath() const {
@@ -216,6 +224,11 @@ void CodexAccountClient::enqueue(Operation operation) {
 }
 
 void CodexAccountClient::startServer() {
+    const QString proxyError = AppSettings::validateProxy(m_proxy);
+    if (!proxyError.isEmpty()) {
+        fail(proxyError);
+        return;
+    }
     QString program;
     QStringList arguments;
     if (!commandForPath(executablePath(), &program, &arguments)) {
@@ -225,6 +238,27 @@ void CodexAccountClient::startServer() {
     m_output.clear();
     m_startDeadline = m_clock.elapsed() + 15000;
     m_watchdog.start();
+    // Automatic mode preserves the official CLI's inherited proxy environment.
+    // Manual mode overrides proxy variables only for this child process. Never
+    // change qputenv(), the desktop Codex process, or Windows proxy preferences.
+    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    if (m_proxy.mode == QStringLiteral("manual")) {
+        QUrl url;
+        url.setScheme(QStringLiteral("http"));
+        url.setHost(m_proxy.host.trimmed());
+        url.setPort(m_proxy.port);
+        const QString proxyUrl = url.toString(QUrl::FullyEncoded);
+        for (const QString &name : {QStringLiteral("HTTP_PROXY"), QStringLiteral("HTTPS_PROXY"),
+                                   QStringLiteral("ALL_PROXY"), QStringLiteral("http_proxy"),
+                                   QStringLiteral("https_proxy"), QStringLiteral("all_proxy")})
+            environment.insert(name, proxyUrl);
+        // An inherited '*' bypass must not silently disable the selected proxy.
+        // Keep only local destinations direct, including the browser callback.
+        const QString bypass = QStringLiteral("localhost,127.0.0.1,::1");
+        environment.insert(QStringLiteral("NO_PROXY"), bypass);
+        environment.insert(QStringLiteral("no_proxy"), bypass);
+    }
+    m_process.setProcessEnvironment(environment);
     m_process.start(program, arguments, QIODevice::ReadWrite);
 }
 

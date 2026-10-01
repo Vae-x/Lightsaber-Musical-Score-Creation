@@ -8,6 +8,7 @@ class QLabel;
 class QLineEdit;
 class QListWidget;
 class QPushButton;
+class QSpinBox;
 class QStackedWidget;
 
 namespace lmsc {
@@ -30,6 +31,9 @@ private:
     QWidget *buildAppearancePage();
     QWidget *buildModelPage();
     QWidget *buildAccountPage();
+    QWidget *buildNetworkPage();
+    QWidget *buildAboutPage();
+    NetworkProxyConfig proxyConfig() const;
     void captureProvider();
     void selectProvider(const QString &id);
     void fetchApiModels(bool force = true);
@@ -37,7 +41,7 @@ private:
     bool savePreferences();
     void setApiStatus(const QString &text, const char *role = "muted");
     void setAccountStatus(const QString &text, const char *role = "muted");
-    void configureCodex();
+    bool configureCodex();
 
     AppSettings m_store;
     AppPreferences m_preferences;
@@ -51,6 +55,10 @@ private:
     QStackedWidget *m_pages;
     QStackedWidget *m_connectionPages;
     QComboBox *m_theme;
+    QComboBox *m_proxyMode;
+    QWidget *m_manualProxy;
+    QLineEdit *m_proxyHost;
+    QSpinBox *m_proxyPort;
     QComboBox *m_connection;
     QComboBox *m_provider;
     QComboBox *m_models;

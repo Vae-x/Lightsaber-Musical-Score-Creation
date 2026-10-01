@@ -6,9 +6,11 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QHostAddress>
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QStandardPaths>
+#include <QUrl>
 
 #ifdef Q_OS_WIN
 #ifndef NOMINMAX
@@ -126,6 +128,38 @@ QVector<AiProviderPreset> AppSettings::providerPresets() {
     };
 }
 
+QString AppSettings::validateProxy(const NetworkProxyConfig &proxy) {
+    if (proxy.mode == QStringLiteral("system")) return {};
+    if (proxy.mode != QStringLiteral("manual"))
+        return QStringLiteral("代理模式无效，请选择自动或手动设置。");
+    const QString host = proxy.host.trimmed();
+    if (host.isEmpty()) return QStringLiteral("请填写手动代理的服务器地址。");
+    for (const QChar character : host) {
+        if (character.isSpace() || character.unicode() < 32 || character.unicode() == 127
+                || QStringLiteral("/\\@?#[]").contains(character))
+            return QStringLiteral("代理服务器请仅填写 IP 或域名，不要包含协议、端口、路径或账户信息。");
+    }
+    const QHostAddress address(host);
+    if (host.contains(QLatin1Char(':')) && address.protocol() != QAbstractSocket::IPv6Protocol)
+        return QStringLiteral("代理服务器请仅填写 IP 或域名，端口请填写在端口栏。");
+    if (address.isNull()) {
+        const QByteArray domain = QUrl::toAce(host);
+        static const QRegularExpression label(QStringLiteral("^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$"));
+        if (domain.isEmpty() || domain.size() > 253)
+            return QStringLiteral("代理服务器的 IP 或域名格式无效。");
+        const auto labels = domain.split('.');
+        for (int i = 0; i < labels.size(); ++i) {
+            // A final dot is valid for a fully qualified DNS name.
+            if (i == labels.size() - 1 && labels.at(i).isEmpty() && i > 0) continue;
+            if (labels.at(i).size() > 63 || !label.match(QString::fromLatin1(labels.at(i))).hasMatch())
+                return QStringLiteral("代理服务器的 IP 或域名格式无效。");
+        }
+    }
+    if (proxy.port < 1 || proxy.port > 65535)
+        return QStringLiteral("代理端口必须在 1 到 65535 之间。");
+    return {};
+}
+
 AppPreferences AppSettings::load(QString *error) const {
     if (error) error->clear();
     AppPreferences preferences = defaults();
@@ -162,6 +196,22 @@ AppPreferences AppSettings::load(QString *error) const {
     else warnings.append(QStringLiteral("AI 连接方式无效，已使用 API。"));
     preferences.codexExecutable = root.value(QStringLiteral("codexExecutable")).toString();
     preferences.codexModel = root.value(QStringLiteral("codexModel")).toString();
+    const QJsonValue proxyValue = root.value(QStringLiteral("networkProxy"));
+    if (!proxyValue.isUndefined()) {
+        const QJsonObject proxy = proxyValue.toObject();
+        NetworkProxyConfig config;
+        config.mode = proxy.value(QStringLiteral("mode")).toString();
+        config.host = proxy.value(QStringLiteral("host")).toString().trimmed();
+        const QJsonValue port = proxy.value(QStringLiteral("port"));
+        config.port = port.toInt(8080);
+        if (!proxyValue.isObject() || !proxy.value(QStringLiteral("host")).isString()
+                || !port.isDouble() || port.toDouble() != config.port
+                || !validateProxy(config).isEmpty()) {
+            warnings.append(QStringLiteral("网络代理设置无效，已使用系统自动代理。"));
+        } else {
+            preferences.networkProxy = config;
+        }
+    }
 
     if (root.value(QStringLiteral("providers")).isObject()) {
         const QJsonObject providers = root.value(QStringLiteral("providers")).toObject();
@@ -209,6 +259,11 @@ bool AppSettings::save(const AppPreferences &preferences, QString *error) const 
         if (error) *error = QStringLiteral("主题或 AI 连接方式无效，设置未保存。");
         return false;
     }
+    const QString proxyError = validateProxy(preferences.networkProxy);
+    if (!proxyError.isEmpty()) {
+        if (error) *error = proxyError;
+        return false;
+    }
     QJsonObject providers;
     for (auto it = preferences.providers.constBegin(); it != preferences.providers.constEnd(); ++it) {
         QString protectedKey;
@@ -231,6 +286,10 @@ bool AppSettings::save(const AppPreferences &preferences, QString *error) const 
     root.insert(QStringLiteral("providerId"), preferences.providerId);
     root.insert(QStringLiteral("codexExecutable"), preferences.codexExecutable);
     root.insert(QStringLiteral("codexModel"), preferences.codexModel);
+    root.insert(QStringLiteral("networkProxy"), QJsonObject{
+        {QStringLiteral("mode"), preferences.networkProxy.mode},
+        {QStringLiteral("host"), preferences.networkProxy.host.trimmed()},
+        {QStringLiteral("port"), preferences.networkProxy.port}});
     root.insert(QStringLiteral("providers"), providers);
     const QByteArray contents = QJsonDocument(root).toJson(QJsonDocument::Indented);
     if (contents.size() > maximumSettingsSize) {

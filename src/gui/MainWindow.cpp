@@ -3,6 +3,7 @@
 #include "EditorViews.h"
 #include "SettingsDialog.h"
 #include "ThemeManager.h"
+#include "core/AppInfo.h"
 #include "core/AppSettings.h"
 #include "core/AudioService.h"
 #include "core/RhythmAnalyzer.h"
@@ -16,6 +17,7 @@
 #include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QDesktopServices>
 #include <QDir>
 #include <QDoubleSpinBox>
 #include <QEventLoop>
@@ -48,6 +50,7 @@
 #include <QTextBrowser>
 #include <QTimer>
 #include <QToolBar>
+#include <QUrl>
 #include <QVBoxLayout>
 #include <algorithm>
 #include <cmath>
@@ -562,15 +565,24 @@ void MainWindow::importSongFolder() {
 void MainWindow::showAbout() {
     QMessageBox about(this);
     about.setObjectName(QStringLiteral("aboutDialog"));
-    about.setWindowTitle(tr("关于光剑曲谱制作"));
+    about.setWindowTitle(tr("关于%1").arg(lmsc::AppInfo::name()));
     about.setIconPixmap(QPixmap(QStringLiteral(":/icons/app.png")).scaled(96, 96, Qt::KeepAspectRatio, Qt::SmoothTransformation));
     about.setTextFormat(Qt::RichText);
-    about.setText(tr("<h3>光剑曲谱制作</h3><p>版本 0.2.0 · Qt5 · Windows</p>"
+    about.setText(tr("<h3>%1</h3><p>版本 %2 · Qt5 · Windows</p><p>作者：%3</p>"
         "<p>VR 节奏游戏曲谱编辑工具，支持音频裁剪、试听和 PICO 头显歌曲导入。</p>"
-        "<p>本项目使用 GNU GPL 第 3 版许可。Qt、FFmpeg 等第三方组件遵循各自的许可，随包附有许可和来源说明。</p>"));
+        "<p>本项目使用 GNU GPL 第 3 版许可。Qt、FFmpeg 等第三方组件遵循各自的许可，随包附有许可和来源说明。</p>")
+        .arg(lmsc::AppInfo::name().toHtmlEscaped(), lmsc::AppInfo::version().toHtmlEscaped(),
+             lmsc::AppInfo::author().toHtmlEscaped()));
+    auto homepageButton = about.addButton(tr("项目主页"), QMessageBox::ActionRole);
+    homepageButton->setObjectName(QStringLiteral("aboutHomepageButton"));
     auto licenseButton = about.addButton(tr("查看 GPLv3 许可"), QMessageBox::ActionRole);
     about.addButton(tr("关闭"), QMessageBox::RejectRole);
     about.exec();
+    if (about.clickedButton() == homepageButton) {
+        if (!QDesktopServices::openUrl(QUrl(lmsc::AppInfo::homepageUrl())))
+            QMessageBox::warning(this, tr("打开项目主页失败"), tr("无法打开浏览器，请手动访问：\n%1").arg(lmsc::AppInfo::homepageUrl()));
+        return;
+    }
     if (about.clickedButton() != licenseButton) return;
     QDialog license(this);
     license.setObjectName(QStringLiteral("gplLicenseDialog"));

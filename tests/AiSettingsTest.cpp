@@ -1,5 +1,8 @@
 #include "core/AppSettings.h"
 #include "core/ApiModelClient.h"
+#ifdef Q_OS_WIN
+#include "core/WinHttpModelTransport.h"
+#endif
 
 #include <QFile>
 #include <QElapsedTimer>
@@ -8,6 +11,7 @@
 #include <QPointer>
 #include <QSharedPointer>
 #include <QSignalSpy>
+#include <QSslSocket>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTemporaryDir>
@@ -83,6 +87,13 @@ private slots:
     void encryptedRoundTripAndIndependentProviders();
     void invalidSettingsAndAtomicFailure();
     void corruptedKeyRetainsOtherPreferences();
+    void proxySettingsRoundTripAndBackwardCompatibility();
+    void invalidProxyConfiguration_data();
+    void invalidProxyConfiguration();
+    void manualProxyIsUsedAndAutomaticModeRestoresDirectLocalAccess();
+    void nativeManualProxyReturnsAnHttpResponse();
+    void httpsProxyTunnelDoesNotSendCredentialsBeforeTls();
+    void invalidProxyPreventsRequests();
     void modelsUseOpenAiFormatAndAuthorization();
     void mimoUsesItsRequiredHeader();
     void rejectedAddressesAndKeys_data();
@@ -107,6 +118,8 @@ void AiSettingsTest::missingSettingsUseProviderDefaults() {
     QCOMPARE(preferences.themeMode, QStringLiteral("system"));
     QCOMPARE(preferences.providerId, QStringLiteral("deepseek"));
     QCOMPARE(preferences.aiConnection, QStringLiteral("api"));
+    QCOMPARE(preferences.networkProxy.mode, QStringLiteral("system"));
+    QVERIFY(preferences.networkProxy.host.isEmpty());
     QVERIFY(preferences.providers.contains(QStringLiteral("mimo")));
     QCOMPARE(preferences.providers.value(QStringLiteral("kimi")).baseUrl,
              QStringLiteral("https://api.moonshot.cn/v1"));
@@ -213,6 +226,162 @@ void AiSettingsTest::corruptedKeyRetainsOtherPreferences() {
              QStringLiteral("preserved-model"));
     QVERIFY(preferences.providers.value(QStringLiteral("deepseek")).apiKey.isEmpty());
     QVERIFY(!error.contains(QStringLiteral("do-not-load-plaintext")));
+}
+
+void AiSettingsTest::proxySettingsRoundTripAndBackwardCompatibility() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    lmsc::AppSettings settings(directory.filePath(QStringLiteral("preferences.json")));
+    auto preferences = settings.load();
+    preferences.networkProxy = {QStringLiteral("manual"), QStringLiteral(" 127.0.0.1 "), 7890};
+    QString error;
+    QVERIFY2(settings.save(preferences, &error), qPrintable(error));
+    auto loaded = settings.load(&error);
+    QVERIFY2(error.isEmpty(), qPrintable(error));
+    QCOMPARE(loaded.networkProxy.mode, QStringLiteral("manual"));
+    QCOMPARE(loaded.networkProxy.host, QStringLiteral("127.0.0.1"));
+    QCOMPARE(loaded.networkProxy.port, 7890);
+    const QByteArray original = readFile(settings.filePath());
+    preferences.networkProxy.port = 0;
+    QVERIFY(!settings.save(preferences, &error));
+    QVERIFY(error.contains(QStringLiteral("端口")));
+    QCOMPARE(readFile(settings.filePath()), original);
+    QJsonObject root = QJsonDocument::fromJson(original).object();
+    root.remove(QStringLiteral("networkProxy"));
+    QVERIFY(writeFile(settings.filePath(), QJsonDocument(root).toJson()));
+    loaded = settings.load(&error);
+    QVERIFY2(error.isEmpty(), qPrintable(error));
+    QCOMPARE(loaded.networkProxy.mode, QStringLiteral("system"));
+    root.insert(QStringLiteral("networkProxy"), QJsonObject{
+        {QStringLiteral("mode"), QStringLiteral("manual")},
+        {QStringLiteral("host"), QStringLiteral("127.0.0.1")},
+        {QStringLiteral("port"), 7890.5}});
+    QVERIFY(writeFile(settings.filePath(), QJsonDocument(root).toJson()));
+    loaded = settings.load(&error);
+    QVERIFY(error.contains(QStringLiteral("代理")));
+    QCOMPARE(loaded.networkProxy.mode, QStringLiteral("system"));
+    QCOMPARE(loaded.providerId, preferences.providerId);
+    QVERIFY(lmsc::AppSettings::validateProxy({QStringLiteral("manual"), QStringLiteral("::1"), 1}).isEmpty());
+    QVERIFY(lmsc::AppSettings::validateProxy({QStringLiteral("manual"), QStringLiteral("proxy.example.invalid"), 65535}).isEmpty());
+    QVERIFY(lmsc::AppSettings::validateProxy({QStringLiteral("system"), {}, 0}).isEmpty());
+}
+
+void AiSettingsTest::invalidProxyConfiguration_data() {
+    QTest::addColumn<QString>("mode");
+    QTest::addColumn<QString>("host");
+    QTest::addColumn<int>("port");
+    QTest::newRow("unknown-mode") << QStringLiteral("unknown") << QStringLiteral("localhost") << 8080;
+    QTest::newRow("empty-host") << QStringLiteral("manual") << QString{} << 8080;
+    QTest::newRow("scheme") << QStringLiteral("manual") << QStringLiteral("http://localhost") << 8080;
+    QTest::newRow("path") << QStringLiteral("manual") << QStringLiteral("localhost/proxy") << 8080;
+    QTest::newRow("userinfo") << QStringLiteral("manual") << QStringLiteral("user:secret@localhost") << 8080;
+    QTest::newRow("embedded-port") << QStringLiteral("manual") << QStringLiteral("localhost:7890") << 8080;
+    QTest::newRow("whitespace") << QStringLiteral("manual") << QStringLiteral("local host") << 8080;
+    QTest::newRow("control") << QStringLiteral("manual") << QStringLiteral("local\r\nhost") << 8080;
+    QTest::newRow("invalid-dns") << QStringLiteral("manual") << QStringLiteral("-invalid.host") << 8080;
+    QTest::newRow("empty-dns-label") << QStringLiteral("manual") << QStringLiteral("invalid..host") << 8080;
+    QTest::newRow("zero-port") << QStringLiteral("manual") << QStringLiteral("127.0.0.1") << 0;
+    QTest::newRow("negative-port") << QStringLiteral("manual") << QStringLiteral("127.0.0.1") << -1;
+    QTest::newRow("too-large-port") << QStringLiteral("manual") << QStringLiteral("127.0.0.1") << 65536;
+}
+
+void AiSettingsTest::invalidProxyConfiguration() {
+    QFETCH(QString, mode);
+    QFETCH(QString, host);
+    QFETCH(int, port);
+    const QString error = lmsc::AppSettings::validateProxy({mode, host, port});
+    QVERIFY(!error.isEmpty());
+    QVERIFY(!error.contains(QStringLiteral("secret")));
+}
+
+void AiSettingsTest::manualProxyIsUsedAndAutomaticModeRestoresDirectLocalAccess() {
+#ifndef Q_OS_WIN
+    if (!QSslSocket::supportsSsl()) QSKIP("HTTPS runtime libraries are unavailable.");
+#endif
+    HttpFixture destination;
+    HttpFixture proxy;
+    QVERIFY(destination.listen());
+    QVERIFY(proxy.listen());
+    proxy.responses.append(Response{502, {}, {}, 0});
+    lmsc::ApiModelClient client;
+    QSignalSpy ready(&client, &lmsc::ApiModelClient::modelsReady);
+    QSignalSpy failed(&client, &lmsc::ApiModelClient::requestFailed);
+    client.setProxyConfig({QStringLiteral("manual"), QStringLiteral("127.0.0.1"), proxy.server.serverPort()});
+    client.fetchModels(QStringLiteral("https://proxy-target.invalid/v1"),
+                       QStringLiteral("test-only-proxy-key"), QStringLiteral("custom"));
+    QTRY_COMPARE(failed.count(), 1);
+    QCOMPARE(ready.count(), 0);
+    QCOMPARE(destination.requests.count(), 0);
+    QVERIFY(!proxy.requests.isEmpty());
+    const int proxyRequests = proxy.requests.count();
+    QVERIFY(proxy.requests.first().startsWith("CONNECT proxy-target.invalid:443 HTTP/1.1"));
+    // Explicit manual mode also keeps local gateways on this computer.
+    client.fetchModels(destination.baseUrl(), QStringLiteral("test-only-local-key"), QStringLiteral("custom"));
+    QTRY_COMPARE(ready.count(), 1);
+    QCOMPARE(destination.requests.count(), 1);
+    QCOMPARE(proxy.requests.count(), proxyRequests);
+    client.setProxyConfig({});
+    client.fetchModels(destination.baseUrl(), QStringLiteral("test-only-direct-key"), QStringLiteral("custom"));
+    QTRY_COMPARE(ready.count(), 2);
+    QCOMPARE(failed.count(), 1);
+    QCOMPARE(proxy.requests.count(), proxyRequests);
+    QCOMPARE(destination.requests.count(), 2);
+}
+
+void AiSettingsTest::nativeManualProxyReturnsAnHttpResponse() {
+#ifdef Q_OS_WIN
+    HttpFixture proxy;
+    QVERIFY(proxy.listen());
+    lmsc::WinHttpModelTransport transport;
+    QSignalSpy reply(&transport, &lmsc::WinHttpModelTransport::replyReady);
+    // Exercise the transport directly, with no DNS or public network needed.
+    // ApiModelClient still rejects plaintext HTTP for all remote API endpoints.
+    transport.fetch(QUrl(QStringLiteral("http://transport-target.invalid/v1/models")),
+                    QStringLiteral("test-only-native-proxy-key"), QStringLiteral("custom"), 2000,
+                    {QStringLiteral("manual"), QStringLiteral("127.0.0.1"), proxy.server.serverPort()});
+    QTRY_COMPARE(reply.count(), 1);
+    QCOMPARE(reply.first().at(0).toInt(), 200);
+    QCOMPARE(reply.first().at(1).toByteArray(), Response{}.body);
+    QVERIFY(reply.first().at(2).toString().isEmpty());
+    QCOMPARE(proxy.requests.count(), 1);
+    QVERIFY(proxy.requests.first().startsWith("GET http://transport-target.invalid/v1/models HTTP/1.1"));
+    QVERIFY(proxy.requests.first().contains("Authorization: Bearer test-only-native-proxy-key\r\n"));
+#else
+    QSKIP("The native WinHTTP transport is Windows-only.");
+#endif
+}
+
+void AiSettingsTest::httpsProxyTunnelDoesNotSendCredentialsBeforeTls() {
+#ifndef Q_OS_WIN
+    if (!QSslSocket::supportsSsl()) QSKIP("HTTPS runtime libraries are unavailable.");
+#endif
+    HttpFixture proxy;
+    QVERIFY(proxy.listen());
+    proxy.responses.append(Response{502, {}, {}, 0});
+    lmsc::ApiModelClient client;
+    QSignalSpy failed(&client, &lmsc::ApiModelClient::requestFailed);
+    client.setProxyConfig({QStringLiteral("manual"), QStringLiteral("127.0.0.1"), proxy.server.serverPort()});
+    client.fetchModels(QStringLiteral("https://proxy-target.invalid/v1"),
+                       QStringLiteral("test-only-tunnel-key"), QStringLiteral("custom"));
+    QTRY_COMPARE(failed.count(), 1);
+    QVERIFY(!proxy.requests.isEmpty());
+    QVERIFY(proxy.requests.first().startsWith("CONNECT proxy-target.invalid:443 HTTP/1.1"));
+    for (const QByteArray &request : proxy.requests)
+        QVERIFY(!request.contains("test-only-tunnel-key"));
+    QVERIFY(!failed.first().first().toString().contains(QStringLiteral("test-only-tunnel-key")));
+}
+
+void AiSettingsTest::invalidProxyPreventsRequests() {
+    HttpFixture destination;
+    QVERIFY(destination.listen());
+    lmsc::ApiModelClient client;
+    QSignalSpy failed(&client, &lmsc::ApiModelClient::requestFailed);
+    client.setProxyConfig({QStringLiteral("manual"), QStringLiteral("http://bad-proxy"), 8080});
+    client.fetchModels(destination.baseUrl(), QStringLiteral("test-only-key"), QStringLiteral("custom"));
+    QCOMPARE(failed.count(), 1);
+    QVERIFY(!client.isBusy());
+    QTest::qWait(50);
+    QCOMPARE(destination.requests.count(), 0);
 }
 
 void AiSettingsTest::modelsUseOpenAiFormatAndAuthorization() {

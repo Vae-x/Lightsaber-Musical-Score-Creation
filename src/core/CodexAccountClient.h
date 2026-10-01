@@ -1,5 +1,7 @@
 #pragma once
 
+#include "AppSettings.h"
+
 #include <QElapsedTimer>
 #include <QHash>
 #include <QJsonObject>
@@ -21,6 +23,7 @@ public:
     ~CodexAccountClient() override;
 
     void setExecutablePath(const QString &path);
+    void setProxyConfig(const NetworkProxyConfig &proxy);
     QString executablePath() const;
     static QString detectedExecutable();
     void checkAccount();
@@ -61,6 +64,7 @@ private:
     QQueue<Operation> m_operations;
     QByteArray m_output;
     QString m_executable;
+    NetworkProxyConfig m_proxy;
     QString m_loginId;
     QStringList m_models;
     QSet<QString> m_modelCursors;

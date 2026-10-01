@@ -1,5 +1,7 @@
 #pragma once
 
+#include "AppSettings.h"
+
 #include <QObject>
 #include <QPointer>
 #include <QStringList>
@@ -19,6 +21,7 @@ class ApiModelClient : public QObject {
     Q_OBJECT
 public:
     explicit ApiModelClient(QObject *parent = nullptr);
+    void setProxyConfig(const NetworkProxyConfig &proxy);
     void fetchModels(const QString &baseUrl, const QString &apiKey,
                      const QString &providerId, int timeoutMs = 20000);
     void cancel();
@@ -38,6 +41,7 @@ private:
     QTimer *m_timeout = nullptr;
     quint64 m_generation = 0;
     bool m_busy = false;
+    NetworkProxyConfig m_proxy;
 };
 
 } // namespace lmsc

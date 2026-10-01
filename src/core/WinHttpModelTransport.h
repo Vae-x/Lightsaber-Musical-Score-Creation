@@ -1,5 +1,7 @@
 #pragma once
 
+#include "AppSettings.h"
+
 #include <QObject>
 
 #ifdef Q_OS_WIN
@@ -20,7 +22,8 @@ class WinHttpModelTransport : public QObject {
 public:
     explicit WinHttpModelTransport(QObject *parent = nullptr);
     ~WinHttpModelTransport() override;
-    void fetch(const QUrl &url, const QString &key, const QString &providerId, int timeoutMs);
+    void fetch(const QUrl &url, const QString &key, const QString &providerId, int timeoutMs,
+               const NetworkProxyConfig &proxy);
     void cancel();
 
 signals:

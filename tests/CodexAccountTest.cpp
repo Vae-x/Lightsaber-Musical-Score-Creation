@@ -8,6 +8,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QProcessEnvironment>
 #include <QTemporaryDir>
 #include <QTextStream>
 #include <QThread>
@@ -50,6 +51,16 @@ int mockServer() {
     const QString mode = qEnvironmentVariable("LMSC_CODEX_TEST_MODE");
     QFile log(qEnvironmentVariable("LMSC_CODEX_TEST_LOG"));
     if (!log.open(QIODevice::WriteOnly | QIODevice::Append)) return 3;
+    const QString environmentLog = qEnvironmentVariable("LMSC_CODEX_TEST_ENV_LOG");
+    if (!environmentLog.isEmpty()) {
+        QFile file(environmentLog);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Append)) return 12;
+        QJsonObject environment;
+        for (const char *name : {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy",
+                                "https_proxy", "all_proxy", "NO_PROXY", "no_proxy"})
+            environment.insert(QString::fromLatin1(name), qEnvironmentVariable(name));
+        file.write(QJsonDocument(environment).toJson(QJsonDocument::Compact) + '\n');
+    }
     bool initialized = false;
     bool handshake = false;
     std::string line;
@@ -297,6 +308,69 @@ void failureModes(const QString &directory, const QString &mode) {
         check(waitUntil([&] { return account; }), QStringLiteral("单个请求错误后仍可继续读取账号"));
     }
 }
+
+void proxyEnvironmentAndReconfiguration(const QString &directory) {
+    // Only synthetic proxy values enter the test log. Restore the caller's
+    // original environment, and verify the client never edits it itself.
+    const QStringList names{QStringLiteral("HTTP_PROXY"), QStringLiteral("HTTPS_PROXY"),
+                            QStringLiteral("ALL_PROXY"), QStringLiteral("http_proxy"),
+                            QStringLiteral("https_proxy"), QStringLiteral("all_proxy"),
+                            QStringLiteral("NO_PROXY"), QStringLiteral("no_proxy"),
+                            QStringLiteral("LMSC_CODEX_TEST_ENV_LOG")};
+    const QProcessEnvironment original = QProcessEnvironment::systemEnvironment();
+    const QString environmentLog = QDir(directory).filePath("proxy-environment.jsonl");
+    for (const QString &name : names) {
+        const QByteArray key = name.toLatin1();
+        if (name == QStringLiteral("LMSC_CODEX_TEST_ENV_LOG")) qputenv(key.constData(), environmentLog.toUtf8());
+        else qputenv(key.constData(), name.contains(QStringLiteral("NO_PROXY"), Qt::CaseInsensitive)
+                     ? QByteArray("*") : QByteArray("http://parent-proxy.invalid:18080"));
+    }
+    {
+        lmsc::CodexAccountClient client;
+        setup(client, "proxyEnvironment", QDir(directory).filePath("proxy-reconfiguration.jsonl"));
+        int accounts = 0;
+        QString error;
+        QObject::connect(&client, &lmsc::CodexAccountClient::accountStatus, [&](const QString &, bool) { ++accounts; });
+        QObject::connect(&client, &lmsc::CodexAccountClient::requestFailed, [&](const QString &message) { error = message; });
+        client.checkAccount();
+        check(waitUntil([&] { return accounts == 1 || !error.isEmpty(); }) && accounts == 1,
+              QStringLiteral("默认代理模式可启动继承环境的官方账号服务"));
+        client.setProxyConfig({QStringLiteral("manual"), QStringLiteral("proxy.example.invalid"), 7890});
+        client.checkAccount();
+        check(waitUntil([&] { return accounts == 2 || !error.isEmpty(); }) && accounts == 2,
+              QStringLiteral("修改代理时异步重启服务并完成首次操作"));
+        client.setProxyConfig({});
+        client.checkAccount();
+        check(waitUntil([&] { return accounts == 3 || !error.isEmpty(); }) && accounts == 3,
+              QStringLiteral("切回自动代理时移除本窗口的手动子进程环境"));
+        const QList<QJsonObject> snapshots = requests(environmentLog);
+        check(snapshots.size() == 3, QStringLiteral("代理变化只重新启动必要的三个 mock 服务"));
+        if (snapshots.size() == 3) {
+            for (const QString &name : names) {
+                if (name == QStringLiteral("LMSC_CODEX_TEST_ENV_LOG")) continue;
+                const bool bypass = name.contains(QStringLiteral("NO_PROXY"), Qt::CaseInsensitive);
+                const QString inherited = bypass ? QStringLiteral("*") : QStringLiteral("http://parent-proxy.invalid:18080");
+                check(snapshots.at(0).value(name).toString() == inherited
+                      && snapshots.at(2).value(name).toString() == inherited,
+                      QStringLiteral("自动模式保留 CLI 原环境：") + name);
+                check(snapshots.at(1).value(name).toString() == (bypass
+                      ? QStringLiteral("localhost,127.0.0.1,::1") : QStringLiteral("http://proxy.example.invalid:7890")),
+                      QStringLiteral("手动代理覆盖子进程并保留本地登录回调直连：") + name);
+                check(qEnvironmentVariable(name.toLatin1().constData()) == inherited,
+                      QStringLiteral("手动代理没有污染主进程环境：") + name);
+            }
+        }
+        client.setProxyConfig({QStringLiteral("manual"), {}, 0});
+        client.checkAccount();
+        check(waitUntil([&] { return !error.isEmpty(); }), QStringLiteral("无效手动代理不启动新的服务"));
+        check(requests(environmentLog).size() == 3, QStringLiteral("无效代理没有启动第四个 mock 子进程"));
+    }
+    for (const QString &name : names) {
+        const QByteArray key = name.toLatin1();
+        if (original.contains(name)) qputenv(key.constData(), original.value(name).toUtf8());
+        else qunsetenv(key.constData());
+    }
+}
 } // namespace
 
 int main(int argc, char **argv) {
@@ -315,6 +389,7 @@ int main(int argc, char **argv) {
     failureModes(temporary.path(), "malformed");
     failureModes(temporary.path(), "cursorLoop");
     failureModes(temporary.path(), "invalidUrl");
+    proxyEnvironmentAndReconfiguration(temporary.path());
     {
         lmsc::CodexAccountClient client;
         client.setExecutablePath(QDir(temporary.path()).filePath("missing-codex.exe"));

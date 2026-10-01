@@ -5,6 +5,7 @@
 #include <QFont>
 #include <QIcon>
 #include <QTimer>
+#include "core/AppInfo.h"
 #include "gui/MainWindow.h"
 #include "gui/EditorViews.h"
 
@@ -12,9 +13,9 @@ int main(int argc, char *argv[]) {
     QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
     QCoreApplication::setAttribute(Qt::AA_UseHighDpiPixmaps);
     QApplication application(argc, argv);
-    application.setApplicationName(QStringLiteral("光剑曲谱制作"));
-    application.setApplicationDisplayName(QStringLiteral("光剑曲谱制作"));
-    application.setApplicationVersion("0.2.0");
+    application.setApplicationName(lmsc::AppInfo::name());
+    application.setApplicationDisplayName(lmsc::AppInfo::name());
+    application.setApplicationVersion(lmsc::AppInfo::version());
     application.setOrganizationName("LMSC");
     application.setWindowIcon(QIcon(":/icons/app.png"));
     application.setFont(QFont("Microsoft YaHei UI", 9));
