@@ -25,11 +25,17 @@ QString nativeExecutableIn(const QString &openaiDirectory) {
     for (const QString &target : targets) {
         const QString package = target.startsWith("aarch64") ? QStringLiteral("codex-win32-arm64")
                                                             : QStringLiteral("codex-win32-x64");
-        const QStringList roots{QDir(openaiDirectory).filePath(package + "/vendor"),
+        // npm keeps the current platform package nested when an older package
+        // with the same name already exists at the top level. Recent releases
+        // also moved the binary from codex/ to bin/.
+        const QStringList roots{QDir(openaiDirectory).filePath("codex/node_modules/@openai/" + package + "/vendor"),
+                                QDir(openaiDirectory).filePath(package + "/vendor"),
                                 QDir(openaiDirectory).filePath("codex/vendor")};
         for (const QString &root : roots) {
-            const QString executable = QDir(root).filePath(target + "/codex/codex.exe");
-            if (QFileInfo(executable).isFile()) return QFileInfo(executable).absoluteFilePath();
+            for (const QString &folder : {QStringLiteral("bin"), QStringLiteral("codex")}) {
+                const QString executable = QDir(root).filePath(target + '/' + folder + "/codex.exe");
+                if (QFileInfo(executable).isFile()) return QFileInfo(executable).absoluteFilePath();
+            }
         }
     }
 #else
@@ -148,17 +154,19 @@ QString CodexAccountClient::executablePath() const {
 }
 
 QString CodexAccountClient::detectedExecutable() {
+    const QStringList roots = npmRoots();
+    // Prefer the native binary belonging to the installed npm wrapper rather
+    // than a stale WinGet link or old top-level optional dependency.
+    for (const QString &root : roots) {
+        const QString native = nativeExecutableIn(root);
+        if (!native.isEmpty()) return native;
+    }
 #ifdef Q_OS_WIN
     const QString fromPath = QStandardPaths::findExecutable(QStringLiteral("codex.exe"));
 #else
     const QString fromPath = QStandardPaths::findExecutable(QStringLiteral("codex"));
 #endif
     if (!fromPath.isEmpty()) return fromPath;
-    const QStringList roots = npmRoots();
-    for (const QString &root : roots) {
-        const QString native = nativeExecutableIn(root);
-        if (!native.isEmpty()) return native;
-    }
     for (const QString &root : roots) {
         const QString script = QDir(root).filePath(QStringLiteral("codex/bin/codex.js"));
         if (QFileInfo(script).isFile() && !QStandardPaths::findExecutable(QStringLiteral("node")).isEmpty())

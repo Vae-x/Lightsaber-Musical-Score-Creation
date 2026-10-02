@@ -72,6 +72,8 @@ public:
     const TimeMap &timeMap() const;
     QString readOnlyReason() const;
     QStringList warnings() const;
+    // Monotonic within this document, including undo/redo and timing changes.
+    quint64 revision() const;
 
     bool addObject(const BeatObject &object, QString *error = nullptr);
     bool updateObject(const BeatObject &object, QString *error = nullptr);
@@ -81,6 +83,10 @@ public:
     bool pasteObjects(const QVector<BeatObject> &objects, double beatOffset,
                       int xOffset = 0, bool mirror = false, QString *error = nullptr);
     bool mirrorObjects(const QStringList &ids, QString *error = nullptr);
+    // New songs only: replace the entire chart and its difficulty in one command.
+    bool applyGeneratedChart(const QVector<BeatObject> &objects,
+                             const QString &difficultyName, int difficultyRank,
+                             quint64 expectedRevision, QString *error = nullptr);
     bool canUndo() const;
     bool canRedo() const;
     bool undo();

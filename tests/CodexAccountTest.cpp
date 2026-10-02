@@ -5,6 +5,7 @@
 #include <QElapsedTimer>
 #include <QEventLoop>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -371,6 +372,46 @@ void proxyEnvironmentAndReconfiguration(const QString &directory) {
         else qunsetenv(key.constData());
     }
 }
+
+void nestedNpmExecutableDiscovery(const QString &directory) {
+#ifdef Q_OS_WIN
+    const QProcessEnvironment original = QProcessEnvironment::systemEnvironment();
+    const QString npmAppData = QDir(directory).filePath("mock-appdata");
+    const QString openai = QDir(npmAppData).filePath("npm/node_modules/@openai");
+    const QString current = QDir(openai).filePath("codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe");
+    const QString stale = QDir(openai).filePath("codex-win32-x64/vendor/x86_64-pc-windows-msvc/codex/codex.exe");
+    check(QDir().mkpath(QFileInfo(current).absolutePath()) && QDir().mkpath(QFileInfo(stale).absolutePath()),
+          QStringLiteral("创建新旧 npm 平台包目录"));
+    check(QFile::copy(QCoreApplication::applicationFilePath(), current), QStringLiteral("复制当前嵌套平台包 mock"));
+    QFile old(stale);
+    check(old.open(QIODevice::WriteOnly), QStringLiteral("创建旧版本占位文件"));
+    old.write("stale binary must not be selected");
+    old.close();
+    const QString wrapper = QDir(npmAppData).filePath("npm/codex.cmd");
+    QFile shim(wrapper);
+    check(shim.open(QIODevice::WriteOnly), QStringLiteral("创建 npm 入口占位文件"));
+    shim.close();
+    qputenv("APPDATA", npmAppData.toUtf8());
+    check(lmsc::CodexAccountClient::detectedExecutable() == QFileInfo(current).absoluteFilePath(),
+          QStringLiteral("自动发现优先当前嵌套包和 bin 目录，避免旧 PATH/顶层平台包"));
+    {
+        lmsc::CodexAccountClient client;
+        setup(client, "discovery", QDir(directory).filePath("npm-wrapper.jsonl"));
+        client.setExecutablePath(wrapper);
+        QStringList models;
+        QString error;
+        QObject::connect(&client, &lmsc::CodexAccountClient::modelsReady, [&](const QStringList &value) { models = value; });
+        QObject::connect(&client, &lmsc::CodexAccountClient::requestFailed, [&](const QString &value) { error = value; });
+        client.fetchModels();
+        check(waitUntil([&] { return !models.isEmpty() || !error.isEmpty(); }) && !models.isEmpty(),
+              QStringLiteral("手动 npm cmd 入口通过当前原生程序运行，不执行 cmd shell"));
+    }
+    if (original.contains("APPDATA")) qputenv("APPDATA", original.value("APPDATA").toUtf8());
+    else qunsetenv("APPDATA");
+#else
+    Q_UNUSED(directory)
+#endif
+}
 } // namespace
 
 int main(int argc, char **argv) {
@@ -390,6 +431,7 @@ int main(int argc, char **argv) {
     failureModes(temporary.path(), "cursorLoop");
     failureModes(temporary.path(), "invalidUrl");
     proxyEnvironmentAndReconfiguration(temporary.path());
+    nestedNpmExecutableDiscovery(temporary.path());
     {
         lmsc::CodexAccountClient client;
         client.setExecutablePath(QDir(temporary.path()).filePath("missing-codex.exe"));

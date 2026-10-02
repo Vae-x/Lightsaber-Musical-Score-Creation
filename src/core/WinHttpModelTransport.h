@@ -24,12 +24,16 @@ public:
     ~WinHttpModelTransport() override;
     void fetch(const QUrl &url, const QString &key, const QString &providerId, int timeoutMs,
                const NetworkProxyConfig &proxy);
+    void post(const QUrl &url, const QString &key, const QString &providerId,
+              const QByteArray &body, int timeoutMs, const NetworkProxyConfig &proxy);
     void cancel();
 
 signals:
     void replyReady(int status, const QByteArray &contents, const QString &error);
 
 private:
+    void start(const QUrl &url, const QString &key, const QString &providerId,
+               const QByteArray &body, bool post, int timeoutMs, const NetworkProxyConfig &proxy);
     quint64 m_generation = 0;
     QMap<QThread *, std::shared_ptr<WinHttpRequestState>> m_tasks;
 };

@@ -102,7 +102,15 @@ private:
     bool m_loop = false, m_metronome = false;
 };
 
-AudioService::AudioService(QObject *parent) : QObject(parent) {
+namespace {
+struct PcmFileLease {
+    QString path;
+    std::shared_ptr<QTemporaryDir> directory;
+    ~PcmFileLease() { QFile::remove(path); }
+};
+}
+
+AudioService::AudioService(QObject *parent) : QObject(parent), m_cache(std::make_shared<QTemporaryDir>()) {
     qRegisterMetaType<MediaInfo>();
     qRegisterMetaType<QVector<float>>();
     connect(&m_process, &QProcess::readyReadStandardOutput, this, &AudioService::readProcessOutput);
@@ -160,6 +168,19 @@ bool AudioService::toolsAvailable() const {
 }
 bool AudioService::isBusy() const { return m_task != Task::None || m_waveThread; }
 
+lmsc::PcmAudioSnapshot AudioService::pcmSnapshot() const {
+    lmsc::PcmAudioSnapshot snapshot;
+    if (!isReady() || isBusy()) return snapshot;
+    snapshot.path = m_basePcm;
+    snapshot.sourcePath = m_source;
+    snapshot.revision = m_pcmRevision;
+    snapshot.durationSeconds = m_duration;
+    snapshot.sampleRate = SampleRate;
+    snapshot.channels = Channels;
+    snapshot.lease = m_baseLease;
+    return snapshot;
+}
+
 void AudioService::startProcess(Task task, const QString &program, const QStringList &arguments) {
     if (isBusy()) { emit errorOccurred(tr("已有音频任务，请等待完成或取消。")); return; }
     if (program.isEmpty() || !QFileInfo::exists(program)) {
@@ -201,13 +222,14 @@ void AudioService::loadAudio(const QString &path, int streamIndex) {
     stop();
     // Temporary audio belongs to this service. Release previous project caches
     // after closing the playback file, rather than retaining every opened song.
-    if (!m_basePcm.isEmpty()) QFile::remove(m_basePcm);
+    m_baseLease.reset();
+    ++m_pcmRevision;
     for (const auto &cache : m_speedPcm) QFile::remove(cache);
     const bool speedChanged = !qFuzzyCompare(m_speed, 1.0);
     m_basePcm.clear(); m_speedPcm.clear(); m_waveform.clear(); m_duration = 0; m_speed = 1; m_loop = false;
     if (speedChanged) emit playbackSpeedChanged(1);
     m_source = QFileInfo(path).absoluteFilePath();
-    m_taskOutput = m_cache.filePath(QUuid::createUuid().toString(QUuid::WithoutBraces) + ".pcm");
+    m_taskOutput = m_cache->filePath(QUuid::createUuid().toString(QUuid::WithoutBraces) + ".pcm");
     m_taskDuration = 0;
     startProcess(Task::Decode, toolPath("ffmpeg"), {"-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", m_source,
         "-map", streamIndex < 0 ? "0:a:0" : QString("0:%1").arg(streamIndex), "-vn", "-f", "s16le", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", "-progress", "pipe:1", "-nostats", m_taskOutput});
@@ -275,6 +297,10 @@ void AudioService::finishProcess(int exitCode, QProcess::ExitStatus status) {
     } else if (completed == Task::Decode) {
         if (QFileInfo(m_taskOutput).size() < FrameBytes) { emit errorOccurred(tr("音频为空，无法试听。")); return; }
         m_basePcm = m_taskOutput;
+        auto lease = std::make_shared<PcmFileLease>();
+        lease->path = m_basePcm;
+        lease->directory = m_cache;
+        m_baseLease = lease;
         m_duration = QFileInfo(m_basePcm).size() / double(SampleRate * FrameBytes);
         buildWaveform(m_basePcm);
     } else if (completed == Task::Speed) {
@@ -323,7 +349,8 @@ void AudioService::buildWaveform(const QString &pcmPath) {
         if (m_waveThread == thread) m_waveThread = nullptr;
         thread->deleteLater();
         if (result->interrupted || !result->error.isEmpty()) {
-            QFile::remove(m_basePcm); m_basePcm.clear(); m_waveform.clear(); m_duration = 0;
+            m_baseLease.reset(); ++m_pcmRevision;
+            m_basePcm.clear(); m_waveform.clear(); m_duration = 0;
             if (result->interrupted) emit cancelled(); else emit errorOccurred(result->error);
             return;
         }
@@ -400,7 +427,7 @@ void AudioService::setPlaybackSpeed(double speed) {
         m_speed = speed; emit playbackSpeedChanged(speed); restartPlayback(savedPosition, m_resumeAfterTask); return;
     }
     m_pendingSpeed = speed; m_taskDuration = m_duration / speed;
-    m_taskOutput = m_cache.filePath(QUuid::createUuid().toString(QUuid::WithoutBraces) + ".pcm");
+    m_taskOutput = m_cache->filePath(QUuid::createUuid().toString(QUuid::WithoutBraces) + ".pcm");
     startProcess(Task::Speed, toolPath("ffmpeg"), {"-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-f", "s16le", "-ar", "44100", "-ac", "2", "-i", m_basePcm,
         "-af", "atempo=" + decimal(speed), "-f", "s16le", "-acodec", "pcm_s16le", "-progress", "pipe:1", "-nostats", m_taskOutput});
 }

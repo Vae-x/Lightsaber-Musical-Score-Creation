@@ -27,6 +27,9 @@ struct WinHttpRequestState {
     DWORD dataSize = 0;
     int status = 0;
     QByteArray contents;
+    // WinHttpSendRequest may retain the body until the asynchronous request
+    // completes. The worker's shared state outlives all native callbacks.
+    QByteArray requestBody;
     std::array<char, 16384> buffer;
     QString error;
     std::chrono::steady_clock::time_point deadline;
@@ -142,7 +145,7 @@ struct Handles {
 
 void performRequest(const std::shared_ptr<WinHttpRequestState> &state,
                     const QUrl &url, const QString &key,
-                    const QString &providerId, int timeoutMs, const NetworkProxyConfig &proxy) {
+                    const QString &providerId, bool post, int timeoutMs, const NetworkProxyConfig &proxy) {
     if (cancelled(state)) return;
     Handles handles;
     // Keep local gateways direct in both modes. Other requests use Windows
@@ -182,8 +185,10 @@ void performRequest(const std::shared_ptr<WinHttpRequestState> &state,
         state->error = nativeError(GetLastError());
         return;
     }
-    const auto path = url.path(QUrl::FullyEncoded).toStdWString();
-    handles.request = WinHttpOpenRequest(handles.connection, L"GET", path.c_str(), nullptr,
+    QString requestPath = url.path(QUrl::FullyEncoded);
+    if (url.hasQuery()) requestPath += QLatin1Char('?') + url.query(QUrl::FullyEncoded);
+    const auto path = requestPath.toStdWString();
+    handles.request = WinHttpOpenRequest(handles.connection, post ? L"POST" : L"GET", path.c_str(), nullptr,
                                          WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
             url.scheme() == QStringLiteral("https") ? WINHTTP_FLAG_SECURE : 0);
     if (!handles.request) {
@@ -212,13 +217,17 @@ void performRequest(const std::shared_ptr<WinHttpRequestState> &state,
     }
     QString headers = QStringLiteral("Accept: application/json\r\nAuthorization: Bearer ")
             + key + QStringLiteral("\r\n");
+    if (post) headers += QStringLiteral("Content-Type: application/json; charset=utf-8\r\n");
     if (providerId == QStringLiteral("mimo"))
         headers += QStringLiteral("api-key: ") + key + QStringLiteral("\r\n");
     const auto nativeHeaders = headers.toStdWString();
     if (!prepareOperation(state)) return;
     const BOOL sent = WinHttpSendRequest(handles.request, nativeHeaders.c_str(),
                                         static_cast<DWORD>(nativeHeaders.size()),
-                                        WINHTTP_NO_REQUEST_DATA, 0, 0, contextValue);
+                                        post && !state->requestBody.isEmpty()
+                                            ? static_cast<LPVOID>(state->requestBody.data()) : WINHTTP_NO_REQUEST_DATA,
+                                        post ? static_cast<DWORD>(state->requestBody.size()) : 0,
+                                        post ? static_cast<DWORD>(state->requestBody.size()) : 0, contextValue);
     if (!waitFor(state, sent, GetLastError(), WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE)) return;
     if (!prepareOperation(state)) return;
     const BOOL received = WinHttpReceiveResponse(handles.request, nullptr);
@@ -286,12 +295,25 @@ void WinHttpModelTransport::cancel() {
 void WinHttpModelTransport::fetch(const QUrl &url, const QString &key,
                                 const QString &providerId, int timeoutMs,
                                 const NetworkProxyConfig &proxy) {
+    start(url, key, providerId, {}, false, timeoutMs, proxy);
+}
+
+void WinHttpModelTransport::post(const QUrl &url, const QString &key,
+                               const QString &providerId, const QByteArray &body,
+                               int timeoutMs, const NetworkProxyConfig &proxy) {
+    start(url, key, providerId, body, true, timeoutMs, proxy);
+}
+
+void WinHttpModelTransport::start(const QUrl &url, const QString &key,
+                                const QString &providerId, const QByteArray &body, bool post,
+                                int timeoutMs, const NetworkProxyConfig &proxy) {
     cancel();
     const quint64 generation = m_generation;
     const auto state = std::make_shared<WinHttpRequestState>();
+    state->requestBody = body;
     state->deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(qMax(1, timeoutMs));
-    QThread *thread = QThread::create([state, url, key, providerId, timeoutMs, proxy] {
-        performRequest(state, url, key, providerId, qMax(1, timeoutMs), proxy);
+    QThread *thread = QThread::create([state, url, key, providerId, post, timeoutMs, proxy] {
+        performRequest(state, url, key, providerId, post, qMax(1, timeoutMs), proxy);
     });
     m_tasks.insert(thread, state);
     connect(thread, &QThread::finished, this, [this, thread, state, generation] {

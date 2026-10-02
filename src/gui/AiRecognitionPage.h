@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/AiRecognitionService.h"
+#include "core/AiGenerationService.h"
 
 #include <QPointer>
 #include <QWidget>
@@ -9,6 +10,8 @@ class QLabel;
 class QPlainTextEdit;
 class QProgressBar;
 class QPushButton;
+class QComboBox;
+class QCheckBox;
 
 namespace lmsc {
 
@@ -23,15 +26,24 @@ public:
     // The caller retains backend ownership. nullptr restores the unavailable
     // backend. Qt connections are removed when either endpoint is destroyed.
     void setService(AiRecognitionService *service);
-    bool isRecognizing() const { return !m_pendingContextId.isEmpty(); }
+    void setGenerationService(AiGenerationService *service, AiGenerationService *fallback = nullptr);
+    void setGenerationContext(const GenerationRequest &context, bool newSong, bool busy);
+    void invalidateGeneration();
+    void showGenerationApplied();
+    bool isRecognizing() const { return !m_pendingContextId.isEmpty() || !m_pendingGeneration.jobId.isEmpty(); }
 
 public slots:
     void cancelRecognition();
+    void generateAgain() { startGeneration(false); }
 
 signals:
     void configureConnectionRequested();
     void analyzeRequested(const lmsc::AiRecognitionRequest &request);
     void cancelRequested(const QString &contextId);
+    void generationRequested(const lmsc::GenerationRequest &request);
+    void cancelGenerationRequested(const QString &jobId);
+    void generationDraftReady(const lmsc::GenerationDraft &draft);
+    void generationInvalidated();
 
 private:
     void startRecognition();
@@ -39,10 +51,22 @@ private:
     void showIdleStatus();
     void setStatus(const QString &text, const char *role = "muted");
     bool accepts(const QString &contextId) const;
+    void startGeneration(bool analysisOnly);
+    bool acceptsGeneration(const GenerationRequest &source) const;
+    GeneratedTypes selectedTypes() const;
 
     UnavailableAiRecognitionService *m_unavailable;
     QPointer<AiRecognitionService> m_service;
     QVector<QMetaObject::Connection> m_connections;
+    QPointer<AiGenerationService> m_generationService;
+    QPointer<AiGenerationService> m_generationFallback;
+    QVector<QMetaObject::Connection> m_generationConnections;
+    GenerationRequest m_generationContext;
+    GenerationRequest m_pendingGeneration;
+    quint64 m_generationServiceRevision = 0;
+    bool m_newSong = false;
+    bool m_legacyOverride = false;
+    bool m_updatingOptions = false;
     QString m_audioFile;
     QString m_title;
     QString m_pendingContextId;
@@ -57,6 +81,9 @@ private:
     QLabel *m_serviceStatus;
     QLabel *m_status;
     QPushButton *m_start;
+    QPushButton *m_generate;
+    QComboBox *m_difficulty;
+    QCheckBox *m_directional, *m_dots, *m_bombs, *m_walls;
     QPushButton *m_cancel;
     QPushButton *m_configure;
     QProgressBar *m_progress;

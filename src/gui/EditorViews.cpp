@@ -252,6 +252,11 @@ void TimelineView::setLoop(double start, double end) {
     update();
 }
 void TimelineView::setFollowPlayhead(bool enabled) { m_follow = enabled; }
+void TimelineView::setReadOnly(bool enabled) {
+    m_readOnly = enabled;
+    m_drag = Idle;
+    update();
+}
 QRectF TimelineView::contentRect() const { return QRectF(52, 0, std::max(0, width() - 52), std::max(0, height() - 20)); }
 QRectF TimelineView::tracksRect() const {
     const QRectF content = contentRect();
@@ -468,7 +473,7 @@ void TimelineView::mousePressEvent(QMouseEvent *event) {
                 selected = {object.id};
             }
             changeSelection(selected);
-            m_drag = MoveObjects;
+            m_drag = m_readOnly ? Idle : MoveObjects;
             m_dragBeatDelta = 0;
             m_dragLaneDelta = 0;
         } else {
@@ -531,7 +536,7 @@ void TimelineView::mouseReleaseEvent(QMouseEvent *event) {
                (std::abs(m_dragBeatDelta) > 1e-8 || m_dragLaneDelta != 0)) {
         // The document validates the complete transaction, including protected
         // objects. Filtering here would silently move only part of a selection.
-        if (!m_selected.isEmpty())
+        if (!m_readOnly && !m_selected.isEmpty())
             emit objectsMoveRequested(m_selected, m_dragBeatDelta, m_dragLaneDelta, 0);
     }
     m_drag = Idle;
@@ -559,7 +564,7 @@ void TimelineView::wheelEvent(QWheelEvent *event) {
     update();
 }
 void TimelineView::keyPressEvent(QKeyEvent *event) {
-    if (event->key() == Qt::Key_Delete || event->key() == Qt::Key_Backspace) {
+    if (!m_readOnly && (event->key() == Qt::Key_Delete || event->key() == Qt::Key_Backspace)) {
         emit deleteRequested();
         event->accept();
     } else if (event->key() == Qt::Key_Escape) {

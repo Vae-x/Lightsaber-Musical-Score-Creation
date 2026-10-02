@@ -17,6 +17,7 @@ int main(int argc, char **argv) {
     AudioService audio;
     audio.setToolsDirectory(QString::fromLocal8Bit(argv[2]));
     RhythmAnalyzer rhythm;
+    lmsc::PcmAudioSnapshot previousSnapshot;
     int stage = 0;
     bool failed = false;
     auto fail = [&](const QString &message) {
@@ -58,14 +59,26 @@ int main(int argc, char **argv) {
         if (!require(!audio.isBusy() && audio.waveform().size() > 0, "waveform worker completion")) return;
         if (stage == 3) {
             if (!require(std::abs(duration - 3) < 0.06, "cropped PCM duration")) return;
+            previousSnapshot = audio.pcmSnapshot();
+            if (!require(previousSnapshot.isValid() && previousSnapshot.path == audio.pcmCachePath()
+                         && bool(previousSnapshot.lease), "original-speed PCM lease")) return;
             stage = 4; audio.setPlaybackSpeed(0.5);
         } else if (stage == 5) {
+            const auto current = audio.pcmSnapshot();
+            if (!require(current.revision > previousSnapshot.revision
+                         && current.path != previousSnapshot.path
+                         && QFileInfo::exists(previousSnapshot.path), "song switch preserves analysis PCM lease")) return;
+            const QString previousPath = previousSnapshot.path;
+            previousSnapshot = {};
+            if (!require(!QFileInfo::exists(previousPath), "last analysis lease releases old PCM")) return;
             stage = 6; rhythm.analyze(audio.pcmCachePath());
         }
     });
     QObject::connect(&audio, &AudioService::playbackSpeedChanged, &app, [&](double speed) {
         if (stage == 4) {
             if (!require(std::abs(speed - 0.5) < 0.001, "pitch-preserving half-speed")) return;
+            if (!require(audio.pcmSnapshot().path == previousSnapshot.path,
+                         "analysis lease stays at original speed")) return;
             // Delay until task completion callback has updated playback state.
             stage = 5; QTimer::singleShot(0, &app, [&] { audio.loadAudio(fixtures.filePath("clicks.mp3")); });
         }

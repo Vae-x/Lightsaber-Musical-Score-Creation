@@ -8,6 +8,7 @@
 #include <QHash>
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QMap>
 #include <QSaveFile>
 #include <QSet>
 #include <QTemporaryDir>
@@ -105,7 +106,13 @@ struct BeatmapDocument::Impl {
     };
     struct Snapshot { BeatObject object; bool deleted = false; };
     struct Change { int entry; Snapshot before, after; };
-    struct Command { QVector<Change> changes; quint64 beforeKey, afterKey; };
+    struct DifficultySnapshot { QString name; int rank = 7; };
+    struct Command {
+        QVector<Change> changes;
+        quint64 beforeKey, afterKey;
+        bool difficultyChanged = false;
+        DifficultySnapshot beforeDifficulty, afterDifficulty;
+    };
     struct Track {
         Difficulty descriptor;
         QJsonObject raw;
@@ -137,6 +144,7 @@ struct BeatmapDocument::Impl {
     double newFirstBeatSeconds = 0.0;
     QStringList warnings;
     quint64 nextKey = 1, metaKey = 0, savedMetaKey = 0;
+    quint64 revision = 0;
 
     Track *track() { return current >= 0 && current < tracks.size() ? &tracks[current] : nullptr; }
     const Track *track() const { return current >= 0 && current < tracks.size() ? &tracks[current] : nullptr; }
@@ -168,7 +176,9 @@ struct BeatmapDocument::Impl {
     bool parseTrack(Track *track, QString *error);
     bool validate(const Track &track, const QVector<BeatObject> &objects,
                   const QSet<QString> &replaced, QString *error) const;
-    bool commit(Track *track, QVector<Change> changes, QString *error);
+    bool commit(Track *track, QVector<Change> changes, QString *error,
+                const QString &difficultyName = {}, int difficultyRank = 0);
+    void applyDifficulty(Track *track, const DifficultySnapshot &snapshot);
     QJsonObject merged(const Track &track) const;
     bool changed(const Track &track) const;
     QJsonObject state() const;
@@ -407,12 +417,36 @@ bool BeatmapDocument::Impl::validate(const Track &selected, const QVector<BeatOb
     return true;
 }
 
-bool BeatmapDocument::Impl::commit(Track *selected, QVector<Change> changes, QString *error) {
-    if (changes.isEmpty()) return true;
+void BeatmapDocument::Impl::applyDifficulty(Track *selected, const DifficultySnapshot &snapshot) {
+    auto sets = info.value("_difficultyBeatmapSets").toArray();
+    auto set = sets.first().toObject();
+    auto difficulties = set.value("_difficultyBeatmaps").toArray();
+    auto difficulty = difficulties.first().toObject();
+    difficulty.insert("_difficulty", snapshot.name);
+    difficulty.insert("_difficultyRank", snapshot.rank);
+    difficulties[0] = difficulty;
+    set.insert("_difficultyBeatmaps", difficulties);
+    sets[0] = set;
+    info.insert("_difficultyBeatmapSets", sets);
+    selected->descriptor.name = snapshot.name;
+    selected->descriptor.rank = snapshot.rank;
+}
+
+bool BeatmapDocument::Impl::commit(Track *selected, QVector<Change> changes, QString *error,
+                                   const QString &difficultyName, int difficultyRank) {
+    const bool difficultyChanged = !difficultyName.isEmpty()
+        && (difficultyName != selected->descriptor.name || difficultyRank != selected->descriptor.rank);
+    if (changes.isEmpty() && !difficultyChanged) return true;
     const qint64 bytes = qint64(changes.size()) * sizeof(Change);
     if (bytes > 16 * 1024 * 1024) return fail(error, QStringLiteral("本次批量操作超过撤销记录上限，请分段编辑。"));
     while (selected->history.size() > selected->cursor) selected->history.removeLast();
     Command command{std::move(changes), selected->stateKey, nextKey++};
+    command.difficultyChanged = difficultyChanged;
+    if (difficultyChanged) {
+        command.beforeDifficulty = {selected->descriptor.name, selected->descriptor.rank};
+        command.afterDifficulty = {difficultyName, difficultyRank};
+        applyDifficulty(selected, command.afterDifficulty);
+    }
     for (const auto &change : command.changes) {
         selected->entries[change.entry].object = change.after.object;
         selected->entries[change.entry].deleted = change.after.deleted;
@@ -446,6 +480,7 @@ bool BeatmapDocument::Impl::commit(Track *selected, QVector<Change> changes, QSt
         }
     }
     refresh();
+    ++revision;
     return true;
 }
 
@@ -630,6 +665,7 @@ bool BeatmapDocument::loadSong(const QString &folder, QString *error) {
     if (!incoming->temporary->isValid()) return fail(error, QStringLiteral("无法建立导入快照目录。"));
     incoming->assets = QDir(incoming->temporary->path()).filePath("assets");
     if (!ProjectStore::copyTree(folder, incoming->assets, error) || !incoming->initialize(error)) return false;
+    incoming->revision = d->revision + 1;
     d = std::move(incoming);
     return true;
 }
@@ -640,6 +676,7 @@ bool BeatmapDocument::loadZip(const QString &filename, QString *error) {
     if (!incoming->temporary->isValid()) return fail(error, QStringLiteral("无法建立 ZIP 快照目录。"));
     incoming->assets = QDir(incoming->temporary->path()).filePath("assets");
     if (!ProjectStore::extractZip(filename, incoming->assets, error) || !incoming->initialize(error)) return false;
+    incoming->revision = d->revision + 1;
     d = std::move(incoming);
     return true;
 }
@@ -684,6 +721,7 @@ bool BeatmapDocument::loadProject(const QString &path, QString *error) {
             return fail(error, QStringLiteral("此自动快照已被较新的手动保存取代。"));
     }
     if (recovery) incoming.d->metaKey = incoming.d->nextKey++;
+    incoming.d->revision = d->revision + 1;
     d = std::move(incoming.d);
     return true;
 }
@@ -729,6 +767,7 @@ bool BeatmapDocument::createNew(const QString &audioPath, const QString &title, 
     incoming->newFirstBeatSeconds = firstBeatSeconds;
     incoming->tracks[0].time = timing;
     incoming->metaKey = incoming->nextKey++;
+    incoming->revision = d->revision + 1;
     d = std::move(incoming);
     return true;
 }
@@ -745,9 +784,13 @@ const QVector<BeatObject> &BeatmapDocument::objects() const { return d->view; }
 const TimeMap &BeatmapDocument::timeMap() const { static const TimeMap fallback; return d->track() ? d->track()->time : fallback; }
 QString BeatmapDocument::readOnlyReason() const { return d->track() ? d->track()->readOnly : QStringLiteral("尚未打开曲谱。" ); }
 QStringList BeatmapDocument::warnings() const { return d->warnings; }
+quint64 BeatmapDocument::revision() const { return d->revision; }
 
 bool BeatmapDocument::setDifficulty(const QString &id, QString *error) {
-    for (int i = 0; i < d->tracks.size(); ++i) if (d->tracks[i].descriptor.id == id) { d->current = i; d->refresh(); return true; }
+    for (int i = 0; i < d->tracks.size(); ++i) if (d->tracks[i].descriptor.id == id) {
+        if (d->current != i) { d->current = i; ++d->revision; }
+        d->refresh(); return true;
+    }
     return fail(error, QStringLiteral("未找到指定难度。"));
 }
 
@@ -862,6 +905,59 @@ bool BeatmapDocument::mirrorObjects(const QStringList &ids, QString *error) {
     return updateObjects(objects, error);
 }
 
+bool BeatmapDocument::applyGeneratedChart(const QVector<BeatObject> &objects,
+                                           const QString &difficultyName, int difficultyRank,
+                                           quint64 expectedRevision, QString *error) {
+    auto *selected = d->track();
+    if (!d->newSong || !selected || d->tracks.size() != 1 || selected->descriptor.characteristic != "Standard")
+        return fail(error, QStringLiteral("整曲自动制谱仅应用到新建歌曲的单张 Standard 谱。"));
+    if (selected->v3 || selected->descriptor.version != "2.2.0" || !selected->time.changes().isEmpty())
+        return fail(error, QStringLiteral("自动制谱首版使用基础 v2.2 新歌谱面，保留已有格式与变速内容。"));
+    if (expectedRevision != d->revision)
+        return fail(error, QStringLiteral("歌曲或谱面已更改，请重新生成候选谱。"));
+    const QMap<QString, int> ranks{{"Easy", 1}, {"Normal", 3}, {"Hard", 5}, {"Expert", 7}, {"ExpertPlus", 9}};
+    if (!ranks.contains(difficultyName) || ranks.value(difficultyName) != difficultyRank)
+        return fail(error, QStringLiteral("自动制谱的难度名称与等级不匹配。"));
+    if (!selected->readOnly.isEmpty()) return fail(error, selected->readOnly);
+
+    QSet<QString> replaced;
+    QVector<Impl::Change> changes;
+    for (int i = 0; i < selected->entries.size(); ++i) {
+        const auto &entry = selected->entries[i];
+        if (entry.deleted) continue;
+        if (entry.object.isProtected()) return fail(error, entry.object.protectedReason);
+        replaced.insert(entry.object.id);
+        changes.append({i, {entry.object, false}, {entry.object, true}});
+    }
+    if ((qint64(changes.size()) + objects.size()) * sizeof(Impl::Change) > 16 * 1024 * 1024)
+        return fail(error, QStringLiteral("生成结果超过整批撤销上限，未应用。"));
+    QVector<BeatObject> incoming = objects;
+    for (auto &object : incoming) {
+        if (object.isProtected()) return fail(error, object.protectedReason);
+        for (const auto &track : d->tracks) {
+            const int source = track.byId.value(object.id, -1);
+            if (source >= 0 && track.entries[source].object.isProtected())
+                return fail(error, track.entries[source].object.protectedReason);
+        }
+        object.id = newId();
+        if (object.kind == ObjectKind::Bomb) { object.color = 0; object.direction = 8; }
+    }
+    if (!d->validate(*selected, incoming, replaced, error)) return false;
+
+    // No fallible validation follows allocation of entries or difficulty changes.
+    for (const auto &object : incoming) {
+        Impl::Entry entry;
+        entry.object = entry.original = object;
+        entry.deleted = true;
+        entry.array = object.kind == ObjectKind::Wall ? "_obstacles" : "_notes";
+        const int index = selected->entries.size();
+        selected->byId.insert(object.id, index);
+        selected->entries.append(entry);
+        changes.append({index, {object, true}, {object, false}});
+    }
+    return d->commit(selected, std::move(changes), error, difficultyName, difficultyRank);
+}
+
 bool BeatmapDocument::canUndo() const { return d->track() && d->track()->cursor > 0; }
 bool BeatmapDocument::canRedo() const { return d->track() && d->track()->cursor < d->track()->history.size(); }
 bool BeatmapDocument::undo() {
@@ -873,6 +969,8 @@ bool BeatmapDocument::undo() {
         selected->entries[change.entry].deleted = change.before.deleted;
     }
     selected->stateKey = command.beforeKey;
+    if (command.difficultyChanged) d->applyDifficulty(selected, command.beforeDifficulty);
+    ++d->revision;
     d->refresh();
     return true;
 }
@@ -885,6 +983,8 @@ bool BeatmapDocument::redo() {
         selected->entries[change.entry].deleted = change.after.deleted;
     }
     selected->stateKey = command.afterKey;
+    if (command.difficultyChanged) d->applyDifficulty(selected, command.afterDifficulty);
+    ++d->revision;
     d->refresh();
     return true;
 }
@@ -904,27 +1004,14 @@ bool BeatmapDocument::setNewSongTempo(double bpm, double firstBeatSeconds, QStri
     d->newFirstBeatSeconds = firstBeatSeconds;
     d->tracks[0].time = time;
     d->metaKey = d->nextKey++;
+    ++d->revision;
     return true;
 }
 
 bool BeatmapDocument::setNewSongDifficulty(const QString &name, int rank, QString *error) {
     if (!d->newSong || d->tracks.isEmpty()) return fail(error, QStringLiteral("已有谱的难度标识保持原样。"));
     if (name.trimmed().isEmpty() || rank <= 0 || rank > 99) return fail(error, QStringLiteral("难度名称或等级标识无效。"));
-    auto sets = d->info.value("_difficultyBeatmapSets").toArray();
-    auto set = sets.first().toObject();
-    auto difficulties = set.value("_difficultyBeatmaps").toArray();
-    auto difficulty = difficulties.first().toObject();
-    difficulty.insert("_difficulty", name.trimmed());
-    difficulty.insert("_difficultyRank", rank);
-    difficulties[0] = difficulty;
-    set.insert("_difficultyBeatmaps", difficulties);
-    sets[0] = set;
-    d->info.insert("_difficultyBeatmapSets", sets);
-    d->tracks[0].descriptor.name = name.trimmed();
-    d->tracks[0].descriptor.rank = rank;
-    d->metaKey = d->nextKey++;
-    d->refresh();
-    return true;
+    return d->commit(&d->tracks[0], {}, error, name.trimmed(), rank);
 }
 
 bool BeatmapDocument::setNewSongMetadata(const QString &title, const QString &artist,
@@ -935,6 +1022,7 @@ bool BeatmapDocument::setNewSongMetadata(const QString &title, const QString &ar
     d->info.insert("_songAuthorName", artist.trimmed());
     d->info.insert("_levelAuthorName", mapper.trimmed());
     d->metaKey = d->nextKey++;
+    ++d->revision;
     return true;
 }
 
@@ -959,6 +1047,7 @@ bool BeatmapDocument::setImportSource(const QString &path, int absoluteStreamInd
     d->source = {{"file", name}, {"originalFilename", input.fileName()}, {"streamIndex", absoluteStreamIndex},
                  {"startSeconds", startSeconds}, {"endSeconds", endSeconds}, {"sha256", QString::fromLatin1(hash.result().toHex())}};
     d->metaKey = d->nextKey++;
+    ++d->revision;
     return true;
 }
 

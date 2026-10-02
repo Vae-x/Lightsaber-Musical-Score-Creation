@@ -7,6 +7,7 @@
 #include <QVector>
 #include <QHash>
 #include <memory>
+#include "PcmAudioSnapshot.h"
 
 class QAudioOutput;
 class QThread;
@@ -42,9 +43,13 @@ public:
     double position() const;
     double playbackSpeed() const { return m_speed; }
     bool isPlaying() const { return m_playing; }
+    bool loopEnabled() const { return m_loop; }
+    double loopStartSeconds() const { return m_loopStart; }
+    double loopEndSeconds() const { return m_loopEnd; }
     bool isReady() const { return !m_basePcm.isEmpty(); }
     bool isBusy() const;
     QString pcmCachePath() const { return m_basePcm; }
+    lmsc::PcmAudioSnapshot pcmSnapshot() const;
     QVector<float> waveform() const { return m_waveform; }
     static constexpr int SampleRate = 44100;
     static constexpr int Channels = 2;
@@ -89,7 +94,9 @@ private:
     QString toolPath(const QString &name) const;
     QString activePcm() const;
     QString m_tools;
-    QTemporaryDir m_cache;
+    std::shared_ptr<QTemporaryDir> m_cache;
+    std::shared_ptr<void> m_baseLease;
+    quint64 m_pcmRevision = 0;
     QProcess m_process;
     QTimer m_timer;
     QThread *m_waveThread = nullptr;

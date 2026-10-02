@@ -1,6 +1,8 @@
 #include "AiRecognitionPage.h"
 
 #include <QFileInfo>
+#include <QCheckBox>
+#include <QComboBox>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -11,6 +13,7 @@
 #include <QStyle>
 #include <QUuid>
 #include <QVBoxLayout>
+#include <QSignalBlocker>
 #include <cmath>
 
 namespace lmsc {
@@ -31,10 +34,20 @@ QFrame *card(QWidget *parent) {
     layout->setSpacing(12);
     return widget;
 }
+
+bool sameTiming(const TimeMap &a, const TimeMap &b) {
+    if (a.baseBpm() != b.baseBpm() || a.firstBeatSeconds() != b.firstBeatSeconds()
+        || a.changes().size() != b.changes().size()) return false;
+    for (int i = 0; i < a.changes().size(); ++i)
+        if (a.changes()[i].beat != b.changes()[i].beat || a.changes()[i].bpm != b.changes()[i].bpm) return false;
+    return true;
+}
 }
 
 AiRecognitionPage::AiRecognitionPage(QWidget *parent)
     : QWidget(parent), m_unavailable(new UnavailableAiRecognitionService(this)) {
+    qRegisterMetaType<GenerationRequest>();
+    qRegisterMetaType<GenerationDraft>();
     setObjectName(QStringLiteral("aiRecognitionPage"));
     setProperty("workspaceSurface", true);
     setAttribute(Qt::WA_StyledBackground, true);
@@ -50,8 +63,8 @@ AiRecognitionPage::AiRecognitionPage(QWidget *parent)
     auto layout = new QVBoxLayout(content);
     layout->setContentsMargins(28, 28, 28, 24);
     layout->setSpacing(16);
-    layout->addWidget(label(tr("AI 识别"), content, "pageTitle"));
-    layout->addWidget(label(tr("分析当前歌曲，为人工编谱提供参考。"), content));
+    layout->addWidget(label(tr("AI 分析与制谱"), content, "pageTitle"));
+    layout->addWidget(label(tr("分析整首音乐，按难度编排动作；先预览，确认后应用到新歌。"), content));
 
     auto song = card(content);
     auto songLayout = qobject_cast<QVBoxLayout *>(song->layout());
@@ -65,18 +78,49 @@ AiRecognitionPage::AiRecognitionPage(QWidget *parent)
 
     auto service = card(content);
     auto serviceLayout = qobject_cast<QVBoxLayout *>(service->layout());
-    serviceLayout->addWidget(label(tr("识别服务"), service, "cardTitle"));
+    serviceLayout->addWidget(label(tr("音乐分析与编排"), service, "cardTitle"));
     m_serviceStatus = label({}, service);
     m_serviceStatus->setObjectName(QStringLiteral("aiServiceStatus"));
     serviceLayout->addWidget(m_serviceStatus);
-    serviceLayout->addWidget(label(tr("本地节拍估计可在“曲谱编辑”中使用。模型连接和账号可在左侧“大语言模型”和“账号授权”中配置。"), service));
+    serviceLayout->addWidget(label(tr("音频在本机提取节拍与段落特征，再交给已配置的模型规划。分析可用于已有歌曲；自动制谱首版仅支持新建歌曲。"), service));
+    auto options = new QHBoxLayout;
+    options->addWidget(label(tr("生成难度"), service));
+    m_difficulty = new QComboBox(service);
+    m_difficulty->setObjectName(QStringLiteral("aiGenerationDifficulty"));
+    const QStringList names{QStringLiteral("Easy"), QStringLiteral("Normal"), QStringLiteral("Hard"),
+                            QStringLiteral("Expert"), QStringLiteral("ExpertPlus")};
+    const QStringList labels{tr("简单 · Easy"), tr("普通 · Normal"), tr("困难 · Hard"),
+                             tr("专家 · Expert"), tr("专家+ · ExpertPlus")};
+    for (int i = 0; i < names.size(); ++i) m_difficulty->addItem(labels[i], names[i]);
+    m_difficulty->setCurrentIndex(3);
+    options->addWidget(m_difficulty);
+    options->addStretch();
+    serviceLayout->addLayout(options);
+    auto types = new QHBoxLayout;
+    m_directional = new QCheckBox(tr("方向方块"), service);
+    m_dots = new QCheckBox(tr("无方向方块"), service);
+    m_bombs = new QCheckBox(tr("炸弹"), service);
+    m_walls = new QCheckBox(tr("墙"), service);
+    m_directional->setObjectName(QStringLiteral("aiDirectionalType"));
+    m_dots->setObjectName(QStringLiteral("aiDotType"));
+    m_bombs->setObjectName(QStringLiteral("aiBombType"));
+    m_walls->setObjectName(QStringLiteral("aiWallType"));
+    m_directional->setChecked(true);
+    for (auto box : {m_directional, m_dots, m_bombs, m_walls}) types->addWidget(box);
+    types->addStretch();
+    serviceLayout->addLayout(types);
+    serviceLayout->addWidget(label(tr("勾选要使用的类型；仅选择炸弹或墙也可生成避障练习。合适位置不足时会减少相应物件。"), service));
     auto actions = new QHBoxLayout;
     actions->setSpacing(10);
-    m_start = new QPushButton(tr("开始识别"), service);
+    m_start = new QPushButton(tr("分析音乐"), service);
     m_start->setObjectName(QStringLiteral("aiRecognizeButton"));
     m_start->setProperty("role", "primary");
     actions->addWidget(m_start);
-    m_cancel = new QPushButton(tr("取消识别"), service);
+    m_generate = new QPushButton(tr("生成候选谱"), service);
+    m_generate->setObjectName(QStringLiteral("aiGenerateButton"));
+    m_generate->setProperty("role", "primary");
+    actions->addWidget(m_generate);
+    m_cancel = new QPushButton(tr("取消任务"), service);
     m_cancel->setObjectName(QStringLiteral("aiCancelRecognition"));
     actions->addWidget(m_cancel);
     actions->addStretch();
@@ -96,8 +140,8 @@ AiRecognitionPage::AiRecognitionPage(QWidget *parent)
 
     auto result = card(content);
     auto resultLayout = qobject_cast<QVBoxLayout *>(result->layout());
-    resultLayout->addWidget(label(tr("识别结果"), result, "cardTitle"));
-    resultLayout->addWidget(label(tr("识别结果仅供参考；确认后请在曲谱编辑中手动修改。"), result));
+    resultLayout->addWidget(label(tr("分析与生成结果"), result, "cardTitle"));
+    resultLayout->addWidget(label(tr("分析建议不会改变曲谱。生成结果将在独立预览中展示，点击应用才写入工程，且可一次撤销。"), result));
     m_result = new QPlainTextEdit(result);
     m_result->setObjectName(QStringLiteral("aiRecognitionResult"));
     m_result->setReadOnly(true);
@@ -110,22 +154,38 @@ AiRecognitionPage::AiRecognitionPage(QWidget *parent)
     outer->addWidget(scroll);
 
     connect(m_start, &QPushButton::clicked, this, &AiRecognitionPage::startRecognition);
+    connect(m_generate, &QPushButton::clicked, this, [this] { startGeneration(false); });
     connect(m_cancel, &QPushButton::clicked, this, &AiRecognitionPage::cancelRecognition);
     connect(m_configure, &QPushButton::clicked, this, &AiRecognitionPage::configureConnectionRequested);
+    const auto optionsChanged = [this] {
+        if (m_updatingOptions) return;
+        invalidateGeneration();
+        refreshControls();
+        showIdleStatus();
+    };
+    connect(m_difficulty, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+            [optionsChanged](int) { optionsChanged(); });
+    for (auto box : {m_directional, m_dots, m_bombs, m_walls})
+        connect(box, &QCheckBox::toggled, this, [optionsChanged](bool) { optionsChanged(); });
     setService(nullptr);
     setContext({}, {}, 120.0, 0.0, 0.0, false);
 }
 
 AiRecognitionPage::~AiRecognitionPage() {
     if (!m_pendingContextId.isEmpty()) emit cancelRequested(m_pendingContextId);
+    if (!m_pendingGeneration.jobId.isEmpty()) emit cancelGenerationRequested(m_pendingGeneration.jobId);
     for (const auto &connection : m_connections) disconnect(connection);
+    for (const auto &connection : m_generationConnections) disconnect(connection);
 }
 
 void AiRecognitionPage::setContext(const QString &audioFile, const QString &title, double bpm,
                                    double offsetSeconds, double durationSeconds, bool busy) {
     const bool changed = m_audioFile != audioFile || m_title != title || m_bpm != bpm
         || m_offsetSeconds != offsetSeconds || m_durationSeconds != durationSeconds;
-    if (changed || busy) cancelRecognition();
+    if (changed || busy) {
+        cancelRecognition();
+        invalidateGeneration();
+    }
     if (changed) {
         ++m_sourceRevision;
         m_result->clear();
@@ -140,7 +200,7 @@ void AiRecognitionPage::setContext(const QString &audioFile, const QString &titl
     m_songTitle->setText(!title.isEmpty() ? title : audioFile.isEmpty()
         ? tr("尚未打开歌曲") : QFileInfo(audioFile).completeBaseName());
     if (title.isEmpty() && audioFile.isEmpty()) {
-        m_songDetails->setText(tr("先打开已有工程或导入歌曲，再进行识别。"));
+        m_songDetails->setText(tr("先创建新歌，或打开带音频的歌曲与工程。"));
     } else {
         const QString duration = std::isfinite(durationSeconds) && durationSeconds > 0.0
             ? tr("%1 秒").arg(durationSeconds, 0, 'f', 1) : tr("时长待确认");
@@ -153,7 +213,8 @@ void AiRecognitionPage::setContext(const QString &audioFile, const QString &titl
 
 void AiRecognitionPage::setService(AiRecognitionService *service) {
     auto next = service ? service : m_unavailable;
-    if (m_service == next) return;
+    m_legacyOverride = service != nullptr;
+    if (m_service == next) { refreshControls(); showIdleStatus(); return; }
     cancelRecognition();
     for (const auto &connection : m_connections) disconnect(connection);
     m_connections.clear();
@@ -220,7 +281,161 @@ void AiRecognitionPage::setService(AiRecognitionService *service) {
     showIdleStatus();
 }
 
+void AiRecognitionPage::setGenerationService(AiGenerationService *service, AiGenerationService *fallback) {
+    m_generationFallback = fallback;
+    if (m_generationService == service) { refreshControls(); showIdleStatus(); return; }
+    invalidateGeneration();
+    for (const auto &connection : m_generationConnections) disconnect(connection);
+    m_generationConnections.clear();
+    m_generationService = service;
+    const auto revision = ++m_generationServiceRevision;
+    if (service) {
+        m_generationConnections.append(connect(this, &AiRecognitionPage::generationRequested,
+                                               service, &AiGenerationService::generate));
+        m_generationConnections.append(connect(this, &AiRecognitionPage::cancelGenerationRequested,
+                                               service, &AiGenerationService::cancel));
+        m_generationConnections.append(connect(service, &AiGenerationService::draftReady, this,
+            [this, revision](const GenerationDraft &draft) {
+                if (revision != m_generationServiceRevision || !acceptsGeneration(draft.source)) return;
+                m_pendingGeneration = {};
+                QString output = draft.summary;
+                if (!draft.source.analysisOnly) {
+                    output += tr("\n\n%1 · 方向 %2 · 无方向 %3 · 炸弹 %4 · 墙 %5\n平均每秒 %6 个音符 · 峰值 %7")
+                        .arg(draft.source.profile.name).arg(draft.metrics.directional).arg(draft.metrics.dots)
+                        .arg(draft.metrics.bombs).arg(draft.metrics.walls)
+                        .arg(draft.metrics.averageNps, 0, 'f', 2).arg(draft.metrics.peakNps, 0, 'f', 2);
+                }
+                if (!draft.warnings.isEmpty()) output += QStringLiteral("\n\n") + draft.warnings.join(QStringLiteral("\n"));
+                m_result->setPlainText(output.isEmpty() ? tr("分析完成，未返回可展示的建议。") : output);
+                setStatus(draft.source.analysisOnly ? tr("分析完成，曲谱未改变。") : tr("候选谱已生成，请试听预览后应用。"), "success");
+                refreshControls();
+                if (!draft.source.analysisOnly) emit generationDraftReady(draft);
+            }));
+        m_generationConnections.append(connect(service, &AiGenerationService::requestFailed, this,
+            [this, revision](const QString &jobId, const QString &message) {
+                if (revision != m_generationServiceRevision || jobId != m_pendingGeneration.jobId || jobId.isEmpty()) return;
+                m_pendingGeneration = {};
+                setStatus(message.isEmpty() ? tr("分析或生成失败，请检查模型连接。") : message, "error");
+                refreshControls();
+            }));
+        m_generationConnections.append(connect(service, &AiGenerationService::progress, this,
+            [this, revision](const QString &jobId, int percent, const QString &stage) {
+                if (revision != m_generationServiceRevision || jobId != m_pendingGeneration.jobId || jobId.isEmpty()) return;
+                m_progress->setRange(0, percent < 0 ? 0 : 100);
+                if (percent >= 0) m_progress->setValue(qBound(0, percent, 100));
+                if (!stage.isEmpty()) setStatus(stage, "status");
+            }));
+        m_generationConnections.append(connect(service, &AiGenerationService::cancelled, this,
+            [this, revision](const QString &jobId) {
+                if (revision != m_generationServiceRevision || jobId != m_pendingGeneration.jobId || jobId.isEmpty()) return;
+                m_pendingGeneration = {};
+                setStatus(tr("任务已取消。"));
+                refreshControls();
+            }));
+        m_generationConnections.append(connect(service, &AiGenerationService::availabilityChanged, this,
+            [this, revision] {
+                if (revision != m_generationServiceRevision) return;
+                if (!m_generationService || !m_generationService->isAvailable()) invalidateGeneration();
+                refreshControls();
+                if (!isRecognizing()) showIdleStatus();
+            }));
+        m_generationConnections.append(connect(service, &QObject::destroyed, this,
+            [this, revision] {
+                if (revision != m_generationServiceRevision) return;
+                m_pendingGeneration = {};
+                m_generationService.clear();
+                emit generationInvalidated();
+                setGenerationService(m_generationFallback, m_generationFallback);
+                setStatus(tr("生成服务已断开，请检查模型连接。"), "warning");
+            }));
+    }
+    refreshControls();
+    showIdleStatus();
+}
+
+void AiRecognitionPage::setGenerationContext(const GenerationRequest &context, bool newSong, bool busy) {
+    const bool changed = context.documentId != m_generationContext.documentId
+        || context.difficultyId != m_generationContext.difficultyId
+        || context.documentRevision != m_generationContext.documentRevision
+        || context.audioRevision != m_generationContext.audioRevision
+        || context.audio.path != m_generationContext.audio.path
+        || context.audio.sourcePath != m_generationContext.audio.sourcePath
+        || context.audio.durationSeconds != m_generationContext.audio.durationSeconds
+        || context.audio.revision != m_generationContext.audio.revision
+        || context.profile.name != m_generationContext.profile.name || context.profile.rank != m_generationContext.profile.rank
+        || !sameTiming(context.timeMap, m_generationContext.timeMap) || newSong != m_newSong;
+    if (changed || busy) invalidateGeneration();
+    if (context.documentId != m_generationContext.documentId
+        || context.profile.name != m_generationContext.profile.name) {
+        m_updatingOptions = true;
+        const int index = m_difficulty->findData(context.profile.name);
+        if (index >= 0) m_difficulty->setCurrentIndex(index);
+        m_updatingOptions = false;
+    }
+    m_generationContext = context;
+    m_newSong = newSong;
+    m_contextBusy = busy;
+    refreshControls();
+    if (changed || busy) showIdleStatus();
+}
+
+GeneratedTypes AiRecognitionPage::selectedTypes() const {
+    GeneratedTypes types;
+    if (m_directional->isChecked()) types |= DirectionalType;
+    if (m_dots->isChecked()) types |= DotType;
+    if (m_bombs->isChecked()) types |= BombType;
+    if (m_walls->isChecked()) types |= WallType;
+    return types;
+}
+
+bool AiRecognitionPage::acceptsGeneration(const GenerationRequest &source) const {
+    const auto &expected = m_pendingGeneration;
+    return !expected.jobId.isEmpty() && source.jobId == expected.jobId
+        && source.documentId == expected.documentId && source.difficultyId == expected.difficultyId
+        && source.documentRevision == expected.documentRevision && source.audioRevision == expected.audioRevision
+        && source.audio.path == expected.audio.path && source.audio.sourcePath == expected.audio.sourcePath
+        && source.audio.revision == expected.audio.revision && source.audio.durationSeconds == expected.audio.durationSeconds
+        && source.audio.sampleRate == expected.audio.sampleRate && source.audio.channels == expected.audio.channels
+        && sameTiming(source.timeMap, expected.timeMap) && source.profile.name == expected.profile.name
+        && source.profile.rank == expected.profile.rank
+        && source.profile.targetMinNps == expected.profile.targetMinNps && source.profile.targetMaxNps == expected.profile.targetMaxNps
+        && source.profile.maxPeakNps == expected.profile.maxPeakNps
+        && source.profile.minSameHandGapSeconds == expected.profile.minSameHandGapSeconds
+        && source.profile.maxConnectionSpeed == expected.profile.maxConnectionSpeed
+        && source.profile.subdivision == expected.profile.subdivision && source.allowedTypes == expected.allowedTypes
+        && source.analysisOnly == expected.analysisOnly;
+}
+
+void AiRecognitionPage::startGeneration(bool analysisOnly) {
+    refreshControls();
+    if (analysisOnly ? !m_start->isEnabled() : !m_generate->isEnabled()) return;
+    emit generationInvalidated();
+    m_pendingGeneration = m_generationContext;
+    m_pendingGeneration.jobId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    m_pendingGeneration.profile = DifficultyProfile::forName(m_difficulty->currentData().toString());
+    m_pendingGeneration.allowedTypes = selectedTypes();
+    m_pendingGeneration.analysisOnly = analysisOnly;
+    m_result->clear();
+    m_progress->setRange(0, 0);
+    setStatus(analysisOnly ? tr("正在分析整首音乐…") : tr("正在分析音乐并生成候选谱…"), "status");
+    refreshControls();
+    const auto request = m_pendingGeneration;
+    emit generationRequested(request);
+}
+
+void AiRecognitionPage::invalidateGeneration() {
+    cancelRecognition();
+    m_result->clear();
+    emit generationInvalidated();
+}
+
+void AiRecognitionPage::showGenerationApplied() {
+    setStatus(tr("候选谱已应用，可在曲谱编辑中一次撤销。"), "success");
+    refreshControls();
+}
+
 void AiRecognitionPage::startRecognition() {
+    if (!m_legacyOverride && m_generationService) { startGeneration(true); return; }
     refreshControls();
     if (!m_start->isEnabled()) return;
     m_pendingContextId = QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -239,12 +454,15 @@ void AiRecognitionPage::startRecognition() {
 }
 
 void AiRecognitionPage::cancelRecognition() {
-    if (m_pendingContextId.isEmpty()) return;
+    if (!isRecognizing()) return;
     const auto contextId = m_pendingContextId;
+    const auto jobId = m_pendingGeneration.jobId;
     m_pendingContextId.clear();
+    m_pendingGeneration = {};
     setStatus(tr("识别已取消。"));
     refreshControls();
-    emit cancelRequested(contextId);
+    if (!contextId.isEmpty()) emit cancelRequested(contextId);
+    if (!jobId.isEmpty()) emit cancelGenerationRequested(jobId);
 }
 
 bool AiRecognitionPage::accepts(const QString &contextId) const {
@@ -252,30 +470,46 @@ bool AiRecognitionPage::accepts(const QString &contextId) const {
 }
 
 void AiRecognitionPage::refreshControls() {
-    const bool available = m_service && m_service->isAvailable();
+    const bool available = m_legacyOverride || !m_generationService
+        ? m_service && m_service->isAvailable() : m_generationService->isAvailable();
     const auto file = QFileInfo(m_audioFile);
     const bool hasAudio = !m_audioFile.isEmpty() && file.isFile() && file.isReadable();
     const bool validTiming = std::isfinite(m_bpm) && m_bpm > 0.0
         && std::isfinite(m_offsetSeconds) && std::isfinite(m_durationSeconds);
-    m_start->setEnabled(available && hasAudio && validTiming && !m_contextBusy && !isRecognizing());
+    const bool hasSnapshot = m_generationContext.audio.isValid() && !m_generationContext.documentId.isEmpty()
+        && QFileInfo(m_generationContext.audio.path).isFile();
+    const bool legacy = m_legacyOverride || !m_generationService;
+    m_start->setEnabled(available && hasAudio && validTiming && (legacy || hasSnapshot)
+                        && !m_contextBusy && !isRecognizing());
+    m_generate->setEnabled(m_generationService && m_generationService->isAvailable() && hasSnapshot
+        && validTiming && m_newSong && selectedTypes() != GeneratedTypes() && !m_contextBusy && !isRecognizing());
+    m_difficulty->setEnabled(m_newSong && !m_contextBusy);
+    for (auto box : {m_directional, m_dots, m_bombs, m_walls}) box->setEnabled(m_newSong && !m_contextBusy);
     m_cancel->setEnabled(isRecognizing());
     m_cancel->setVisible(isRecognizing());
     m_progress->setVisible(isRecognizing());
     m_configure->setEnabled(!isRecognizing() && !m_contextBusy);
     m_serviceStatus->setText(available
-        ? tr("识别服务已接入")
-        : tr("AI 音频识别尚未接入，当前可先配置 AI 连接。"));
-    if (!available) m_start->setToolTip(tr("需要先接入支持音频分析的 AI 识别服务。"));
+        ? tr("已连接分析与编排服务")
+        : tr("请先配置并保存模型连接，或完成账号授权。"));
+    if (!available) m_start->setToolTip(tr("请先配置并保存可用的模型连接。"));
     else if (!hasAudio) m_start->setToolTip(tr("请打开带有可用本地音频的歌曲或工程。"));
     else if (m_contextBusy) m_start->setToolTip(tr("请等待当前任务结束。"));
     else if (!validTiming) m_start->setToolTip(tr("请先确认歌曲的 BPM 和时间参数。"));
     else m_start->setToolTip({});
+    if (!m_newSong) m_generate->setToolTip(tr("自动制谱首版仅支持新建歌曲；已有歌曲可使用分析音乐。"));
+    else if (selectedTypes() == GeneratedTypes()) m_generate->setToolTip(tr("请至少勾选一种物件类型。"));
+    else if (!hasSnapshot) m_generate->setToolTip(tr("请等待当前歌曲音频准备完成。"));
+    else if (!m_generationService || !m_generationService->isAvailable()) m_generate->setToolTip(tr("请先配置并保存可用的模型连接。"));
+    else m_generate->setToolTip({});
 }
 
 void AiRecognitionPage::showIdleStatus() {
     if (isRecognizing()) return;
-    if (!m_service || !m_service->isAvailable()) {
-        setStatus(tr("尚未接入识别服务"));
+    const bool available = m_legacyOverride || !m_generationService
+        ? m_service && m_service->isAvailable() : m_generationService->isAvailable();
+    if (!available) {
+        setStatus(tr("请先配置并保存模型连接。"));
     } else if (m_contextBusy) {
         setStatus(tr("请等待当前任务结束。"));
     } else if (m_audioFile.isEmpty() || !QFileInfo(m_audioFile).isFile()
@@ -285,7 +519,7 @@ void AiRecognitionPage::showIdleStatus() {
                || !std::isfinite(m_durationSeconds)) {
         setStatus(tr("请先确认歌曲的 BPM 和时间参数。"), "warning");
     } else {
-        setStatus(tr("准备就绪，可开始识别。"));
+        setStatus(tr("准备就绪，可分析音乐或生成候选谱。"));
     }
 }
 

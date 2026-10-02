@@ -3,9 +3,11 @@
 #include <QMainWindow>
 #include <QFutureWatcher>
 #include <QSet>
+#include <QPointer>
 #include <memory>
 #include <functional>
 #include "core/BeatmapDocument.h"
+#include "core/AppSettings.h"
 
 namespace Ui { class MainWindow; }
 class AudioService;
@@ -35,6 +37,12 @@ class NavigationSidebar;
 class SettingsPanel;
 class AiRecognitionPage;
 class AiRecognitionService;
+class AiGenerationService;
+class ConfiguredAiTextTransport;
+class LlmAiGenerationService;
+class GenerationPreviewDialog;
+struct GenerationRequest;
+struct GenerationDraft;
 }
 struct DocumentLoadResult {
     std::shared_ptr<lmsc::BeatmapDocument> document;
@@ -53,6 +61,8 @@ public:
     // The caller owns the recognition backend and keeps it in the GUI thread.
     // A backend may dispatch its analysis to workers; none is connected by default.
     void setAiRecognitionService(lmsc::AiRecognitionService *service);
+    // Caller-owned override. nullptr restores the configured application backend.
+    void setAiGenerationService(lmsc::AiGenerationService *service);
 signals:
     void documentReady();
     void loadFailed(const QString &error);
@@ -63,6 +73,8 @@ private:
     void buildWorkspace();
     void selectWorkspacePage(int row);
     void refreshRecognitionContext();
+    bool generationSourceIsCurrent(const lmsc::GenerationRequest &source) const;
+    void previewGeneratedChart(const lmsc::GenerationDraft &draft);
     void updateWorkspaceActions();
     void buildActions();
     void connectAudio();
@@ -105,6 +117,11 @@ private:
     lmsc::NavigationSidebar *m_sidebar = nullptr;
     lmsc::SettingsPanel *m_settingsPanel = nullptr;
     lmsc::AiRecognitionPage *m_aiPage = nullptr;
+    lmsc::ConfiguredAiTextTransport *m_aiTransport = nullptr;
+    lmsc::LlmAiGenerationService *m_defaultGenerationService = nullptr;
+    QPointer<lmsc::GenerationPreviewDialog> m_generationPreview;
+    QString m_documentId;
+    lmsc::AppPreferences m_generationPreferences;
     QToolBar *m_editorToolbar = nullptr;
     std::shared_ptr<lmsc::BeatmapDocument> m_document;
     QVector<lmsc::BeatObject> m_clipboard;

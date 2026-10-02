@@ -44,6 +44,7 @@ public:
     void setSnapDivision(int subdivisionsPerBeat);
     void setLoop(double startSeconds, double endSeconds);
     void setFollowPlayhead(bool enabled);
+    void setReadOnly(bool enabled);
 
 signals:
     void seekRequested(double seconds);
@@ -96,6 +97,7 @@ private:
     int m_snapDivision = 4;
     bool m_follow = true;
     bool m_additive = false;
+    bool m_readOnly = false;
     DragMode m_drag = Idle;
     QPointF m_press;
     QPointF m_current;

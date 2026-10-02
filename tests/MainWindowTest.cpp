@@ -1,5 +1,6 @@
 #include "gui/MainWindow.h"
 #include "gui/AiRecognitionPage.h"
+#include "gui/GenerationPreviewDialog.h"
 #include "gui/EditorViews.h"
 #include "gui/NavigationSidebar.h"
 #include "gui/ThemeManager.h"
@@ -29,6 +30,7 @@
 #include <QPixmap>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QPointer>
 #include <QRegularExpression>
 #include <QSpinBox>
 #include <QStatusBar>
@@ -63,6 +65,14 @@ public:
         cancelledIds.append(contextId);
         emit cancelled(contextId);
     }
+};
+class MainGenerationService final : public lmsc::AiGenerationService {
+public:
+    QVector<lmsc::GenerationRequest> requests;
+    QStringList cancelledIds;
+    bool isAvailable() const override { return true; }
+    void generate(const lmsc::GenerationRequest &request) override { requests.append(request); }
+    void cancel(const QString &jobId) override { cancelledIds.append(jobId); emit cancelled(jobId); }
 };
 
 class ScopedHttpsUrlHandler {
@@ -123,6 +133,7 @@ private slots:
     void navigationPreservesEditorAndSettingsDraft();
     void aiRecognitionEntry();
     void aiSuggestionsPreserveLoadedDocument();
+    void aiGenerationPreviewAndAtomicApply();
     void clickPlaceApplyUndoAndDifficulty();
     void protectedSelectionRejectsEntireDrag();
     void importMp3AndCropThroughDialogs_data();
@@ -203,7 +214,7 @@ void MainWindowTest::navigationPreservesEditorAndSettingsDraft() {
     auto settingsPages = window.findChild<QStackedWidget *>(QStringLiteral("settingsPages"));
     auto toggle = sidebar ? sidebar->findChild<QToolButton *>(QStringLiteral("navigationToggle")) : nullptr;
     QVERIFY(sidebar && nav && workspace && settingsPages && toggle);
-    const QStringList names{QStringLiteral("曲谱编辑"), QStringLiteral("AI 识别"),
+    const QStringList names{QStringLiteral("曲谱编辑"), QStringLiteral("AI 分析与制谱"),
         QStringLiteral("外观"), QStringLiteral("大语言模型"), QStringLiteral("账号授权"),
         QStringLiteral("网络"), QStringLiteral("关于")};
     QCOMPARE(nav->count(), names.size());
@@ -399,6 +410,98 @@ void MainWindowTest::aiSuggestionsPreserveLoadedDocument() {
     QVERIFY(result->toPlainText().isEmpty());
     QCOMPARE(objectCount(window), 3);
     QVERIFY(apply->isEnabled());
+    window.close();
+}
+
+void MainWindowTest::aiGenerationPreviewAndAtomicApply() {
+    QString error;
+    lmsc::BeatmapDocument original;
+    QVERIFY2(original.createNew(QDir(m_song).filePath(QStringLiteral("song.ogg")),
+                               QStringLiteral("AI 新歌测试"), 120, 0, {}, &error), qPrintable(error));
+    lmsc::BeatObject old;
+    old.beat = 2; old.x = 0; old.y = 0; old.direction = 1;
+    QVERIFY2(original.addObject(old, &error), qPrintable(error));
+    const QString project = m_temp.filePath(QStringLiteral("ai-generation-project/project.lmsc"));
+    QVERIFY2(original.saveProject(project, &error), qPrintable(error));
+    MainGenerationService service;
+    MainWindow window(nullptr, settingsFile());
+    window.setTestMode(true);
+    window.setAiGenerationService(&service);
+    QVERIFY(!service.parent());
+    window.show();
+    QSignalSpy ready(&window, &MainWindow::documentReady);
+    window.openPath(project);
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 20000);
+    QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
+    auto audio = window.findChild<AudioService *>();
+    auto nav = window.findChild<QListWidget *>(QStringLiteral("mainNavigation"));
+    auto generate = window.findChild<QPushButton *>(QStringLiteral("aiGenerateButton"));
+    auto targetDifficulty = window.findChild<QComboBox *>(QStringLiteral("aiGenerationDifficulty"));
+    auto actualDifficulty = window.findChild<QComboBox *>(QStringLiteral("newSongDifficultySelector"));
+    auto grid = window.findChild<GridEditor *>();
+    QVERIFY(audio && nav && generate && targetDifficulty && actualDifficulty && grid);
+    audio->seek(1.25);
+    audio->setLoop(1, 2, true);
+    const auto originalAudio = audio->pcmSnapshot();
+    QFile sourceAudio(originalAudio.sourcePath);
+    QVERIFY(sourceAudio.open(QIODevice::ReadOnly));
+    const auto audioHash = QCryptographicHash::hash(sourceAudio.readAll(), QCryptographicHash::Sha256);
+    sourceAudio.close();
+    nav->setCurrentRow(1);
+    targetDifficulty->setCurrentIndex(targetDifficulty->findData(QStringLiteral("Hard")));
+    QCOMPARE(actualDifficulty->currentData().toString(), QStringLiteral("Expert"));
+    QVERIFY(generate->isEnabled());
+    generate->click();
+    QCOMPARE(service.requests.size(), 1);
+    lmsc::GenerationDraft draft;
+    draft.source = service.requests.last();
+    draft.summary = QStringLiteral("预览后应用的测试规划");
+    for (int i = 0; i < 3; ++i) {
+        lmsc::BeatObject note;
+        note.beat = 1 + i; note.x = i % 2 == 0 ? 0 : 2; note.y = 1;
+        note.color = i % 2; note.direction = i % 2 == 0 ? 1 : 0;
+        draft.objects.append(note);
+    }
+    draft.metrics.directional = 3;
+    emit service.draftReady(draft);
+    QPointer<lmsc::GenerationPreviewDialog> preview = window.findChild<lmsc::GenerationPreviewDialog *>();
+    QVERIFY(preview && preview->isVisible());
+    QCOMPARE(objectCount(window), 1);
+    QCOMPARE(actualDifficulty->currentData().toString(), QStringLiteral("Expert"));
+    QVERIFY(!audio->loopEnabled());
+    preview->findChild<QPushButton *>(QStringLiteral("generationPreviewCancel"))->click();
+    QTRY_VERIFY(preview.isNull());
+    QVERIFY(audio->loopEnabled());
+    QCOMPARE(audio->loopStartSeconds(), 1.0);
+    QCOMPARE(audio->loopEndSeconds(), 2.0);
+    QCOMPARE(objectCount(window), 1);
+    generate->click();
+    QCOMPARE(service.requests.size(), 2);
+    emit service.draftReady(draft);
+    QVERIFY(!window.findChild<lmsc::GenerationPreviewDialog *>());
+    draft.source = service.requests.last();
+    emit service.draftReady(draft);
+    preview = window.findChild<lmsc::GenerationPreviewDialog *>();
+    QVERIFY(preview);
+    preview->findChild<QPushButton *>(QStringLiteral("generationPreviewApply"))->click();
+    QTRY_VERIFY(preview.isNull());
+    QCOMPARE(objectCount(window), 3);
+    QCOMPARE(actualDifficulty->currentData().toString(), QStringLiteral("Hard"));
+    nav->setCurrentRow(0);
+    grid->setFocus();
+    QTest::keyClick(grid, Qt::Key_Z, Qt::ControlModifier);
+    QCOMPARE(objectCount(window), 1);
+    QCOMPARE(actualDifficulty->currentData().toString(), QStringLiteral("Expert"));
+    QTest::keyClick(grid, Qt::Key_Y, Qt::ControlModifier);
+    QCOMPARE(objectCount(window), 3);
+    QCOMPARE(actualDifficulty->currentData().toString(), QStringLiteral("Hard"));
+    QVERIFY(sourceAudio.open(QIODevice::ReadOnly));
+    QCOMPARE(QCryptographicHash::hash(sourceAudio.readAll(), QCryptographicHash::Sha256), audioHash);
+    QCOMPARE(audio->pcmSnapshot().revision, originalAudio.revision);
+    lmsc::BeatmapDocument unchangedDisk;
+    QVERIFY2(unchangedDisk.loadProject(project, &error), qPrintable(error));
+    QCOMPARE(unchangedDisk.objects().size(), 1);
+    QCOMPARE(unchangedDisk.difficulties().first().name, QStringLiteral("Expert"));
     window.close();
 }
 
@@ -790,7 +893,11 @@ void MainWindowTest::importMp3AndCropThroughDialogs() {
     QCOMPARE(difficultySelector->currentData(Qt::UserRole + 1).toInt(), difficultyRank);
     QCOMPARE(objectCount(window), 0);
     QVERIFY(std::abs(window.findChild<AudioService *>()->duration() - 3.0) < 0.06);
-    QTRY_VERIFY_WITH_TIMEOUT(hasText(window, QStringLiteral("建议")), 20000);
+    auto *rhythmStatus = window.findChild<QLabel *>(QStringLiteral("rhythmAnalysisStatus"));
+    QVERIFY(rhythmStatus);
+    const QRegularExpression rhythmResult(QStringLiteral(
+        "^建议 [0-9]+(?:\\.[0-9]+)? BPM，第一拍 [0-9]+(?:\\.[0-9]+)? 秒\\n可信度 [0-9]+%"));
+    QTRY_VERIFY_WITH_TIMEOUT(rhythmResult.match(rhythmStatus->text()).hasMatch(), 20000);
     if (previewBeforeConvert) QVERIFY(convertedDuringPreview);
     if (!captureDirectory.isEmpty() && difficultyName == QStringLiteral("Hard")) {
         QVERIFY(capturedCreation);
@@ -860,12 +967,23 @@ void MainWindowTest::importMp3AndCropThroughDialogs() {
     }
     QVERIFY(undo && redo && undo->isEnabled());
     undo->trigger();
+    QCOMPARE(objectCount(window), 1);
+    QCOMPARE(difficultySelector->currentData().toString(), difficultyName);
+    QCOMPARE(difficulties->item(0)->text(), QStringLiteral("Standard · ") + difficultyName);
+    QVERIFY(undo->isEnabled());
+    undo->trigger();
     QCOMPARE(objectCount(window), 0);
-    QCOMPARE(difficultySelector->currentData().toString(), difficultyNames.at(nextDifficulty));
+    QCOMPARE(difficultySelector->currentData().toString(), difficultyName);
+    QCOMPARE(difficulties->item(0)->text(), QStringLiteral("Standard · ") + difficultyName);
     QVERIFY(redo->isEnabled());
     redo->trigger();
     QCOMPARE(objectCount(window), 1);
+    QCOMPARE(difficultySelector->currentData().toString(), difficultyName);
+    QCOMPARE(difficulties->item(0)->text(), QStringLiteral("Standard · ") + difficultyName);
+    QVERIFY(redo->isEnabled());
+    redo->trigger();
     QCOMPARE(difficultySelector->currentData().toString(), difficultyNames.at(nextDifficulty));
+    QCOMPARE(difficulties->item(0)->text(), QStringLiteral("Standard · ") + difficultyNames.at(nextDifficulty));
     auto *autosave = window.findChild<QTimer *>(QStringLiteral("documentAutosave"));
     QVERIFY(autosave);
     QVERIFY(QMetaObject::invokeMethod(autosave, "timeout", Qt::DirectConnection));

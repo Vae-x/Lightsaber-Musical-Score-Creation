@@ -4,6 +4,7 @@
 #include "SettingsPanel.h"
 #include "NavigationSidebar.h"
 #include "AiRecognitionPage.h"
+#include "GenerationPreviewDialog.h"
 #include "ThemeManager.h"
 #include "core/AppInfo.h"
 #include "core/AppSettings.h"
@@ -12,6 +13,7 @@
 #include "core/MtpImportService.h"
 #include "core/WorkspacePaths.h"
 #include "core/SongExporter.h"
+#include "core/AiTextTransport.h"
 #include <QtConcurrent>
 #include <QAction>
 #include <QApplication>
@@ -53,6 +55,7 @@
 #include <QTimer>
 #include <QToolBar>
 #include <QUrl>
+#include <QUuid>
 #include <QVBoxLayout>
 #include <algorithm>
 #include <cmath>
@@ -84,6 +87,25 @@ QString safeName(QString name) {
     return name.trimmed().isEmpty() ? QStringLiteral("MySong") : name.left(100);
 }
 struct StorageResult { bool ok = false; QString error; };
+bool sameGenerationTiming(const lmsc::TimeMap &a, const lmsc::TimeMap &b) {
+    if (a.baseBpm() != b.baseBpm() || a.firstBeatSeconds() != b.firstBeatSeconds()
+        || a.changes().size() != b.changes().size()) return false;
+    for (int i = 0; i < a.changes().size(); ++i)
+        if (a.changes()[i].beat != b.changes()[i].beat || a.changes()[i].bpm != b.changes()[i].bpm) return false;
+    return true;
+}
+bool sameAiPreferences(const lmsc::AppPreferences &a, const lmsc::AppPreferences &b) {
+    if (a.aiConnection != b.aiConnection || a.providerId != b.providerId
+        || a.codexExecutable != b.codexExecutable || a.codexModel != b.codexModel
+        || a.networkProxy.mode != b.networkProxy.mode || a.networkProxy.host != b.networkProxy.host
+        || a.networkProxy.port != b.networkProxy.port || a.providers.keys() != b.providers.keys()) return false;
+    for (auto it = a.providers.begin(); it != a.providers.end(); ++it) {
+        const auto other = b.providers.value(it.key());
+        if (it.value().baseUrl != other.baseUrl || it.value().apiKey != other.apiKey
+            || it.value().model != other.model || it.value().models != other.models) return false;
+    }
+    return true;
+}
 
 // Dense editor panes must not set the minimum size of a hidden settings page.
 class WorkspacePages final : public QStackedWidget {
@@ -106,7 +128,13 @@ MainWindow::MainWindow(QWidget *parent, const QString &settingsFile)
       m_mtp(new MtpImportService(this)),
       m_loader(new QFutureWatcher<DocumentLoadResult>(this)) {
     ui->setupUi(this);
-    lmsc::ThemeManager::apply(lmsc::AppSettings(m_settingsFile).load().themeMode);
+    const auto preferences = lmsc::AppSettings(m_settingsFile).load();
+    m_generationPreferences = preferences;
+    lmsc::ThemeManager::apply(preferences.themeMode);
+    m_documentId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    m_aiTransport = new lmsc::ConfiguredAiTextTransport(this);
+    m_aiTransport->configure(preferences);
+    m_defaultGenerationService = new lmsc::LlmAiGenerationService(m_aiTransport, this);
     lmsc::ThemeManager::watchSystemChanges(qApp);
     setWindowIcon(QIcon(QStringLiteral(":/icons/app.png")));
     lmsc::WorkspacePaths::projectsDirectory();
@@ -182,6 +210,7 @@ MainWindow::MainWindow(QWidget *parent, const QString &settingsFile)
 
 MainWindow::~MainWindow() {
     m_aiPage->cancelRecognition();
+    if (m_generationPreview) m_generationPreview->close();
     m_settingsPanel->discardChanges();
     m_mtp->cancel();
     m_audio->cancel();
@@ -314,6 +343,7 @@ void MainWindow::buildEditor() {
             requestRhythmAnalysis();
     });
     m_analysisLabel = new QLabel(tr("已有曲谱保留原始节拍。\n新歌估拍后可在此校准。"), tempo);
+    m_analysisLabel->setObjectName(QStringLiteral("rhythmAnalysisStatus"));
     m_analysisLabel->setWordWrap(true);
     tf->addRow(m_analysisLabel);
     leftLayout->addWidget(tempo);
@@ -471,9 +501,9 @@ void MainWindow::buildWorkspace() {
     auto navigation = m_sidebar->listWidget();
     navigation->setObjectName(QStringLiteral("mainNavigation"));
     navigation->setAccessibleName(tr("工作区导航"));
-    navigation->setAccessibleDescription(tr("使用上下方向键切换曲谱编辑、AI 识别或设置页面。"));
+    navigation->setAccessibleDescription(tr("使用上下方向键切换曲谱编辑、AI 分析与制谱或设置页面。"));
     m_sidebar->addItem(tr("曲谱编辑"), lmsc::NavigationIcon::Editor);
-    m_sidebar->addItem(tr("AI 识别"), lmsc::NavigationIcon::Recognition);
+    m_sidebar->addItem(tr("AI 分析与制谱"), lmsc::NavigationIcon::Recognition);
     m_sidebar->addItem(tr("外观"), lmsc::NavigationIcon::Appearance);
     m_sidebar->addItem(tr("大语言模型"), lmsc::NavigationIcon::Model);
     m_sidebar->addItem(tr("账号授权"), lmsc::NavigationIcon::Account);
@@ -484,6 +514,7 @@ void MainWindow::buildWorkspace() {
     m_workspacePages->setObjectName(QStringLiteral("workspacePages"));
     m_workspacePages->addWidget(m_editorPage);
     m_aiPage = new lmsc::AiRecognitionPage(m_workspacePages);
+    m_aiPage->setGenerationService(m_defaultGenerationService, m_defaultGenerationService);
     m_workspacePages->addWidget(m_aiPage);
     m_settingsPanel = new lmsc::SettingsPanel(m_workspacePages, m_settingsFile, true);
     m_workspacePages->addWidget(m_settingsPanel);
@@ -497,10 +528,21 @@ void MainWindow::buildWorkspace() {
     connect(m_settingsPanel, &lmsc::SettingsPanel::done, this, returnToEditor);
     connect(m_settingsPanel, &lmsc::SettingsPanel::canceled, this, returnToEditor);
     connect(m_settingsPanel, &lmsc::SettingsPanel::preferencesChanged, this, [this] {
+        const auto preferences = lmsc::AppSettings(m_settingsFile).load();
+        if (!sameAiPreferences(m_generationPreferences, preferences)) {
+            m_aiPage->invalidateGeneration();
+            m_generationPreferences = preferences;
+            m_aiTransport->configure(preferences);
+            refreshRecognitionContext();
+        }
         statusBar()->showMessage(tr("设置已保存"), 5000);
     });
     connect(m_aiPage, &lmsc::AiRecognitionPage::configureConnectionRequested, this, [navigation] {
         navigation->setCurrentRow(3);
+    });
+    connect(m_aiPage, &lmsc::AiRecognitionPage::generationDraftReady, this, &MainWindow::previewGeneratedChart);
+    connect(m_aiPage, &lmsc::AiRecognitionPage::generationInvalidated, this, [this] {
+        if (m_generationPreview) m_generationPreview->close();
     });
     navigation->setCurrentRow(0);
 }
@@ -528,11 +570,71 @@ void MainWindow::refreshRecognitionContext() {
                          m_document->timeMap().firstBeatSeconds(),
                          loaded ? m_audio->duration() : 0,
                          m_busy || m_audio->isBusy() || m_queuedAudio);
+    lmsc::GenerationRequest context;
+    context.documentId = loaded ? m_documentId : QString();
+    context.difficultyId = m_document->currentDifficultyId();
+    context.documentRevision = m_document->revision();
+    context.timeMap = m_document->timeMap();
+    if (loaded && isAudioReady()) context.audio = m_audio->pcmSnapshot();
+    context.audioRevision = context.audio.revision;
+    QString difficultyName = QStringLiteral("Expert");
+    for (const auto &difficulty : m_document->difficulties())
+        if (difficulty.id == context.difficultyId) { difficultyName = difficulty.name; break; }
+    context.profile = lmsc::DifficultyProfile::forName(difficultyName);
+    m_aiPage->setGenerationContext(context, loaded && m_document->isNewSong(),
+                                 m_busy || m_audio->isBusy() || m_queuedAudio);
 }
 
 void MainWindow::setAiRecognitionService(lmsc::AiRecognitionService *service) {
     m_aiPage->setService(service);
     refreshRecognitionContext();
+}
+
+void MainWindow::setAiGenerationService(lmsc::AiGenerationService *service) {
+    m_aiPage->setGenerationService(service ? service : m_defaultGenerationService, m_defaultGenerationService);
+    refreshRecognitionContext();
+}
+
+bool MainWindow::generationSourceIsCurrent(const lmsc::GenerationRequest &source) const {
+    if (m_busy || !m_document->isLoaded() || !isAudioReady()) return false;
+    const auto audio = m_audio->pcmSnapshot();
+    return !source.jobId.isEmpty() && source.documentId == m_documentId
+        && source.documentRevision == m_document->revision()
+        && source.difficultyId == m_document->currentDifficultyId()
+        && source.audioRevision == audio.revision && source.audio.revision == audio.revision
+        && source.audio.path == audio.path && source.audio.sourcePath == audio.sourcePath
+        && source.audio.durationSeconds == audio.durationSeconds
+        && sameGenerationTiming(source.timeMap, m_document->timeMap());
+}
+
+void MainWindow::previewGeneratedChart(const lmsc::GenerationDraft &draft) {
+    if (draft.source.analysisOnly || !m_document->isNewSong() || !generationSourceIsCurrent(draft.source)) return;
+    if (m_generationPreview) m_generationPreview->close();
+    auto preview = new lmsc::GenerationPreviewDialog(draft, m_document->objects().size(), m_audio, this);
+    m_generationPreview = preview;
+    connect(preview, &lmsc::GenerationPreviewDialog::applyRequested, this, [this, preview] {
+        const auto &draft = preview->draft();
+        if (!m_document->isNewSong() || !generationSourceIsCurrent(draft.source)) {
+            preview->showApplicationError(tr("当前歌曲或曲谱已改变，请关闭预览并重新生成。"));
+            return;
+        }
+        QString error;
+        if (!m_document->applyGeneratedChart(draft.objects, draft.source.profile.name,
+                                           draft.source.profile.rank, draft.source.documentRevision, &error)) {
+            preview->showApplicationError(error);
+            return;
+        }
+        preview->close();
+        m_selection.clear();
+        refreshDocument();
+        m_aiPage->showGenerationApplied();
+        statusBar()->showMessage(tr("候选曲谱已应用，切换到曲谱编辑后可一次撤销。"), 10000);
+    });
+    connect(preview, &lmsc::GenerationPreviewDialog::regenerateRequested, this, [this, preview] {
+        preview->close();
+        m_aiPage->generateAgain();
+    });
+    preview->show();
 }
 
 void MainWindow::updateWorkspaceActions() {
@@ -843,8 +945,9 @@ void MainWindow::openPath(const QString &input) {
 }
 
 void MainWindow::replaceDocument(std::shared_ptr<lmsc::BeatmapDocument> document) {
-    m_aiPage->cancelRecognition();
+    m_aiPage->invalidateGeneration();
     m_document = std::move(document);
+    m_documentId = QUuid::createUuid().toString(QUuid::WithoutBraces);
     m_initializeAudio = true;
     m_selection.clear(); m_clipboard.clear(); m_loopStart = 0; m_loopEnd = 0;
     m_loop->setChecked(false);

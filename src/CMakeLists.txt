@@ -30,10 +30,16 @@ add_library(lmsc_core STATIC
         core/SongExporter.cpp core/SongExporter.h
         core/AudioService.cpp
         core/AudioService.h
+        core/PcmAudioSnapshot.h
         core/RhythmAnalyzer.cpp
         core/RhythmAnalyzer.h
         core/AppSettings.cpp core/AppSettings.h
         core/AiRecognitionService.cpp core/AiRecognitionService.h
+        core/AiTextTransport.cpp core/AiTextTransport.h
+        core/CodexTextSession.cpp core/CodexTextSession.h
+        core/AiGenerationService.cpp core/AiGenerationService.h
+        core/MusicFeatureAnalyzer.cpp core/MusicFeatureAnalyzer.h
+        core/BeatmapPlayabilityValidator.cpp core/BeatmapPlayabilityValidator.h
         core/ApiModelClient.cpp core/ApiModelClient.h
         core/WinHttpModelTransport.cpp core/WinHttpModelTransport.h
         core/CodexAccountClient.cpp core/CodexAccountClient.h
@@ -55,6 +61,7 @@ add_executable(src WIN32
         gui/SettingsDialog.cpp gui/SettingsDialog.h
         gui/SettingsPanel.cpp gui/SettingsPanel.h
         gui/AiRecognitionPage.cpp gui/AiRecognitionPage.h
+        gui/GenerationPreviewDialog.cpp gui/GenerationPreviewDialog.h
         gui/NavigationSidebar.cpp gui/NavigationSidebar.h
         gui/ThemeManager.cpp gui/ThemeManager.h
         ../resources/app.qrc)
@@ -163,6 +170,31 @@ if (BUILD_TESTING)
     endif ()
 
     add_test(NAME core_editing COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:core_tests>")
+    add_executable(generated_chart_tests "${LMSC_REPOSITORY_DIR}/tests/GeneratedChartTest.cpp")
+    target_link_libraries(generated_chart_tests PRIVATE lmsc_core Qt5::Test)
+    set_target_properties(generated_chart_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_test(NAME generated_chart COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:generated_chart_tests>")
+    set_tests_properties(generated_chart PROPERTIES TIMEOUT 60 LABELS "core;ai")
+    add_executable(ai_text_transport_tests "${LMSC_REPOSITORY_DIR}/tests/AiTextTransportTest.cpp")
+    target_link_libraries(ai_text_transport_tests PRIVATE lmsc_core Qt5::Test)
+    set_target_properties(ai_text_transport_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_test(NAME ai_text_transport COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:ai_text_transport_tests>")
+    set_tests_properties(ai_text_transport PROPERTIES TIMEOUT 150 LABELS "ai;network;codex")
+    add_executable(ai_generation_tests "${LMSC_REPOSITORY_DIR}/tests/AiGenerationTest.cpp")
+    target_link_libraries(ai_generation_tests PRIVATE lmsc_core Qt5::Test)
+    set_target_properties(ai_generation_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_test(NAME ai_generation COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:ai_generation_tests>")
+    set_tests_properties(ai_generation PROPERTIES TIMEOUT 180 LABELS "core;ai;audio")
+    add_executable(ai_generation_page_tests
+            "${LMSC_REPOSITORY_DIR}/tests/AiGenerationPageTest.cpp"
+            gui/AiRecognitionPage.cpp gui/AiRecognitionPage.h
+            gui/GenerationPreviewDialog.cpp gui/GenerationPreviewDialog.h
+            gui/EditorViews.cpp gui/EditorViews.h
+            gui/ThemeManager.cpp gui/ThemeManager.h)
+    target_link_libraries(ai_generation_page_tests PRIVATE lmsc_core Qt5::Widgets Qt5::Test)
+    set_target_properties(ai_generation_page_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_test(NAME ai_generation_page COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:ai_generation_page_tests>")
+    set_tests_properties(ai_generation_page PROPERTIES TIMEOUT 90 LABELS "gui;ai")
     add_executable(ai_settings_tests "${LMSC_REPOSITORY_DIR}/tests/AiSettingsTest.cpp")
     target_link_libraries(ai_settings_tests PRIVATE lmsc_core Qt5::Test)
     set_target_properties(ai_settings_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
@@ -254,6 +286,7 @@ if (BUILD_TESTING)
                 gui/SettingsDialog.cpp gui/SettingsDialog.h
                 gui/SettingsPanel.cpp gui/SettingsPanel.h
                 gui/AiRecognitionPage.cpp gui/AiRecognitionPage.h
+                gui/GenerationPreviewDialog.cpp gui/GenerationPreviewDialog.h
                 gui/NavigationSidebar.cpp gui/NavigationSidebar.h
                 gui/ThemeManager.cpp gui/ThemeManager.h)
         target_sources(main_window_tests PRIVATE ../resources/app.qrc)
