@@ -119,6 +119,8 @@ private:
     QLabel *m_songLabel, *m_projectLabel, *m_summaryLabel, *m_protectionLabel;
     QLabel *m_positionLabel, *m_analysisLabel;
     QListWidget *m_difficulties;
+    QWidget *m_newDifficultyRow;
+    QComboBox *m_newDifficultySelector;
     QComboBox *m_placeType, *m_placeColor, *m_placeDirection;
     QComboBox *m_editColor, *m_editDirection, *m_snap, *m_speed;
     QDoubleSpinBox *m_bpm, *m_offset, *m_editBeat, *m_editDuration;
@@ -131,8 +133,8 @@ private:
     QAction *m_saveAction, *m_exportAction, *m_undoAction, *m_redoAction;
     std::unique_ptr<QTemporaryDir> m_mediaTemp;
     struct NewSongSettings {
-        QString title, artist, mapper, cover, source;
-        int track = 0;
+        QString title, artist, mapper, cover, source, difficultyName;
+        int track = 0, difficultyRank = 7;
         double start = 0, end = 0;
     } m_newSettings;
     bool m_busy = false, m_refreshing = false, m_testMode = false;

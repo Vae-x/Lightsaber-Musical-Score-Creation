@@ -62,6 +62,21 @@ QStringList directionNames() {
             QStringLiteral("→ 右"), QStringLiteral("↖ 左上"), QStringLiteral("↗ 右上"),
             QStringLiteral("↙ 左下"), QStringLiteral("↘ 右下"), QStringLiteral("● 无方向")};
 }
+void addNewSongDifficultyChoices(QComboBox *combo) {
+    struct Choice { QString name, label; int rank; };
+    const QVector<Choice> choices{
+        {QStringLiteral("Easy"), QStringLiteral("简单 · Easy"), 1},
+        {QStringLiteral("Normal"), QStringLiteral("普通 · Normal"), 3},
+        {QStringLiteral("Hard"), QStringLiteral("困难 · Hard"), 5},
+        {QStringLiteral("Expert"), QStringLiteral("专家 · Expert"), 7},
+        {QStringLiteral("ExpertPlus"), QStringLiteral("专家+ · ExpertPlus"), 9}
+    };
+    for (const auto &choice : choices) {
+        combo->addItem(choice.label, choice.name);
+        combo->setItemData(combo->count() - 1, choice.rank, Qt::UserRole + 1);
+    }
+    combo->setCurrentIndex(combo->findData(QStringLiteral("Expert")));
+}
 QString safeName(QString name) {
     name.replace(QRegularExpression(QStringLiteral("[<>:\"/\\\\|?*\\x00-\\x1f]")), "_");
     while (name.endsWith('.') || name.endsWith(' ')) name.chop(1);
@@ -151,6 +166,7 @@ MainWindow::MainWindow(QWidget *parent, const QString &settingsFile)
         }
     });
     m_autosave = new QTimer(this);
+    m_autosave->setObjectName(QStringLiteral("documentAutosave"));
     m_autosave->setInterval(30000);
     connect(m_autosave, &QTimer::timeout, this, [this] {
         if (m_busy || !m_document->isModified() || m_document->projectPath().isEmpty()) return;
@@ -239,6 +255,25 @@ void MainWindow::buildEditor() {
         QString error;
         if (!m_document->setDifficulty(item->data(Qt::UserRole).toString(), &error)) showError(error);
         m_selection.clear();
+        refreshDocument();
+    });
+    m_newDifficultyRow = new QWidget(left);
+    auto difficultyLayout = new QVBoxLayout(m_newDifficultyRow);
+    difficultyLayout->setContentsMargins(0, 0, 0, 0);
+    difficultyLayout->addWidget(new QLabel(tr("新歌难度"), m_newDifficultyRow));
+    m_newDifficultySelector = new QComboBox(m_newDifficultyRow);
+    m_newDifficultySelector->setObjectName(QStringLiteral("newSongDifficultySelector"));
+    addNewSongDifficultyChoices(m_newDifficultySelector);
+    m_newDifficultySelector->setToolTip(tr("调整这张新歌曲谱的难度标识，保留已有音符。"));
+    difficultyLayout->addWidget(m_newDifficultySelector);
+    leftLayout->addWidget(m_newDifficultyRow);
+    connect(m_newDifficultySelector, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        if (index < 0 || m_refreshing || m_busy || !m_document->isNewSong()) return;
+        QString error;
+        const QString name = m_newDifficultySelector->currentData().toString();
+        const int rank = m_newDifficultySelector->currentData(Qt::UserRole + 1).toInt();
+        if (!m_document->setNewSongDifficulty(name, rank, &error)) showError(error);
+        else statusBar()->showMessage(tr("已将新歌难度设为 %1").arg(m_newDifficultySelector->currentText()), 5000);
         refreshDocument();
     });
     auto tempo = new QGroupBox(tr("节拍校准"), left);
@@ -825,6 +860,10 @@ void MainWindow::refreshDocument() {
         item->setToolTip(difficulty.filename + " / v" + difficulty.version);
         if (difficulty.id == m_document->currentDifficultyId()) m_difficulties->setCurrentItem(item);
     }
+    m_newDifficultyRow->setVisible(loaded && m_document->isNewSong());
+    m_newDifficultySelector->setEnabled(loaded && m_document->isNewSong() && !m_busy);
+    if (loaded && m_document->isNewSong() && !m_document->difficulties().isEmpty())
+        m_newDifficultySelector->setCurrentIndex(m_newDifficultySelector->findData(m_document->difficulties().first().name));
     QVector<EditorObject> display;
     QSet<QString> valid;
     int protectedCount = 0;
@@ -995,6 +1034,9 @@ void MainWindow::showNewSongDialog(const MediaInfo &info) {
     auto title = new QLineEdit(QFileInfo(info.path).completeBaseName(), &dialog);
     auto artist = new QLineEdit(&dialog);
     auto mapper = new QLineEdit("LMSC", &dialog);
+    auto difficulty = new QComboBox(&dialog);
+    difficulty->setObjectName(QStringLiteral("newSongDifficulty"));
+    addNewSongDifficultyChoices(difficulty);
     auto cover = new QLineEdit(&dialog);
     auto coverRow = new QWidget(&dialog); auto coverLayout = new QHBoxLayout(coverRow);
     coverLayout->setContentsMargins(0, 0, 0, 0);
@@ -1014,6 +1056,10 @@ void MainWindow::showNewSongDialog(const MediaInfo &info) {
     end->setValue(duration);
     if (m_recropPending) {
         title->setText(m_document->title());
+        if (!m_document->difficulties().isEmpty()) {
+            const int preset = difficulty->findData(m_document->difficulties().first().name);
+            if (preset >= 0) difficulty->setCurrentIndex(preset);
+        }
         const int preset = track->findData(m_recropPreset.streamIndex);
         if (preset >= 0) track->setCurrentIndex(preset);
         start->setValue(std::min(duration, m_recropPreset.startSeconds));
@@ -1021,11 +1067,12 @@ void MainWindow::showNewSongDialog(const MediaInfo &info) {
     }
     m_recropPending = false;
     form->addRow(tr("歌曲名"), title); form->addRow(tr("作者 / 歌手"), artist); form->addRow(tr("谱师"), mapper);
+    form->addRow(tr("曲谱难度"), difficulty);
     form->addRow(tr("封面（可选）"), coverRow); form->addRow(tr("提取音轨"), track);
     form->addRow(tr("裁剪起点"), start); form->addRow(tr("裁剪终点"), end);
     layout->addLayout(form);
     auto explanation = new QLabel(tr("默认使用整首，只提取声音。导出为 Ogg/Vorbis。\n"
-            "新歌先创建一张 Standard 曲谱，使用已验证样本的 Expert 标识；\n"
+            "新歌按所选难度创建一张 Standard 曲谱，之后可在左侧调整难度。\n"
             "星穹绿洲的四档名称与映射待实机核验。自动估拍后可以手动校准。"), &dialog);
     explanation->setWordWrap(true); layout->addWidget(explanation);
     auto preview = new QPushButton(tr("试听所选片段"), &dialog);
@@ -1061,7 +1108,8 @@ void MainWindow::showNewSongDialog(const MediaInfo &info) {
         return;
     }
     m_newSettings = {title->text().trimmed(), artist->text().trimmed(), mapper->text().trimmed(),
-                     cover->text(), info.path, track->currentData().toInt(), start->value(), end->value()};
+                     cover->text(), info.path, difficulty->currentData().toString(),
+                     track->currentData().toInt(), difficulty->currentData(Qt::UserRole + 1).toInt(), start->value(), end->value()};
     m_mediaTemp = std::make_unique<QTemporaryDir>();
     if (!m_mediaTemp->isValid()) { m_mediaFlow = false; restoreDocumentAudio(); showError(tr("无法创建媒体转换临时目录")); return; }
     m_newPending = true;
@@ -1099,6 +1147,7 @@ void MainWindow::finishNewSong(const QString &output) {
         result.document = std::make_shared<lmsc::BeatmapDocument>();
         if (!result.document->createNew(output, settings.title, 120, 0, cover, &result.error)
             || !result.document->setNewSongMetadata(settings.title, settings.artist, settings.mapper, &result.error)
+            || !result.document->setNewSongDifficulty(settings.difficultyName, settings.difficultyRank, &result.error)
             || !result.document->setImportSource(settings.source, settings.track, settings.start, settings.end, &result.error)) {
             if (result.error.isEmpty()) result.error = QStringLiteral("建立新歌失败");
         }
@@ -1199,6 +1248,7 @@ void MainWindow::setBusy(bool busy, const QString &message) {
     m_saveAction->setEnabled(!busy && m_document->isLoaded());
     m_exportAction->setEnabled(!busy && m_document->isLoaded());
     m_difficulties->setEnabled(!busy);
+    m_newDifficultySelector->setEnabled(!busy && m_document->isNewSong());
     m_grid->setEnabled(!busy && m_document->isLoaded() && m_document->readOnlyReason().isEmpty());
     m_bpm->setEnabled(!busy && m_document->isNewSong());
     m_offset->setEnabled(!busy && m_document->isNewSong());

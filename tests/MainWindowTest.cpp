@@ -599,7 +599,9 @@ void MainWindowTest::clickPlaceApplyUndoAndDifficulty() {
     QTest::keyClick(grid, Qt::Key_Z, Qt::ControlModifier);
     QCOMPARE(objectCount(window), 4);
     auto *difficulties = window.findChild<QListWidget *>(QStringLiteral("difficultyList"));
-    QVERIFY(difficulties);
+    auto *newSongDifficulty = window.findChild<QComboBox *>(QStringLiteral("newSongDifficultySelector"));
+    QVERIFY(difficulties && newSongDifficulty);
+    QVERIFY(!newSongDifficulty->isVisible() || !newSongDifficulty->isEnabled());
     QCOMPARE(difficulties->count(), 2);
     difficulties->setCurrentRow(1);
     QCOMPARE(objectCount(window), 1);
@@ -646,19 +648,34 @@ void MainWindowTest::importMp3AndCropThroughDialogs_data() {
     QTest::addColumn<QString>("mediaName");
     QTest::addColumn<int>("streamIndex");
     QTest::addColumn<bool>("previewBeforeConvert");
-    QTest::newRow("MP3") << QStringLiteral("clicks.mp3") << 0 << false;
-    QTest::newRow("MP4-second-audio") << QStringLiteral("two-tracks.mp4") << 2 << true;
+    QTest::addColumn<QString>("difficultyName");
+    QTest::addColumn<int>("difficultyRank");
+    QTest::newRow("MP3-Easy") << QStringLiteral("clicks.mp3") << 0 << false << QStringLiteral("Easy") << 1;
+    QTest::newRow("MP3-Normal") << QStringLiteral("clicks.mp3") << 0 << false << QStringLiteral("Normal") << 3;
+    QTest::newRow("MP3-Hard") << QStringLiteral("clicks.mp3") << 0 << false << QStringLiteral("Hard") << 5;
+    QTest::newRow("MP3-Expert") << QStringLiteral("clicks.mp3") << 0 << false << QStringLiteral("Expert") << 7;
+    QTest::newRow("MP4-second-audio-ExpertPlus") << QStringLiteral("two-tracks.mp4") << 2 << true
+                                              << QStringLiteral("ExpertPlus") << 9;
 }
 
 void MainWindowTest::importMp3AndCropThroughDialogs() {
     QFETCH(QString, mediaName);
     QFETCH(int, streamIndex);
     QFETCH(bool, previewBeforeConvert);
+    QFETCH(QString, difficultyName);
+    QFETCH(int, difficultyRank);
+    const QStringList difficultyNames{QStringLiteral("Easy"), QStringLiteral("Normal"), QStringLiteral("Hard"),
+                                      QStringLiteral("Expert"), QStringLiteral("ExpertPlus")};
+    const QVector<int> difficultyRanks{1, 3, 5, 7, 9};
+    const QString captureDirectory = qEnvironmentVariable("LMSC_DIFFICULTY_CAPTURE_DIRECTORY");
+    if (!captureDirectory.isEmpty()) QVERIFY(QDir().mkpath(captureDirectory));
     const QString inputMedia = QString::fromUtf8(LMSC_AUDIO_FIXTURES_DIR) + "/" + mediaName;
     MainWindow window(nullptr, settingsFile()); window.setTestMode(true); window.show();
     QSignalSpy ready(&window, &MainWindow::documentReady);
     int phase = 0;
     bool configuredCrop = false;
+    bool configuredDifficulty = false;
+    bool capturedCreation = false;
     bool convertedDuringPreview = false;
     QString lastDialog;
     QTimer dialogDriver;
@@ -697,13 +714,33 @@ void MainWindowTest::importMp3AndCropThroughDialogs() {
             auto *start = field<QDoubleSpinBox>(*dialog, QStringLiteral("裁剪起点"));
             auto *end = field<QDoubleSpinBox>(*dialog, QStringLiteral("裁剪终点"));
             auto *track = field<QComboBox>(*dialog, QStringLiteral("提取音轨"));
+            auto *difficulty = dialog->findChild<QComboBox *>(QStringLiteral("newSongDifficulty"));
             auto *buttons = dialog->findChild<QDialogButtonBox *>();
-            if (!(title && start && end && track && buttons)) { dialog->reject(); phase = 2; return; }
+            if (!(title && start && end && track && difficulty && buttons)) { dialog->reject(); phase = 2; return; }
+            if (field<QComboBox>(*dialog, QStringLiteral("曲谱难度")) != difficulty
+                || difficulty->count() != difficultyNames.size()
+                || difficulty->currentData().toString() != QStringLiteral("Expert")) {
+                dialog->reject(); phase = 2; return;
+            }
+            for (int index = 0; index < difficultyNames.size(); ++index)
+                if (difficulty->itemData(index).toString() != difficultyNames.at(index)
+                    || difficulty->itemData(index, Qt::UserRole + 1).toInt() != difficultyRanks.at(index)) {
+                    dialog->reject(); phase = 2; return;
+                }
+            const int difficultyChoice = difficulty->findData(difficultyName);
+            if (difficultyChoice < 0) { dialog->reject(); phase = 2; return; }
+            difficulty->setCurrentIndex(difficultyChoice);
+            configuredDifficulty = difficulty->currentData().toString() == difficultyName
+                && difficulty->currentData(Qt::UserRole + 1).toInt() == difficultyRank;
             const int trackChoice = track->findData(streamIndex);
             if (trackChoice < 0) { dialog->reject(); phase = 2; return; }
             track->setCurrentIndex(trackChoice);
             title->setText(QStringLiteral("GUI Crop")); start->setValue(1.0); end->setValue(4.0);
             configuredCrop = true; phase = 2; dialogDriver.stop();
+            if (!captureDirectory.isEmpty() && difficultyName == QStringLiteral("Hard")) {
+                QApplication::processEvents();
+                capturedCreation = dialog->grab().save(QDir(captureDirectory).filePath("new-song-dialog-hard.png"));
+            }
             if (previewBeforeConvert) {
                 auto *preview = button(*dialog, QStringLiteral("试听所选片段"));
                 if (!preview) { configuredCrop = false; dialog->reject(); return; }
@@ -735,19 +772,45 @@ void MainWindowTest::importMp3AndCropThroughDialogs() {
     QTest::mouseClick(newSong, Qt::LeftButton);
     QTRY_VERIFY_WITH_TIMEOUT(ready.count() == 1 || phase == 2, 20000);
     QVERIFY(configuredCrop);
+    QVERIFY(configuredDifficulty);
     QTRY_VERIFY_WITH_TIMEOUT(ready.count() == 1, 20000);
     QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
     QVERIFY(window.windowTitle().contains(QStringLiteral("GUI Crop")));
-    QCOMPARE(window.findChild<QListWidget *>(QStringLiteral("difficultyList"))->count(), 1);
+    auto *difficulties = window.findChild<QListWidget *>(QStringLiteral("difficultyList"));
+    auto *difficultySelector = window.findChild<QComboBox *>(QStringLiteral("newSongDifficultySelector"));
+    auto *audio = window.findChild<AudioService *>();
+    QVERIFY(difficulties && difficultySelector && audio);
+    QCOMPARE(difficulties->count(), 1);
+    QCOMPARE(difficulties->item(0)->text(), QStringLiteral("Standard · ") + difficultyName);
+    QVERIFY(difficultySelector->isVisible() && difficultySelector->isEnabled());
+    QCOMPARE(difficultySelector->count(), difficultyNames.size());
+    QCOMPARE(difficultySelector->currentData().toString(), difficultyName);
+    QCOMPARE(difficultySelector->currentData(Qt::UserRole + 1).toInt(), difficultyRank);
     QCOMPARE(objectCount(window), 0);
     QVERIFY(std::abs(window.findChild<AudioService *>()->duration() - 3.0) < 0.06);
     QTRY_VERIFY_WITH_TIMEOUT(hasText(window, QStringLiteral("建议")), 20000);
     if (previewBeforeConvert) QVERIFY(convertedDuringPreview);
-    const QString output = QDir(m_temp.path()).filePath(mediaName + "-roundtrip");
+    if (!captureDirectory.isEmpty() && difficultyName == QStringLiteral("Hard")) {
+        QVERIFY(capturedCreation);
+        QApplication::processEvents();
+        QVERIFY(window.grab().save(QDir(captureDirectory).filePath("new-song-editor-hard.png")));
+    }
+    const QString output = QDir(m_temp.path()).filePath(mediaName + "-" + difficultyName + "-roundtrip");
     QString error;
     QVERIFY2(window.runEditorCheck(output, &error), qPrintable(error));
     lmsc::BeatmapDocument reopened;
     QVERIFY2(reopened.loadProject(QDir(output).filePath("smoke.lmsc"), &error), qPrintable(error));
+    QCOMPARE(reopened.difficulties().size(), 1);
+    QCOMPARE(reopened.difficulties().first().name, difficultyName);
+    QCOMPARE(reopened.difficulties().first().rank, difficultyRank);
+    QCOMPARE(reopened.difficulties().first().filename, QStringLiteral("Expert.dat"));
+    QCOMPARE(reopened.objects().size(), 1);
+    lmsc::BeatmapDocument exportedSong;
+    QVERIFY2(exportedSong.loadSong(QDir(output).filePath("export"), &error), qPrintable(error));
+    QCOMPARE(exportedSong.difficulties().size(), 1);
+    QCOMPARE(exportedSong.difficulties().first().name, difficultyName);
+    QCOMPARE(exportedSong.difficulties().first().rank, difficultyRank);
+    QCOMPARE(exportedSong.objects().size(), 1);
     const auto source = reopened.importSource();
     QVERIFY(source.isAvailable());
     QCOMPARE(source.streamIndex, streamIndex);
@@ -757,10 +820,103 @@ void MainWindowTest::importMp3AndCropThroughDialogs() {
     QVERIFY(original.open(QIODevice::ReadOnly) && retained.open(QIODevice::ReadOnly));
     QCOMPARE(QCryptographicHash::hash(retained.readAll(), QCryptographicHash::Sha256),
              QCryptographicHash::hash(original.readAll(), QCryptographicHash::Sha256));
+    original.close();
+    retained.close();
     const auto exported = lmsc::ProjectStore::files(QDir(output).filePath("export"), &error);
     QVERIFY2(error.isEmpty(), qPrintable(error));
     for (const auto &path : exported)
         QVERIFY(!path.endsWith(".mp3", Qt::CaseInsensitive) && !path.endsWith(".mp4", Qt::CaseInsensitive));
+
+    const auto before = reopened.objects().first();
+    const QString difficultyId = reopened.currentDifficultyId();
+    QFile beforeAudio(reopened.audioPath());
+    QVERIFY(beforeAudio.open(QIODevice::ReadOnly));
+    const QByteArray audioHash = QCryptographicHash::hash(beforeAudio.readAll(), QCryptographicHash::Sha256);
+    beforeAudio.close();
+    audio->seek(0.75);
+    const double audioPosition = audio->position();
+    const double audioDuration = audio->duration();
+    const int nextDifficulty = (difficultyNames.indexOf(difficultyName) + 1) % difficultyNames.size();
+    difficultySelector->setCurrentIndex(nextDifficulty);
+    QCOMPARE(difficulties->count(), 1);
+    QCOMPARE(difficulties->item(0)->text(), QStringLiteral("Standard · ") + difficultyNames.at(nextDifficulty));
+    QCOMPARE(difficulties->item(0)->data(Qt::UserRole).toString(), difficultyId);
+    QCOMPARE(difficultySelector->currentData().toString(), difficultyNames.at(nextDifficulty));
+    QCOMPARE(difficultySelector->currentData(Qt::UserRole + 1).toInt(), difficultyRanks.at(nextDifficulty));
+    QCOMPARE(objectCount(window), 1);
+    QVERIFY(window.isAudioReady());
+    QCOMPARE(audio->duration(), audioDuration);
+    QCOMPARE(audio->position(), audioPosition);
+    QAction *undo = nullptr;
+    QAction *redo = nullptr;
+    QAction *save = nullptr;
+    for (auto *action : window.findChildren<QAction *>()) {
+        if (action->text() == QStringLiteral("撤销")) undo = action;
+        if (action->text() == QStringLiteral("重做")) redo = action;
+        if (action->text() == QStringLiteral("保存工程")) save = action;
+    }
+    QVERIFY(undo && redo && undo->isEnabled());
+    undo->trigger();
+    QCOMPARE(objectCount(window), 0);
+    QCOMPARE(difficultySelector->currentData().toString(), difficultyNames.at(nextDifficulty));
+    QVERIFY(redo->isEnabled());
+    redo->trigger();
+    QCOMPARE(objectCount(window), 1);
+    QCOMPARE(difficultySelector->currentData().toString(), difficultyNames.at(nextDifficulty));
+    auto *autosave = window.findChild<QTimer *>(QStringLiteral("documentAutosave"));
+    QVERIFY(autosave);
+    QVERIFY(QMetaObject::invokeMethod(autosave, "timeout", Qt::DirectConnection));
+    const QString projectFile = QDir(output).filePath("smoke.lmsc");
+    QVERIFY(lmsc::BeatmapDocument::hasRecovery(projectFile));
+    lmsc::BeatmapDocument recovery;
+    QVERIFY2(recovery.loadProject(lmsc::BeatmapDocument::recoveryPath(projectFile), &error), qPrintable(error));
+    QCOMPARE(recovery.difficulties().size(), 1);
+    QCOMPARE(recovery.difficulties().first().name, difficultyNames.at(nextDifficulty));
+    QCOMPARE(recovery.difficulties().first().rank, difficultyRanks.at(nextDifficulty));
+    QCOMPARE(recovery.currentDifficultyId(), difficultyId);
+    QCOMPARE(recovery.objects().size(), 1);
+    QVERIFY(save && save->isEnabled());
+    save->trigger();
+    QVERIFY(!lmsc::BeatmapDocument::hasRecovery(projectFile));
+    lmsc::BeatmapDocument changed;
+    QVERIFY2(changed.loadProject(QDir(output).filePath("smoke.lmsc"), &error), qPrintable(error));
+    QCOMPARE(changed.difficulties().size(), 1);
+    QCOMPARE(changed.difficulties().first().name, difficultyNames.at(nextDifficulty));
+    QCOMPARE(changed.difficulties().first().rank, difficultyRanks.at(nextDifficulty));
+    QCOMPARE(changed.currentDifficultyId(), difficultyId);
+    QCOMPARE(changed.difficulties().first().filename, QStringLiteral("Expert.dat"));
+    QCOMPARE(changed.objects().size(), 1);
+    const auto after = changed.objects().first();
+    QCOMPARE(after.id, before.id);
+    QCOMPARE(static_cast<int>(after.kind), static_cast<int>(before.kind));
+    QCOMPARE(after.beat, before.beat);
+    QCOMPARE(after.x, before.x);
+    QCOMPARE(after.y, before.y);
+    QCOMPARE(after.color, before.color);
+    QCOMPARE(after.direction, before.direction);
+    QCOMPARE(changed.importSource().streamIndex, source.streamIndex);
+    QCOMPARE(changed.importSource().startSeconds, source.startSeconds);
+    QCOMPARE(changed.importSource().endSeconds, source.endSeconds);
+    QFile afterAudio(changed.audioPath());
+    QVERIFY(afterAudio.open(QIODevice::ReadOnly));
+    QCOMPARE(QCryptographicHash::hash(afterAudio.readAll(), QCryptographicHash::Sha256), audioHash);
+    afterAudio.close();
+    const QString changedExport = QDir(output).filePath("changed-export");
+    QVERIFY2(changed.exportSong(changedExport, &error), qPrintable(error));
+    lmsc::BeatmapDocument changedExported;
+    QVERIFY2(changedExported.loadSong(changedExport, &error), qPrintable(error));
+    QCOMPARE(changedExported.difficulties().size(), 1);
+    QCOMPARE(changedExported.difficulties().first().name, difficultyNames.at(nextDifficulty));
+    QCOMPARE(changedExported.difficulties().first().rank, difficultyRanks.at(nextDifficulty));
+    QCOMPARE(changedExported.objects().size(), 1);
+    window.openPath(projectFile);
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 2, 20000);
+    QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
+    QVERIFY(difficultySelector->isVisible() && difficultySelector->isEnabled());
+    QCOMPARE(difficultySelector->currentData().toString(), difficultyNames.at(nextDifficulty));
+    QCOMPARE(difficultySelector->currentData(Qt::UserRole + 1).toInt(), difficultyRanks.at(nextDifficulty));
+    QCOMPARE(difficulties->count(), 1);
+    QCOMPARE(objectCount(window), 1);
     window.close();
 }
 
