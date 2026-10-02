@@ -600,8 +600,10 @@ void MainWindowTest::clickPlaceApplyUndoAndDifficulty() {
     QCOMPARE(objectCount(window), 4);
     auto *difficulties = window.findChild<QListWidget *>(QStringLiteral("difficultyList"));
     auto *newSongDifficulty = window.findChild<QComboBox *>(QStringLiteral("newSongDifficultySelector"));
+    auto *exportLeadIn = window.findChild<QDoubleSpinBox *>(QStringLiteral("exportLeadInSeconds"));
     QVERIFY(difficulties && newSongDifficulty);
     QVERIFY(!newSongDifficulty->isVisible() || !newSongDifficulty->isEnabled());
+    QVERIFY(exportLeadIn && (!exportLeadIn->isVisible() || !exportLeadIn->isEnabled()));
     QCOMPARE(difficulties->count(), 2);
     difficulties->setCurrentRow(1);
     QCOMPARE(objectCount(window), 1);
@@ -810,6 +812,7 @@ void MainWindowTest::importMp3AndCropThroughDialogs() {
     QCOMPARE(exportedSong.difficulties().size(), 1);
     QCOMPARE(exportedSong.difficulties().first().name, difficultyName);
     QCOMPARE(exportedSong.difficulties().first().rank, difficultyRank);
+    QCOMPARE(exportedSong.difficulties().first().filename, difficultyName + QStringLiteral(".dat"));
     QCOMPARE(exportedSong.objects().size(), 1);
     const auto source = reopened.importSource();
     QVERIFY(source.isAvailable());
@@ -908,7 +911,57 @@ void MainWindowTest::importMp3AndCropThroughDialogs() {
     QCOMPARE(changedExported.difficulties().size(), 1);
     QCOMPARE(changedExported.difficulties().first().name, difficultyNames.at(nextDifficulty));
     QCOMPARE(changedExported.difficulties().first().rank, difficultyRanks.at(nextDifficulty));
+    QCOMPARE(changedExported.difficulties().first().filename, difficultyNames.at(nextDifficulty) + QStringLiteral(".dat"));
     QCOMPARE(changedExported.objects().size(), 1);
+    if (difficultyName == QStringLiteral("Hard")) {
+        auto *leadIn = window.findChild<QDoubleSpinBox *>(QStringLiteral("exportLeadInSeconds"));
+        QVERIFY(leadIn && leadIn->isVisible() && leadIn->isEnabled());
+        QCOMPARE(leadIn->value(), 2.0);
+        const QString exportParent = QDir(output).filePath(QStringLiteral("gui-export"));
+        QVERIFY(QDir().mkpath(exportParent));
+        int exportPhase = 0;
+        bool bufferMessage = false;
+        QString guiExportPath;
+        QTimer exportDriver;
+        connect(&exportDriver, &QTimer::timeout, &window, [&] {
+            auto *modal = QApplication::activeModalWidget();
+            if (exportPhase == 0) {
+                auto *file = qobject_cast<QFileDialog *>(modal);
+                if (!file) return;
+                file->setDirectory(exportParent);
+                exportPhase = 1;
+                QMetaObject::invokeMethod(file, "accept", Qt::QueuedConnection);
+            } else if (exportPhase == 1) {
+                auto *message = qobject_cast<QMessageBox *>(modal);
+                if (!message || message->windowTitle() != QStringLiteral("导出完成")) return;
+                bufferMessage = message->text().contains(QStringLiteral("2.000 秒开场静音"))
+                    && message->text().contains(QStringLiteral("CustomMusic"));
+                guiExportPath = QDir::fromNativeSeparators(message->text().section('\n', 1, 1));
+                exportPhase = 2;
+                exportDriver.stop();
+                message->accept();
+            }
+        });
+        QAction *exportAction = nullptr;
+        for (auto *action : window.findChildren<QAction *>())
+            if (action->text() == QStringLiteral("导出歌曲目录")) exportAction = action;
+        QVERIFY(exportAction && exportAction->isEnabled());
+        exportDriver.start(20);
+        exportAction->trigger();
+        exportDriver.stop();
+        QCOMPARE(exportPhase, 2);
+        QVERIFY(bufferMessage);
+        QCOMPARE(QFileInfo(guiExportPath).absolutePath(), QFileInfo(exportParent).absoluteFilePath());
+        lmsc::BeatmapDocument guiExport;
+        QVERIFY2(guiExport.loadSong(guiExportPath, &error), qPrintable(error));
+        QCOMPARE(guiExport.objects().size(), 1);
+        QCOMPARE(guiExport.difficulties().first().name, difficultyNames.at(nextDifficulty));
+        QVERIFY(std::abs(guiExport.timeMap().beatToSeconds(guiExport.objects().first().beat)
+                         - changed.timeMap().beatToSeconds(changed.objects().first().beat) - 2.0) < 1e-8);
+        QCOMPARE(audio->duration(), audioDuration);
+        QCOMPARE(audio->position(), audioPosition);
+        QVERIFY(!window.windowTitle().contains(QStringLiteral(" *")));
+    }
     window.openPath(projectFile);
     QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 2, 20000);
     QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);

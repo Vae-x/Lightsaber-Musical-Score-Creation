@@ -195,6 +195,7 @@ void MtpImportService::consumeLine(const QByteArray &line) {
             entry.name = song.value(QStringLiteral("name")).toString();
             entry.deviceName = song.value(QStringLiteral("deviceName")).toString();
             entry.location = song.value(QStringLiteral("location")).toString();
+            entry.gameName = song.value(QStringLiteral("gameName")).toString();
             entry.locator = QString::fromUtf8(QJsonDocument(song.value(QStringLiteral("locator")).toObject()).toJson(QJsonDocument::Compact));
             if (entry.name.isEmpty() || entry.locator.isEmpty()) {
                 m_error = QStringLiteral("设备歌曲列表不完整，请刷新后重试。");

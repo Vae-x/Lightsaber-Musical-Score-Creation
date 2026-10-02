@@ -81,6 +81,7 @@ int main(int argc, char **argv) {
     QTemporaryDir scripts(QDir::tempPath() + QStringLiteral("/lmsc-mtp-tests-XXXXXX"));
     check(scripts.isValid(), QStringLiteral("创建测试临时目录"));
     MtpImportService service;
+    const QString productionScript = service.scriptPath();
     service.setScriptPath(scripts.path() + QStringLiteral("/不存在.ps1"));
     auto result = waitFor(service, [&] { service.listSongs(); });
     check(!result.error.isEmpty() && !result.completed && !service.isBusy(), QStringLiteral("缺少脚本时报告失败，不报告导入成功"));
@@ -90,13 +91,26 @@ int main(int argc, char **argv) {
         {QStringLiteral("segments"), QJsonArray{QStringLiteral("内部共享存储空间"), QStringLiteral("歌曲 $(abc) ' 空格")}}
     }).toJson(QJsonDocument::Compact));
     const QString escapedLocator = QString(locator).replace(QLatin1Char('\''), QStringLiteral("''"));
+    const QString lightBandLocator = QString::fromUtf8(QJsonDocument(QJsonObject{
+        {QStringLiteral("device"), QStringLiteral("Pico Neo 3")},
+        {QStringLiteral("segments"), QJsonArray{QStringLiteral("内部共享存储空间"), QStringLiteral("Android"),
+            QStringLiteral("data"), QStringLiteral("com.StarRiverVR.LightBand"), QStringLiteral("files"),
+            QStringLiteral("CustomMusic"), QStringLiteral("同名中文歌曲 $(abc) ' 空格")}}
+    }).toJson(QJsonDocument::Compact));
+    const QString escapedLightBandLocator = QString(lightBandLocator).replace(QLatin1Char('\''), QStringLiteral("''"));
     const QString listScript = QStringLiteral(
         "$locator='%1' | ConvertFrom-Json\n"
+        "$lightBandLocator='%2' | ConvertFrom-Json\n"
         "$song=@{name='中文歌曲 $(abc)';deviceName='Pico Neo 3';location='内部共享存储空间';locator=$locator}\n"
-        "[Console]::WriteLine((@{type='songs';songs=@($song)}|ConvertTo-Json -Depth 8 -Compress))\n").arg(escapedLocator);
+        "$lightBandSong=@{name='中文歌曲 $(abc)';deviceName='Pico Neo 3';gameName='光之乐团';location='内部共享存储空间\\Android\\data\\com.StarRiverVR.LightBand\\files\\CustomMusic';locator=$lightBandLocator}\n"
+        "[Console]::WriteLine((@{type='songs';songs=@($song,$lightBandSong)}|ConvertTo-Json -Depth 8 -Compress))\n").arg(escapedLocator, escapedLightBandLocator);
     service.setScriptPath(makeScript(scripts, listScript));
     result = waitFor(service, [&] { service.listSongs(); });
-    check(result.completed && result.songs.size() == 1 && result.songs[0].name == QStringLiteral("中文歌曲 $(abc)"), QStringLiteral("中文、空格及字面 shell 字符的列表读取"));
+    check(result.completed && result.songs.size() == 2 && result.songs[0].name == QStringLiteral("中文歌曲 $(abc)"), QStringLiteral("中文、空格及字面 shell 字符的列表读取"));
+    check(result.songs.size() == 2 && result.songs[0].gameName.isEmpty()
+            && result.songs[1].gameName == QStringLiteral("光之乐团")
+            && result.songs[1].locator == lightBandLocator,
+          QStringLiteral("同名歌曲保留独立来源与光之乐团深层定位，兼容未提供游戏名称的列表"));
     check(!service.isBusy(), QStringLiteral("列表完成后释放忙碌状态"));
 
     MtpSongEntry entry;
@@ -112,6 +126,45 @@ int main(int argc, char **argv) {
     service.setScriptPath(makeScript(scripts, importScript));
     result = waitFor(service, [&] { service.importSong(entry); });
     check(result.completed && result.error.isEmpty() && QFileInfo::exists(result.path + QStringLiteral("/Info.dat")), QStringLiteral("异步导入以 Unicode 环境变量传定位参数并保留本地临时副本"));
+
+    const QString lightBandImportScript = QStringLiteral(
+        "$locator=$env:LMSC_MTP_LOCATOR|ConvertFrom-Json\n"
+        "if(@($locator.segments).Count -ne 7 -or $locator.segments[3] -cne 'com.StarRiverVR.LightBand' -or $locator.segments[6] -cne '同名中文歌曲 $(abc) '' 空格'){throw '光之乐团定位信息变形'}\n"
+        "[IO.File]::WriteAllText((Join-Path $env:LMSC_MTP_TARGET 'Info.dat'),'{}')\n"
+        "[Console]::WriteLine((@{type='imported';path=$env:LMSC_MTP_TARGET}|ConvertTo-Json -Compress))\n");
+    MtpSongEntry lightBandEntry = entry;
+    lightBandEntry.locator = lightBandLocator;
+    service.setScriptPath(makeScript(scripts, lightBandImportScript));
+    result = waitFor(service, [&] { service.importSong(lightBandEntry); });
+    check(result.completed && result.error.isEmpty() && QFileInfo::exists(result.path + QStringLiteral("/Info.dat")),
+          QStringLiteral("光之乐团七层定位通过环境变量完整传递并只向本地临时目录复制"));
+
+    const QString locatorValidationScript = QStringLiteral(
+        "$tokens=$null; $parseErrors=$null\n"
+        "$ast=[Management.Automation.Language.Parser]::ParseFile('%1',[ref]$tokens,[ref]$parseErrors)\n"
+        "if($parseErrors.Count){throw '设备导入脚本语法错误'}\n"
+        "foreach($functionName in @('Get-SongSources','Test-SupportedLocator')){\n"
+        "  $definition=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName},$true)\n"
+        "  if(-not $definition){throw '缺少设备目录校验函数'}\n"
+        "  Invoke-Expression $definition.Extent.Text\n"
+        "}\n"
+        "$lightBand='%2'|ConvertFrom-Json\n"
+        "$oasis=@{device='Pico Neo 3';segments=@('内部共享存储空间','SoulTopia','BeatNote','Custom','歌曲')}\n"
+        "if(-not (Test-SupportedLocator $lightBand) -or -not (Test-SupportedLocator $oasis)){throw '已支持的游戏目录遭拒绝'}\n"
+        "$invalid=@(\n"
+        "  @{device='Pico Neo 3';segments=@('内部共享存储空间','Android','data','com.other.game','files','CustomMusic','歌曲')},\n"
+        "  @{device='Pico Neo 3';segments=@('内部共享存储空间','Android','data','com.StarRiverVR.LightBand','files','CustomMusic')},\n"
+        "  @{device='Pico Neo 3';segments=@('内部共享存储空间','SoulTopia','BeatNote','Custom','')},\n"
+        "  @{device='';segments=@('内部共享存储空间','SoulTopia','BeatNote','Custom','歌曲')},\n"
+        "  @{device='Pico Neo 3';segments=@('内部共享存储空间','SoulTopia','BeatNote','Custom','歌曲','附加目录')}\n"
+        ")\n"
+        "foreach($item in $invalid){if(Test-SupportedLocator $item){throw '未支持的路径通过了校验'}}\n"
+        "[Console]::WriteLine('{\"type\":\"songs\",\"songs\":[]}')\n")
+        .arg(QString(productionScript).replace(QLatin1Char('\''), QStringLiteral("''")), escapedLightBandLocator);
+    service.setScriptPath(makeScript(scripts, locatorValidationScript));
+    result = waitFor(service, [&] { service.listSongs(); });
+    check(result.completed && result.error.isEmpty(),
+          QStringLiteral("真实导入脚本只接受两处游戏歌曲目录，拒绝其他包、缺失歌曲名和额外子目录"));
 
     service.setScriptPath(makeScript(scripts, QStringLiteral("[Console]::WriteLine('{\"type\":\"imported\",\"path\":\"C:/unexpected\"}')\n")));
     result = waitFor(service, [&] { service.importSong(entry); });

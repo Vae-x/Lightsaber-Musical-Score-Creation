@@ -17,10 +17,35 @@ function Find-UniqueItem {
     return $matches[0]
 }
 
-function Find-CustomFolder {
-    param($Storage)
+function Get-SongSources {
+    @(
+        [pscustomobject]@{ GameName = '星穹绿洲'; Segments = @('SoulTopia', 'BeatNote', 'Custom') }
+        [pscustomobject]@{ GameName = '光之乐团'; Segments = @('Android', 'data', 'com.StarRiverVR.LightBand', 'files', 'CustomMusic') }
+    )
+}
+
+function Test-SupportedLocator {
+    param($Locator)
+    if ([string]::IsNullOrWhiteSpace([string]$Locator.device)) { return $false }
+    $segments = @($Locator.segments)
+    foreach ($segment in $segments) {
+        if ($segment -isnot [string] -or [string]::IsNullOrWhiteSpace($segment)) { return $false }
+    }
+    foreach ($source in Get-SongSources) {
+        if ($segments.Count -ne $source.Segments.Count + 2) { continue }
+        $matches = $true
+        for ($index = 0; $index -lt $source.Segments.Count; $index++) {
+            if ($segments[$index + 1] -cne $source.Segments[$index]) { $matches = $false; break }
+        }
+        if ($matches) { return $true }
+    }
+    return $false
+}
+
+function Find-SongRootFolder {
+    param($Storage, [string[]]$Segments)
     $folder = $Storage.GetFolder
-    foreach ($segment in @('SoulTopia', 'BeatNote', 'Custom')) {
+    foreach ($segment in $Segments) {
         $items = @($folder.Items() | Where-Object { [string]::Equals([string]$_.Name, $segment, [StringComparison]::OrdinalIgnoreCase) })
         if ($items.Count -ne 1 -or -not $items[0].IsFolder) { return $null }
         $folder = $items[0].GetFolder
@@ -124,26 +149,27 @@ try {
             Send-Record @{ type = 'progress'; message = ('读取 ' + [string]$device.Name + ' 的歌曲目录'); percent = -1 }
             foreach ($storage in $device.GetFolder.Items()) {
                 if (-not $storage.IsFolder) { continue }
-                $custom = Find-CustomFolder $storage
-                if ($null -eq $custom) { continue }
-                foreach ($song in $custom.Items()) {
-                    if (-not $song.IsFolder) { continue }
-                    if ($songs.Count -ge 4000) { throw '头显歌曲数量超过本次读取限制（4000 首）。' }
-                    $segments = @([string]$storage.Name, 'SoulTopia', 'BeatNote', 'Custom', [string]$song.Name)
-                    [void]$songs.Add(@{ name = [string]$song.Name; deviceName = [string]$device.Name; location = ($segments[0..3] -join '\'); locator = @{ device = [string]$device.Name; segments = $segments } })
+                foreach ($source in Get-SongSources) {
+                    $custom = Find-SongRootFolder $storage $source.Segments
+                    if ($null -eq $custom) { continue }
+                    foreach ($song in $custom.Items()) {
+                        if (-not $song.IsFolder) { continue }
+                        if ($songs.Count -ge 4000) { throw '头显歌曲数量超过本次读取限制（4000 首）。' }
+                        $root = @([string]$storage.Name) + $source.Segments
+                        $segments = $root + @([string]$song.Name)
+                        [void]$songs.Add(@{ name = [string]$song.Name; deviceName = [string]$device.Name; gameName = $source.GameName; location = ($root -join '\'); locator = @{ device = [string]$device.Name; segments = $segments } })
+                    }
                 }
             }
         }
-        if ($songs.Count -eq 0) { throw '头显中未找到 SoulTopia\BeatNote\Custom 的歌曲文件夹。请确认已导入歌曲，并允许读取内部共享存储空间。' }
+        if ($songs.Count -eq 0) { throw '头显中未找到歌曲文件夹。星穹绿洲：SoulTopia\BeatNote\Custom；光之乐团：Android\data\com.StarRiverVR.LightBand\files\CustomMusic。请确认已导入歌曲，并允许读取内部共享存储空间。' }
         Send-Record @{ type = 'songs'; songs = @($songs.ToArray()) }
         exit 0
     }
     if ($env:LMSC_MTP_MODE -ne 'import') { throw '设备导入操作无效。' }
     $target = Assert-LocalTarget
     $locator = $env:LMSC_MTP_LOCATOR | ConvertFrom-Json
-    if (-not $locator.device -or @($locator.segments).Count -ne 5 -or
-        $locator.segments[1] -cne 'SoulTopia' -or $locator.segments[2] -cne 'BeatNote' -or
-        $locator.segments[3] -cne 'Custom') { throw '设备定位信息无效，请刷新歌曲列表。' }
+    if (-not (Test-SupportedLocator $locator)) { throw '设备定位信息无效，请刷新歌曲列表。' }
     $device = Find-UniqueItem $computer ([string]$locator.device)
     if (-not $device.IsFolder -or $device.Name -notmatch '(?i)pico') { throw '定位的设备不是 Pico 头显。' }
     $folder = $device.GetFolder

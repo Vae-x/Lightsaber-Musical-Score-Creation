@@ -121,6 +121,8 @@ private:
     QListWidget *m_difficulties;
     QWidget *m_newDifficultyRow;
     QComboBox *m_newDifficultySelector;
+    QWidget *m_exportLeadInRow;
+    QDoubleSpinBox *m_exportLeadIn;
     QComboBox *m_placeType, *m_placeColor, *m_placeDirection;
     QComboBox *m_editColor, *m_editDirection, *m_snap, *m_speed;
     QDoubleSpinBox *m_bpm, *m_offset, *m_editBeat, *m_editDuration;

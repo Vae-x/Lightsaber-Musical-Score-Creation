@@ -4,6 +4,7 @@
 #include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
+#include <QHash>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QProcess>
@@ -185,8 +186,12 @@ void unitTests(const QString &root) {
     require(newReopened.exportSong(newExport, &error), error);
     require(!ProjectStore::files(newExport).join(' ').contains("original.mp4"), "source media excluded from exported game song");
     QJsonObject newMap, newInfo;
-    require(ProjectStore::readJson(QDir(newExport).filePath("Expert.dat"), &newMap, &error) &&
+    require(ProjectStore::readJson(QDir(newExport).filePath("Hard.dat"), &newMap, &error) &&
             ProjectStore::readJson(QDir(newExport).filePath("Info.dat"), &newInfo, &error), error);
+    require(!QFileInfo::exists(QDir(newExport).filePath("Expert.dat")) &&
+            newInfo.value("_difficultyBeatmapSets").toArray().first().toObject()
+                .value("_difficultyBeatmaps").toArray().first().toObject().value("_beatmapFilename").toString() == "Hard.dat",
+            "new-song export uses the selected difficulty filename without a stale Expert copy");
     require(newMap.value("_version").toString() == "2.2.0" && newInfo.value("_songTimeOffset").toDouble() == 0.0 &&
             std::abs(newMap.value("_notes").toArray().first().toObject().value("_time").toDouble() - 4.7) < 1e-10,
             "first-beat alignment baked into exported beat times, deprecated offset zero");
@@ -198,6 +203,66 @@ void unitTests(const QString &root) {
     require(newReopened.updateObject(secondNote, &error) && newReopened.autoSave(&error), error);
     BeatmapDocument sourceRecovery;
     require(sourceRecovery.loadProject(BeatmapDocument::recoveryPath(newProject), &error) && sourceRecovery.importSource().isAvailable(), "source recovery snapshot");
+    const QStringList difficultyNames{"Easy", "Normal", "Hard", "Expert", "ExpertPlus"};
+    const QVector<int> difficultyRanks{1, 3, 5, 7, 9};
+    QJsonObject snapshot;
+    require(ProjectStore::readJson(QDir(newProject).filePath("project.lmsc"), &snapshot, &error), error);
+    const QString snapshotAssets = QDir(newProject).filePath(snapshot.value("assets").toString());
+    const auto originalAssetHashes = snapshot.value("assetHashes");
+    const auto snapshotFiles = ProjectStore::files(snapshotAssets);
+    QHash<QString, QByteArray> snapshotBytes;
+    for (const auto &relative : snapshotFiles) snapshotBytes.insert(relative, hash(QDir(snapshotAssets).filePath(relative)));
+    for (int i = 0; i < difficultyNames.size(); ++i) {
+        const auto &name = difficultyNames[i];
+        // Changing an existing new-song project must preserve its original
+        // Expert.dat snapshot and identifiers for save/recovery compatibility.
+        require(newReopened.setNewSongDifficulty(name, difficultyRanks[i], &error), error);
+        const auto beforeObjects = newReopened.objects();
+        const auto beforeDifficulty = newReopened.difficulties().first();
+        const QString output = QDir(root).filePath("difficulty-" + name);
+        require(newReopened.exportSong(output, &error), error);
+        QJsonObject exportedInfo, exportedMap;
+        require(ProjectStore::readJson(QDir(output).filePath("Info.dat"), &exportedInfo, &error) &&
+                ProjectStore::readJson(QDir(output).filePath(name + ".dat"), &exportedMap, &error), error);
+        const auto exportedDifficulty = exportedInfo.value("_difficultyBeatmapSets").toArray().first().toObject()
+                .value("_difficultyBeatmaps").toArray().first().toObject();
+        require(exportedDifficulty.value("_difficulty").toString() == name &&
+                exportedDifficulty.value("_difficultyRank").toInt() == difficultyRanks[i] &&
+                exportedDifficulty.value("_beatmapFilename").toString() == name + ".dat" &&
+                (name == "Expert" || !QFileInfo::exists(QDir(output).filePath("Expert.dat"))) &&
+                exportedMap.value("_notes").toArray().size() == 1, "all five difficulty exports have matching metadata and map files");
+        BeatmapDocument reimported;
+        require(reimported.loadSong(output, &error) && reimported.difficulties().first().name == name &&
+                reimported.objects().size() == beforeObjects.size(), "renamed difficulty output can be reimported");
+        require(newReopened.difficulties().first().id == beforeDifficulty.id &&
+                newReopened.difficulties().first().filename == "Expert.dat" &&
+                newReopened.objects().first().id == beforeObjects.first().id &&
+                newReopened.objects().first().beat == beforeObjects.first().beat,
+                "export filename does not mutate in-memory project identity or objects");
+        require(ProjectStore::files(snapshotAssets) == snapshotFiles, "export does not rename original snapshot files");
+        for (const auto &relative : snapshotFiles)
+            require(hash(QDir(snapshotAssets).filePath(relative)) == snapshotBytes.value(relative), "export does not modify original snapshot bytes");
+    }
+    require(newReopened.saveProject(newProject, &error), error);
+    QJsonObject resaved;
+    require(ProjectStore::readJson(QDir(newProject).filePath("project.lmsc"), &resaved, &error) &&
+            resaved.value("assetHashes") == originalAssetHashes &&
+            resaved.value("difficulties").toArray().first().toObject().value("file").toString() == "Expert.dat",
+            "resaving a renamed export preserves legacy snapshot format");
+    BeatmapDocument renamedReopened;
+    require(renamedReopened.loadProject(newProject, &error) && renamedReopened.difficulties().first().name == "ExpertPlus" &&
+            renamedReopened.difficulties().first().filename == "Expert.dat" && renamedReopened.objects().first().beat == 10,
+            "project reload survives exporting and switching all difficulties");
+    BeatmapDocument emptyNew;
+    require(emptyNew.createNew(QDir(original).filePath("song.ogg"), "Empty song", 120, 0, {}, &error) &&
+            emptyNew.setNewSongDifficulty("Easy", 1, &error), error);
+    const QString emptyExport = QDir(root).filePath("empty-easy-export");
+    require(emptyNew.exportSong(emptyExport, &error) && QFileInfo::exists(QDir(emptyExport).filePath("Easy.dat")) &&
+            !QFileInfo::exists(QDir(emptyExport).filePath("Expert.dat")), "unedited new-song export also renames the snapshot copy");
+    require(emptyNew.setNewSongDifficulty("../outside", 1, &error), error);
+    const QString unknownExport = QDir(root).filePath("unknown-difficulty-export");
+    require(emptyNew.exportSong(unknownExport, &error) && QFileInfo::exists(QDir(unknownExport).filePath("Expert.dat")) &&
+            !QFileInfo::exists(QDir(root).filePath("outside.dat")), "unknown difficulty names never become export paths");
     QJsonObject saved;
     require(ProjectStore::readJson(QDir(newProject).filePath("project.lmsc"), &saved, &error), error);
     QFile corrupt(QDir(newProject).filePath(saved.value("assets").toString() + "/song.ogg"));

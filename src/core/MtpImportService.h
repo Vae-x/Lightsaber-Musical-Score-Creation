@@ -14,6 +14,7 @@ struct MtpSongEntry {
     QString deviceName;
     QString location;
     QString locator;
+    QString gameName;
 };
 Q_DECLARE_METATYPE(MtpSongEntry)
 Q_DECLARE_METATYPE(QVector<MtpSongEntry>)

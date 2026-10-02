@@ -27,6 +27,7 @@ add_library(lmsc_core STATIC
         core/TimeMap.h
         core/ProjectStore.cpp
         core/ProjectStore.h
+        core/SongExporter.cpp core/SongExporter.h
         core/AudioService.cpp
         core/AudioService.h
         core/RhythmAnalyzer.cpp
@@ -233,6 +234,15 @@ if (BUILD_TESTING)
         set_tests_properties(audio_service PROPERTIES
                 FIXTURES_REQUIRED audio_media TIMEOUT 90
                 LABELS "audio;requires-audio-device"
+                WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+
+        add_executable(song_exporter_tests "${LMSC_REPOSITORY_DIR}/tests/SongExporterTest.cpp")
+        target_link_libraries(song_exporter_tests PRIVATE lmsc_core)
+        set_target_properties(song_exporter_tests PROPERTIES
+                RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+        add_test(NAME song_exporter COMMAND ${LMSC_TEST_ENVIRONMENT}
+                "$<TARGET_FILE:song_exporter_tests>" "${LMSC_AUDIO_TOOLS_DIR}/bin")
+        set_tests_properties(song_exporter PROPERTIES TIMEOUT 90 LABELS "core;audio"
                 WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
 
         find_package(Qt5 5.12 REQUIRED COMPONENTS Test)

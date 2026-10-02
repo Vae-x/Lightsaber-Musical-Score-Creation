@@ -11,6 +11,7 @@
 #include "core/RhythmAnalyzer.h"
 #include "core/MtpImportService.h"
 #include "core/WorkspacePaths.h"
+#include "core/SongExporter.h"
 #include <QtConcurrent>
 #include <QAction>
 #include <QApplication>
@@ -276,6 +277,21 @@ void MainWindow::buildEditor() {
         else statusBar()->showMessage(tr("已将新歌难度设为 %1").arg(m_newDifficultySelector->currentText()), 5000);
         refreshDocument();
     });
+    m_exportLeadInRow = new QWidget(left);
+    auto leadInLayout = new QVBoxLayout(m_exportLeadInRow);
+    leadInLayout->setContentsMargins(0, 0, 0, 0);
+    leadInLayout->addWidget(new QLabel(tr("导出开场缓冲"), m_exportLeadInRow));
+    m_exportLeadIn = new QDoubleSpinBox(m_exportLeadInRow);
+    m_exportLeadIn->setObjectName(QStringLiteral("exportLeadInSeconds"));
+    m_exportLeadIn->setRange(0, 10);
+    m_exportLeadIn->setDecimals(3);
+    m_exportLeadIn->setSingleStep(0.5);
+    m_exportLeadIn->setSuffix(tr(" 秒"));
+    m_exportLeadIn->setValue(2);
+    m_exportLeadIn->setToolTip(tr("仅新歌导出：在音频开头补静音，并把音符、炸弹和墙后移相同时间。\n"
+                                "编辑工程的音频和拍点不变；设为 0 关闭。"));
+    leadInLayout->addWidget(m_exportLeadIn);
+    leftLayout->addWidget(m_exportLeadInRow);
     auto tempo = new QGroupBox(tr("节拍校准"), left);
     auto tf = new QFormLayout(tempo);
     m_bpm = new QDoubleSpinBox(tempo);
@@ -625,7 +641,10 @@ void MainWindow::importSongFolder() {
     tabs->addTab(computer, tr("电脑文件夹"));
     auto headset = new QWidget(tabs);
     auto headsetLayout = new QVBoxLayout(headset);
-    auto hint = new QLabel(tr("连接并解锁 PICO，允许 USB 文件传输。\n歌曲位置：内部共享存储空间 / SoulTopia / BeatNote / Custom\n导入时复制到电脑，保留头显中的原歌曲。"), headset);
+    auto hint = new QLabel(tr("连接并解锁 PICO，允许 USB 文件传输。\n"
+                             "星穹绿洲：SoulTopia / BeatNote / Custom\n"
+                             "光之乐团：Android / data / com.StarRiverVR.LightBand / files / CustomMusic\n"
+                             "以上目录均位于内部共享存储空间。导入时复制到电脑，保留头显中的原歌曲。"), headset);
     hint->setWordWrap(true);
     headsetLayout->addWidget(hint);
     auto songs = new QListWidget(headset);
@@ -661,13 +680,15 @@ void MainWindow::importSongFolder() {
     connect(m_mtp, &MtpImportService::songsListed, &dialog, [=](const QVector<MtpSongEntry> &entries) {
         songs->clear();
         for (const auto &entry : entries) {
-            auto item = new QListWidgetItem(entry.name + "\n" + entry.deviceName, songs);
+            const QString source = entry.gameName.isEmpty()
+                ? entry.deviceName : entry.gameName + QStringLiteral(" · ") + entry.deviceName;
+            auto item = new QListWidgetItem(entry.name + "\n" + source, songs);
             item->setData(Qt::UserRole, QVariant::fromValue(entry));
             item->setToolTip(entry.location);
         }
         refresh->setEnabled(true);
         status->setText(entries.isEmpty()
-            ? tr("没有找到歌曲。请检查头显连接、USB 文件传输授权，以及 Custom 目录。")
+            ? tr("没有找到歌曲。请检查头显连接、USB 文件传输授权，以及 Custom / CustomMusic 目录。")
             : tr("找到 %1 首歌曲，选择后导入。").arg(entries.size()));
         if (!entries.isEmpty()) { tabs->setCurrentWidget(headset); songs->setCurrentRow(0); }
     });
@@ -861,6 +882,8 @@ void MainWindow::refreshDocument() {
         if (difficulty.id == m_document->currentDifficultyId()) m_difficulties->setCurrentItem(item);
     }
     m_newDifficultyRow->setVisible(loaded && m_document->isNewSong());
+    m_exportLeadInRow->setVisible(loaded && m_document->isNewSong());
+    m_exportLeadIn->setEnabled(loaded && m_document->isNewSong() && !m_busy);
     m_newDifficultySelector->setEnabled(loaded && m_document->isNewSong() && !m_busy);
     if (loaded && m_document->isNewSong() && !m_document->difficulties().isEmpty())
         m_newDifficultySelector->setCurrentIndex(m_newDifficultySelector->findData(m_document->difficulties().first().name));
@@ -1211,14 +1234,18 @@ void MainWindow::exportSong() {
     const QString base = QDir(parent).filePath(safeName(m_document->title()));
     QString path = base;
     int suffix = 2; while (QFileInfo::exists(path)) path = base + "-" + QString::number(suffix++);
+    const double leadIn = m_document->isNewSong() ? m_exportLeadIn->value() : 0;
+    const QString toolsDirectory = m_audio->toolsDirectory();
     m_storageBusy = true;
-    setBusy(true, tr("正在导出完整歌曲目录…"));
+    setBusy(true, leadIn > 0 ? tr("正在添加开场缓冲并导出歌曲…") : tr("正在导出完整歌曲目录…"));
     auto doc = m_document;
     QFutureWatcher<StorageResult> watcher;
     QEventLoop loop;
     connect(&watcher, &QFutureWatcher<StorageResult>::finished, &loop, &QEventLoop::quit);
-    watcher.setFuture(QtConcurrent::run([doc, path] {
-        StorageResult result; result.ok = doc->exportSong(path, &result.error); return result;
+    watcher.setFuture(QtConcurrent::run([doc, path, leadIn, toolsDirectory] {
+        StorageResult result;
+        result.ok = lmsc::SongExporter::exportSong(*doc, path, leadIn, toolsDirectory, &result.error);
+        return result;
     }));
     m_cancelButton->hide();
     loop.exec();
@@ -1226,8 +1253,14 @@ void MainWindow::exportSong() {
     m_storageBusy = false;
     setBusy(false);
     if (!result.ok) { showError(result.error); return; }
+    const QString bufferNote = leadIn > 0
+        ? tr("\n已添加 %1 秒开场静音，音符、炸弹和墙同步后移。工程中的音频与拍点不变。\n").arg(leadIn, 0, 'f', 3)
+        : QString();
     QMessageBox::information(this, tr("导出完成"),
-        tr("歌曲目录：\n%1\n\n把这个完整目录手动复制到头显的 Custom 文件夹，再在星穹绿洲中验证声音和谱面。").arg(QDir::toNativeSeparators(path)));
+        tr("歌曲目录：\n%1\n%2\n手动复制整个歌曲目录到对应游戏的目录：\n"
+           "星穹绿洲：SoulTopia\\BeatNote\\Custom\n"
+           "光之乐团：Android\\data\\com.StarRiverVR.LightBand\\files\\CustomMusic\n\n"
+           "在目标游戏中检查声音、难度和开头物件。").arg(QDir::toNativeSeparators(path), bufferNote));
 }
 
 bool MainWindow::confirmDocumentChange() {
@@ -1249,6 +1282,7 @@ void MainWindow::setBusy(bool busy, const QString &message) {
     m_exportAction->setEnabled(!busy && m_document->isLoaded());
     m_difficulties->setEnabled(!busy);
     m_newDifficultySelector->setEnabled(!busy && m_document->isNewSong());
+    m_exportLeadIn->setEnabled(!busy && m_document->isNewSong());
     m_grid->setEnabled(!busy && m_document->isLoaded() && m_document->readOnlyReason().isEmpty());
     m_bpm->setEnabled(!busy && m_document->isNewSong());
     m_offset->setEnabled(!busy && m_document->isNewSong());

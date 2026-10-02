@@ -1064,7 +1064,6 @@ bool BeatmapDocument::exportSong(const QString &destinationFolder, QString *erro
         if (!hash.addData(&original) || QString::fromLatin1(hash.result().toHex()) != it.value().toString())
             return fail(error, QStringLiteral("原始快照发生变化，拒绝导出：%1").arg(it.key()));
     }
-    if (d->newSong && !ProjectStore::writeJson(QDir(song).filePath(d->infoRelative), d->info, error)) return false;
     for (const auto &selected : d->tracks) if (d->changed(selected)) {
         if (!selected.readOnly.isEmpty()) return fail(error, QStringLiteral("受保护难度出现编辑记录，拒绝导出。"));
         const auto merged = d->merged(selected);
@@ -1074,6 +1073,28 @@ bool BeatmapDocument::exportSong(const QString &destinationFolder, QString *erro
         for (auto it = selected.raw.begin(); it != selected.raw.end(); ++it)
             if (!editable.contains(it.key()) && merged.value(it.key()) != it.value())
                 return fail(error, QStringLiteral("导出校验发现高级或未知字段改变。"));
+    }
+    if (d->newSong) {
+        const auto &selected = d->tracks.first();
+        QString exportFilename = selected.descriptor.filename;
+        // Only standard difficulty names can become output paths. The
+        // project snapshot and edit IDs retain their original filename.
+        const QStringList standardNames{"Easy", "Normal", "Hard", "Expert", "ExpertPlus"};
+        if (standardNames.contains(selected.descriptor.name)) exportFilename = selected.descriptor.name + ".dat";
+        if (exportFilename != selected.descriptor.filename &&
+            !QFile::rename(QDir(song).filePath(selected.descriptor.filename), QDir(song).filePath(exportFilename)))
+            return fail(error, QStringLiteral("无法生成与难度对应的谱面文件。"));
+        auto exportedInfo = d->info;
+        auto sets = exportedInfo.value("_difficultyBeatmapSets").toArray();
+        auto set = sets.first().toObject();
+        auto difficulties = set.value("_difficultyBeatmaps").toArray();
+        auto difficulty = difficulties.first().toObject();
+        difficulty.insert("_beatmapFilename", exportFilename);
+        difficulties[0] = difficulty;
+        set.insert("_difficultyBeatmaps", difficulties);
+        sets[0] = set;
+        exportedInfo.insert("_difficultyBeatmapSets", sets);
+        if (!ProjectStore::writeJson(QDir(song).filePath(d->infoRelative), exportedInfo, error)) return false;
     }
     if (!QDir().rename(song, target.absoluteFilePath()))
         return fail(error, QStringLiteral("无法完成导出目录提交；目标可能已被创建。"));
