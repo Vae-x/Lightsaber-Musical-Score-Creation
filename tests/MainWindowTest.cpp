@@ -521,7 +521,7 @@ void MainWindowTest::chineseBrandIconAndAboutLicense() {
     QCOMPARE(nav->currentRow(), 6);
     QCOMPARE(workspace->currentIndex(), 2);
     QCOMPARE(pages->currentIndex(), 4);
-    QCOMPARE(version->text(), QStringLiteral("0.2.0"));
+    QCOMPARE(version->text(), QStringLiteral("0.3.0"));
     QCOMPARE(author->text(), QStringLiteral("Vae-x"));
     QVERIFY(hasText(*pages->currentWidget(), QStringLiteral("GNU GPL 第 3 版")));
     QVERIFY(hasText(*pages->currentWidget(), QStringLiteral("第三方组件")));
