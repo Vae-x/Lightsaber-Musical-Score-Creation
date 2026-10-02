@@ -405,9 +405,9 @@ void MainWindowTest::aiSuggestionsPreserveLoadedDocument() {
     QCOMPARE(service.requests.count(), 2);
     const auto pending = service.requests.last();
     nav->setCurrentRow(0);
-    QCOMPARE(service.cancelledIds.last(), pending.contextId);
+    QVERIFY(!service.cancelledIds.contains(pending.contextId));
     emit service.recognitionFinished({pending.contextId, QStringLiteral("已离开页面的迟到结果"), {}});
-    QVERIFY(result->toPlainText().isEmpty());
+    QCOMPARE(result->toPlainText(), QStringLiteral("已离开页面的迟到结果"));
     QCOMPARE(objectCount(window), 3);
     QVERIFY(apply->isEnabled());
     window.close();
@@ -463,7 +463,12 @@ void MainWindowTest::aiGenerationPreviewAndAtomicApply() {
         draft.objects.append(note);
     }
     draft.metrics.directional = 3;
+    nav->setCurrentRow(0);
     emit service.draftReady(draft);
+    QVERIFY(!window.findChild<lmsc::GenerationPreviewDialog *>());
+    nav->setCurrentRow(1);
+    auto viewCandidate=window.findChild<QPushButton *>(QStringLiteral("aiViewCandidate"));
+    QVERIFY(viewCandidate && viewCandidate->isEnabled()); viewCandidate->click();
     QPointer<lmsc::GenerationPreviewDialog> preview = window.findChild<lmsc::GenerationPreviewDialog *>();
     QVERIFY(preview && preview->isVisible());
     QCOMPARE(objectCount(window), 1);

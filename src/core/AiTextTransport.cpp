@@ -6,6 +6,8 @@
 #endif
 
 #include <QFileInfo>
+#include <QElapsedTimer>
+#include <QCryptographicHash>
 #include <QHostAddress>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -58,7 +60,8 @@ QString validatePreferences(const AppPreferences &preferences) {
 
 bool sameConnection(const AppPreferences &a, const AppPreferences &b) {
     if (a.aiConnection != b.aiConnection || a.networkProxy.mode != b.networkProxy.mode
-            || a.networkProxy.host != b.networkProxy.host || a.networkProxy.port != b.networkProxy.port) return false;
+            || a.networkProxy.host != b.networkProxy.host || a.networkProxy.port != b.networkProxy.port
+            || a.requestTimeoutMinutes != b.requestTimeoutMinutes) return false;
     if (a.aiConnection == "codex")
         return a.codexExecutable == b.codexExecutable && a.codexModel == b.codexModel;
     if (a.providerId != b.providerId) return false;
@@ -88,6 +91,7 @@ struct ConfiguredAiTextTransport::Impl {
     AppPreferences preferences;
     AiTextRequest request;
     QTimer timeout;
+    QTimer heartbeat;
     QPointer<CodexTextSession> codex;
     QPointer<QNetworkReply> reply;
     QNetworkAccessManager network;
@@ -97,13 +101,23 @@ struct ConfiguredAiTextTransport::Impl {
     quint64 generation = 0;
     QByteArray response;
     bool active = false;
+    QElapsedTimer clock;
+    QString stage = QStringLiteral("prepare");
+    int nativeCode = 0;
 
     explicit Impl(ConfiguredAiTextTransport *owner) : owner(owner) {
         timeout.setSingleShot(true);
+        heartbeat.setInterval(1000);
+        QObject::connect(&heartbeat, &QTimer::timeout, owner, [this] {
+            if (active && !codex) emit this->owner->requestProgress(request.requestId, stage, clock.elapsed());
+        });
         QObject::connect(&timeout, &QTimer::timeout, owner, [this] {
-            if (active) fail(QStringLiteral("AI 生成超时，未应用任何结果。"));
+            if (active) fail(QStringLiteral("AI 请求超时，已完成的进度可手动继续。"), "timeout");
         });
 #ifdef Q_OS_WIN
+        QObject::connect(&native, &WinHttpModelTransport::networkDetails, owner, [this](const QString &phase, int code) {
+            if (active && !codex) { stage=phase; nativeCode=code; }
+        });
         QObject::connect(&native, &WinHttpModelTransport::replyReady, owner,
                          [this](int status, const QByteArray &contents, const QString &error) {
             if (active && !codex) parseReply(status, contents,
@@ -117,6 +131,7 @@ struct ConfiguredAiTextTransport::Impl {
         ++generation;
         active = false;
         timeout.stop();
+        heartbeat.stop();
 #ifdef Q_OS_WIN
         native.cancel();
 #endif
@@ -135,19 +150,28 @@ struct ConfiguredAiTextTransport::Impl {
     }
 
     void fail(const QString &message) {
+        fail(message, "protocol");
+    }
+    void fail(const QString &message, const QString &category, int status = 0, bool retryable = true) {
         if (!active) return;
         const QString id = request.requestId;
+        AiFailure error;
+        error.requestId=id; error.jobId=request.jobId; error.stage=stage; error.category=category;
+        error.message=message; error.httpStatus=status; error.nativeCode=nativeCode;
+        error.elapsedMs=clock.isValid() ? clock.elapsed() : 0; error.retryable=retryable;
+        logAiFailure(error);
         stop();
+        emit owner->failureInfo(error);
         emit owner->failed(id, message);
     }
 
     void parseReply(int status, const QByteArray &contents, const QString &error) {
         if (status >= 300 && status < 400) {
-            fail(QStringLiteral("API 地址发生重定向，请在设置中填写最终服务地址。"));
+            fail(QStringLiteral("API 地址发生重定向，请在设置中填写最终服务地址。"), "redirect", status);
             return;
         }
-        if (status >= 400) { fail(httpError(status)); return; }
-        if (!error.isEmpty()) { fail(error); return; }
+        if (status >= 400) { fail(httpError(status), aiHttpCategory(status), status); return; }
+        if (!error.isEmpty()) { fail(error, error.contains(QStringLiteral("TLS")) ? "tls" : error.contains(QStringLiteral("超时")) ? "timeout" : "network"); return; }
         if (status < 200 || status >= 300 || contents.size() > maximumResponseSize) {
             fail(QStringLiteral("AI 服务响应无效或过大，未应用任何结果。"));
             return;
@@ -162,8 +186,15 @@ struct ConfiguredAiTextTransport::Impl {
         }
         const QJsonObject choice = choices.first().toObject();
         const QJsonObject message = choice.value("message").toObject();
-        if (choice.value("finish_reason").toString() != "stop") {
-            fail(QStringLiteral("AI 响应被截断或未正常结束，未应用任何结果。"));
+        const QString reason=choice.value("finish_reason").toString();
+        if (reason != "stop") {
+            const auto usage=root.value("usage").toObject();
+            DiagnosticLog::instance().record("request.incomplete", {{"jobId",request.jobId},{"requestId",request.requestId},
+                {"reason",reason=="length" || reason=="content_filter" ? reason : QString("unknown")},
+                {"inputTokens",tokenCount(usage.value("prompt_tokens"))},
+                {"outputTokens",tokenCount(usage.value("completion_tokens"))},{"maxOutputTokens",request.maxOutputTokens}});
+            fail(reason=="length" ? QStringLiteral("模型输出达到长度上限，未完成的段落可手动继续；若反复发生，请更换模型。")
+                                  : QStringLiteral("AI 响应未正常结束，未应用任何结果。"), reason=="length" ? "truncated" : "protocol");
             return;
         }
         if ((!message.value("tool_calls").isNull() && !message.value("tool_calls").isUndefined()
@@ -181,6 +212,8 @@ struct ConfiguredAiTextTransport::Impl {
         const QJsonObject usage = root.value("usage").toObject();
         result.inputTokens = tokenCount(usage.value("prompt_tokens"));
         result.outputTokens = tokenCount(usage.value("completion_tokens"));
+        DiagnosticLog::instance().record("request.completed", {{"jobId", request.jobId}, {"requestId", request.requestId},
+            {"elapsedMs", double(clock.elapsed())}, {"inputTokens", result.inputTokens}, {"outputTokens", result.outputTokens}});
         stop();
         emit owner->completed(result);
     }
@@ -188,9 +221,10 @@ struct ConfiguredAiTextTransport::Impl {
     void complete(const AiTextRequest &incoming) {
         stop();
         request = incoming;
-        request.timeoutMs = qBound(1, request.timeoutMs, 180000);
+        request.timeoutMs = qBound(1, request.timeoutMs, 30 * 60000);
         request.maxOutputTokens = qBound(1, request.maxOutputTokens, 32768);
         active = true;
+        clock.start(); stage="prepare"; nativeCode=0;
         const QString validation = validatePreferences(preferences);
         if (!validation.isEmpty()) { fail(validation); return; }
         if (request.requestId.trimmed().isEmpty() || request.userPrompt.trimmed().isEmpty()
@@ -199,23 +233,39 @@ struct ConfiguredAiTextTransport::Impl {
             fail(QStringLiteral("AI 请求为空或过大，未启动生成。"));
             return;
         }
-        timeout.start(request.timeoutMs);
+        DiagnosticLog::instance().record("request.started", {{"jobId", request.jobId}, {"requestId", request.requestId},
+            {"connection", preferences.aiConnection}, {"provider", preferences.providerId},
+            {"model", preferences.aiConnection=="codex" ? preferences.codexModel : preferences.providers.value(preferences.providerId).model},
+            {"proxyMode", preferences.networkProxy.mode}, {"timeoutMs", request.timeoutMs}, {"maxOutputTokens", request.maxOutputTokens}});
+        if (preferences.aiConnection=="api") DiagnosticLog::instance().record("request.endpoint", {{"jobId",request.jobId},
+            {"requestId",request.requestId},{"host",QUrl(preferences.providers.value(preferences.providerId).baseUrl).host()}});
         const quint64 current = generation;
         if (preferences.aiConnection == "codex") {
             codex = new CodexTextSession(preferences, request,
                 [this, current](const AiTextResult &result) {
                     if (!active || generation != current) return;
+                    DiagnosticLog::instance().record("request.completed", {{"jobId", request.jobId},
+                        {"requestId", request.requestId}, {"elapsedMs", double(clock.elapsed())}});
                     codex.clear();
                     stop();
                     emit owner->completed(result);
-                }, [this, current](const QString &message) {
+                }, [this, current](const AiFailure &error) {
                     if (!active || generation != current) return;
                     codex.clear();
-                    fail(message);
-                }, owner);
+                    stop();
+                    emit owner->failureInfo(error);
+                    emit owner->failed(error.requestId, error.message);
+                }, owner, [this, current](const QString &phase, qint64 elapsed) {
+                    if (!active || generation != current) return;
+                    stage=phase;
+                    emit owner->requestProgress(request.requestId, phase, elapsed);
+                });
             codex->start();
             return;
         }
+        timeout.start(request.timeoutMs);
+        heartbeat.start();
+        stage="http.wait";
         const AiProviderConfig config = preferences.providers.value(preferences.providerId);
         QUrl url(config.baseUrl.trimmed(), QUrl::StrictMode);
         QString path = url.path();
@@ -237,7 +287,7 @@ struct ConfiguredAiTextTransport::Impl {
         const QByteArray body = QJsonDocument(parameters).toJson(QJsonDocument::Compact);
 #ifdef Q_OS_WIN
         native.post(url, config.apiKey.trimmed(), preferences.providerId, body,
-                    request.timeoutMs, preferences.networkProxy);
+                    qMax(1, request.timeoutMs-int(clock.elapsed())), preferences.networkProxy);
 #else
         if (url.scheme() == "https" && !QSslSocket::supportsSsl()) {
             fail(QStringLiteral("当前程序缺少匹配的 HTTPS/TLS 运行库。"));
@@ -245,7 +295,7 @@ struct ConfiguredAiTextTransport::Impl {
         }
         const bool loopback = url.host().compare("localhost", Qt::CaseInsensitive) == 0
                 || QHostAddress(url.host()).isLoopback();
-        if (loopback) network.setProxy(QNetworkProxy(QNetworkProxy::NoProxy));
+        if (loopback || preferences.networkProxy.mode=="direct") network.setProxy(QNetworkProxy(QNetworkProxy::NoProxy));
         else if (preferences.networkProxy.mode == "manual")
             network.setProxy(QNetworkProxy(QNetworkProxy::HttpProxy, preferences.networkProxy.host.trimmed(),
                                  static_cast<quint16>(preferences.networkProxy.port)));
@@ -287,6 +337,7 @@ ConfiguredAiTextTransport::ConfiguredAiTextTransport(QObject *parent)
     : AiTextTransport(parent), d(new Impl(this)) {
     qRegisterMetaType<AiTextRequest>();
     qRegisterMetaType<AiTextResult>();
+    qRegisterMetaType<AiFailure>();
 }
 
 ConfiguredAiTextTransport::~ConfiguredAiTextTransport() { d->stop(); }
@@ -297,7 +348,16 @@ void ConfiguredAiTextTransport::configure(const AppPreferences &preferences) {
     if (!sameConnection(d->preferences, preferences) && d->active)
         d->fail(QStringLiteral("AI 设置已更改，请重新生成。"));
     d->preferences = preferences;
+    for (const auto &config : preferences.providers) DiagnosticLog::instance().addSecret(config.apiKey);
     if (before != isAvailable()) emit availabilityChanged();
+}
+int ConfiguredAiTextTransport::requestTimeoutMs() const { return qBound(1, d->preferences.requestTimeoutMinutes, 30)*60000; }
+QString ConfiguredAiTextTransport::connectionIdentity() const {
+    const auto &p=d->preferences;
+    const auto config=p.providers.value(p.providerId);
+    const QString identity=p.aiConnection=="codex" ? p.aiConnection+'\n'+p.codexExecutable+'\n'+p.codexModel
+        : p.aiConnection+'\n'+p.providerId+'\n'+config.baseUrl.trimmed()+'\n'+config.model;
+    return QString::fromLatin1(QCryptographicHash::hash(identity.toUtf8(), QCryptographicHash::Sha256).toHex());
 }
 
 void ConfiguredAiTextTransport::complete(const AiTextRequest &request) { d->complete(request); }

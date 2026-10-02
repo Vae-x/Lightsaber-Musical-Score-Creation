@@ -12,9 +12,10 @@ namespace lmsc {
 class CodexTextSession final : public QObject {
 public:
     using Success = std::function<void(const AiTextResult &)>;
-    using Failure = std::function<void(const QString &)>;
+    using Failure = std::function<void(const AiFailure &)>;
+    using Progress = std::function<void(const QString &, qint64)>;
     CodexTextSession(const AppPreferences &preferences, const AiTextRequest &request,
-                     Success success, Failure failure, QObject *parent);
+                     Success success, Failure failure, QObject *parent, Progress progress = {});
     ~CodexTextSession() override;
     void start();
     void cancel();

@@ -4,6 +4,7 @@
 #include "gui/EditorViews.h"
 #include "core/AppSettings.h"
 #include "core/AppInfo.h"
+#include "core/DiagnosticLog.h"
 #include <QtTest>
 #include <QApplication>
 #include <QCheckBox>
@@ -18,6 +19,7 @@
 #include <QLineEdit>
 #include <QListWidget>
 #include <QPushButton>
+#include <QPlainTextEdit>
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QSpinBox>
@@ -48,6 +50,7 @@ private slots:
     void fetchModelsThroughUi();
     void fetchModelsThroughManualProxy();
     void proxySaveCancelAndValidation();
+    void networkDiagnosticsAndPersistence();
     void aboutHomepage();
     void painterViewsFollowTheme();
     void captureSettings();
@@ -498,6 +501,81 @@ void SettingsDialogTest::fetchModelsThroughManualProxy() {
     QVERIFY(!received.contains("test-proxy-key"));
     QVERIFY(dialog.findChild<QPushButton *>(QStringLiteral("fetchApiModels"))->isEnabled());
     QCOMPARE(dialog.findChild<QComboBox *>(QStringLiteral("aiModel"))->count(), 0);
+}
+
+void SettingsDialogTest::networkDiagnosticsAndPersistence() {
+    struct RestoreLog {
+        bool enabled=lmsc::DiagnosticLog::instance().isEnabled();
+        ~RestoreLog() { lmsc::DiagnosticLog::instance().setEnabled(enabled); }
+    } restore;
+    QTemporaryDir directory;
+    const QString file=directory.filePath("preferences.json");
+    lmsc::SettingsDialog dialog(nullptr,file);
+    dialog.show();
+    auto nav=dialog.findChild<QListWidget *>("settingsNavigation");
+    auto mode=dialog.findChild<QComboBox *>("networkProxyMode");
+    auto timeout=dialog.findChild<QSpinBox *>("aiRequestTimeoutMinutes");
+    auto enabled=dialog.findChild<QCheckBox *>("diagnosticLogEnabled");
+    auto probe=dialog.findChild<QPushButton *>("checkProxyConnection");
+    auto status=dialog.findChild<QLabel *>("proxyCheckStatus");
+    auto buttons=dialog.findChild<QDialogButtonBox *>("settingsButtons");
+    QVERIFY(nav && mode && timeout && enabled && probe && status && buttons);
+    QCOMPARE(timeout->value(),10);
+    QCOMPARE(timeout->minimum(),1);
+    QCOMPARE(timeout->maximum(),30);
+    QVERIFY(enabled->isChecked());
+    QVERIFY(mode->findData("direct")>=0);
+    nav->setCurrentRow(3);
+    mode->setCurrentIndex(mode->findData("direct"));
+    QVERIFY(!probe->isEnabled());
+    timeout->setValue(20);
+    enabled->setChecked(false);
+    buttons->button(QDialogButtonBox::Apply)->click();
+    const auto saved=lmsc::AppSettings(file).load();
+    QCOMPARE(saved.networkProxy.mode,QString("direct"));
+    QCOMPARE(saved.requestTimeoutMinutes,20);
+    QVERIFY(!saved.diagnosticLogEnabled);
+    timeout->setValue(1);
+    enabled->setChecked(true);
+    buttons->button(QDialogButtonBox::Cancel)->click();
+    QCOMPARE(lmsc::AppSettings(file).load().requestTimeoutMinutes,20);
+    QVERIFY(!lmsc::AppSettings(file).load().diagnosticLogEnabled);
+
+    lmsc::SettingsDialog reopened(nullptr,file);
+    reopened.show();
+    QCOMPARE(reopened.findChild<QSpinBox *>("aiRequestTimeoutMinutes")->value(),20);
+    QVERIFY(!reopened.findChild<QCheckBox *>("diagnosticLogEnabled")->isChecked());
+    reopened.findChild<QListWidget *>("settingsNavigation")->setCurrentRow(3);
+    auto newMode=reopened.findChild<QComboBox *>("networkProxyMode");
+    newMode->setCurrentIndex(newMode->findData("manual"));
+    QTcpServer proxy;
+    QVERIFY(proxy.listen(QHostAddress::LocalHost,0));
+    QByteArray received;
+    connect(&proxy,&QTcpServer::newConnection,&proxy,[&] {
+        auto socket=proxy.nextPendingConnection();
+        connect(socket,&QTcpSocket::readyRead,socket,[&,socket] {
+            received+=socket->readAll();
+            if (received.contains("\r\n\r\n")) socket->write("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n");
+        });
+        connect(socket,&QTcpSocket::disconnected,socket,&QObject::deleteLater);
+    });
+    reopened.findChild<QLineEdit *>("networkProxyHost")->setText("127.0.0.1");
+    reopened.findChild<QSpinBox *>("networkProxyPort")->setValue(proxy.serverPort());
+    auto newProbe=reopened.findChild<QPushButton *>("checkProxyConnection");
+    newProbe->click();
+    QVERIFY(!newProbe->isEnabled());
+    QTRY_VERIFY_WITH_TIMEOUT(newProbe->isEnabled(),5000);
+    QVERIFY(reopened.findChild<QLabel *>("proxyCheckStatus")->text().contains(QStringLiteral("实际服务连接")));
+    QVERIFY(received.startsWith("CONNECT 127.0.0.1:1 HTTP/1.1"));
+    QVERIFY(!received.contains("Authorization"));
+    // Opening logs must work even while recording is disabled.
+    reopened.findChild<QListWidget *>("settingsNavigation")->setCurrentRow(4);
+    reopened.findChild<QPushButton *>("viewDiagnosticLogs")->click();
+    auto viewer=reopened.findChild<QDialog *>("diagnosticLogDialog");
+    QVERIFY(viewer && viewer->isVisible());
+    QVERIFY(viewer->findChild<QPlainTextEdit *>("diagnosticLogText")->isReadOnly());
+    QVERIFY(viewer->findChild<QPushButton *>("exportDiagnosticLog"));
+    viewer->close();
 }
 
 void SettingsDialogTest::aboutHomepage() {

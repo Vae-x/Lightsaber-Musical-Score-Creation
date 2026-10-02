@@ -98,13 +98,19 @@ bool sameAiPreferences(const lmsc::AppPreferences &a, const lmsc::AppPreferences
     if (a.aiConnection != b.aiConnection || a.providerId != b.providerId
         || a.codexExecutable != b.codexExecutable || a.codexModel != b.codexModel
         || a.networkProxy.mode != b.networkProxy.mode || a.networkProxy.host != b.networkProxy.host
-        || a.networkProxy.port != b.networkProxy.port || a.providers.keys() != b.providers.keys()) return false;
+        || a.networkProxy.port != b.networkProxy.port || a.requestTimeoutMinutes != b.requestTimeoutMinutes || a.providers.keys() != b.providers.keys()) return false;
     for (auto it = a.providers.begin(); it != a.providers.end(); ++it) {
         const auto other = b.providers.value(it.key());
         if (it.value().baseUrl != other.baseUrl || it.value().apiKey != other.apiKey
             || it.value().model != other.model || it.value().models != other.models) return false;
     }
     return true;
+}
+bool sameGenerationModel(const lmsc::AppPreferences &a, const lmsc::AppPreferences &b) {
+    if (a.aiConnection!=b.aiConnection) return false;
+    if (a.aiConnection=="codex") return a.codexExecutable==b.codexExecutable && a.codexModel==b.codexModel;
+    const auto first=a.providers.value(a.providerId), second=b.providers.value(b.providerId);
+    return a.providerId==b.providerId && first.baseUrl.trimmed()==second.baseUrl.trimmed() && first.model==second.model;
 }
 
 // Dense editor panes must not set the minimum size of a hidden settings page.
@@ -130,6 +136,8 @@ MainWindow::MainWindow(QWidget *parent, const QString &settingsFile)
     ui->setupUi(this);
     const auto preferences = lmsc::AppSettings(m_settingsFile).load();
     m_generationPreferences = preferences;
+    lmsc::DiagnosticLog::instance().setEnabled(preferences.diagnosticLogEnabled);
+    lmsc::DiagnosticLog::instance().record("application.started");
     lmsc::ThemeManager::apply(preferences.themeMode);
     m_documentId = QUuid::createUuid().toString(QUuid::WithoutBraces);
     m_aiTransport = new lmsc::ConfiguredAiTextTransport(this);
@@ -529,8 +537,10 @@ void MainWindow::buildWorkspace() {
     connect(m_settingsPanel, &lmsc::SettingsPanel::canceled, this, returnToEditor);
     connect(m_settingsPanel, &lmsc::SettingsPanel::preferencesChanged, this, [this] {
         const auto preferences = lmsc::AppSettings(m_settingsFile).load();
+        lmsc::DiagnosticLog::instance().setEnabled(preferences.diagnosticLogEnabled);
         if (!sameAiPreferences(m_generationPreferences, preferences)) {
-            m_aiPage->invalidateGeneration();
+            if (sameGenerationModel(m_generationPreferences, preferences)) m_aiPage->pauseGenerationForConnectionChange();
+            else m_aiPage->invalidateGeneration();
             m_generationPreferences = preferences;
             m_aiTransport->configure(preferences);
             refreshRecognitionContext();
@@ -549,8 +559,6 @@ void MainWindow::buildWorkspace() {
 
 void MainWindow::selectWorkspacePage(int row) {
     if (row < 0 || row > 6) return;
-    if (row != 1 && m_workspacePages->currentWidget() == m_aiPage)
-        m_aiPage->cancelRecognition();
     if (row < 2) {
         m_workspacePages->setCurrentIndex(row);
         if (row == 1) refreshRecognitionContext();
@@ -575,7 +583,7 @@ void MainWindow::refreshRecognitionContext() {
     context.difficultyId = m_document->currentDifficultyId();
     context.documentRevision = m_document->revision();
     context.timeMap = m_document->timeMap();
-    if (loaded && isAudioReady()) context.audio = m_audio->pcmSnapshot();
+    if (loaded) context.audio = m_audio->pcmSnapshot();
     context.audioRevision = context.audio.revision;
     QString difficultyName = QStringLiteral("Expert");
     for (const auto &difficulty : m_document->difficulties())
@@ -609,6 +617,9 @@ bool MainWindow::generationSourceIsCurrent(const lmsc::GenerationRequest &source
 
 void MainWindow::previewGeneratedChart(const lmsc::GenerationDraft &draft) {
     if (draft.source.analysisOnly || !m_document->isNewSong() || !generationSourceIsCurrent(draft.source)) return;
+    if (m_workspacePages->currentWidget()!=m_aiPage) {
+        statusBar()->showMessage(tr("AI 候选谱已生成，可返回 AI 页面查看。"),10000); return;
+    }
     if (m_generationPreview) m_generationPreview->close();
     auto preview = new lmsc::GenerationPreviewDialog(draft, m_document->objects().size(), m_audio, this);
     m_generationPreview = preview;

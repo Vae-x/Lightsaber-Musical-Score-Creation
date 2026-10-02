@@ -43,9 +43,18 @@ class AiGenerationService : public QObject {
 public:
     using QObject::QObject;
     virtual bool isAvailable() const = 0;
+    struct Status {
+        enum State { Idle, Running, Paused, Failed, Completed } state = Idle;
+        QString jobId, stage, message;
+        int percent = 0, completedSegments = 0, totalSegments = 0;
+        bool resumable = false;
+    };
+    virtual Status status() const { return {}; }
 public slots:
     virtual void generate(const lmsc::GenerationRequest &request) = 0;
     virtual void cancel(const QString &jobId) = 0;
+    virtual void resume(const QString &jobId) { emit requestFailed(jobId, QStringLiteral("此服务不支持继续生成。")); }
+    virtual void discard(const QString &jobId) { cancel(jobId); }
 signals:
     void draftReady(const lmsc::GenerationDraft &draft);
     void requestFailed(const QString &jobId, const QString &message);
@@ -59,9 +68,12 @@ public:
     explicit LlmAiGenerationService(AiTextTransport *transport, QObject *parent = nullptr);
     ~LlmAiGenerationService() override;
     bool isAvailable() const override;
+    Status status() const override;
 public slots:
     void generate(const lmsc::GenerationRequest &request) override;
     void cancel(const QString &jobId) override;
+    void resume(const QString &jobId) override;
+    void discard(const QString &jobId) override;
 private:
     struct Impl;
     std::unique_ptr<Impl> d;

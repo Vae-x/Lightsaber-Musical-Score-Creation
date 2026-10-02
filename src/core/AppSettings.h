@@ -35,6 +35,8 @@ struct AppPreferences {
     QString codexExecutable;
     QString codexModel;
     NetworkProxyConfig networkProxy;
+    int requestTimeoutMinutes = 10;
+    bool diagnosticLogEnabled = true;
 };
 
 // Application-wide preferences are separate from songs and project documents.

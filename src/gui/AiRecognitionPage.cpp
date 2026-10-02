@@ -1,4 +1,5 @@
 #include "AiRecognitionPage.h"
+#include "DiagnosticLogDialog.h"
 
 #include <QFileInfo>
 #include <QCheckBox>
@@ -123,6 +124,9 @@ AiRecognitionPage::AiRecognitionPage(QWidget *parent)
     m_cancel = new QPushButton(tr("取消任务"), service);
     m_cancel->setObjectName(QStringLiteral("aiCancelRecognition"));
     actions->addWidget(m_cancel);
+    m_resume=new QPushButton(tr("继续生成"), service); m_resume->setObjectName("aiResumeGeneration"); actions->addWidget(m_resume);
+    m_preview=new QPushButton(tr("查看候选谱"), service); m_preview->setObjectName("aiViewCandidate"); actions->addWidget(m_preview);
+    m_logs=new QPushButton(tr("查看本次日志"), service); m_logs->setObjectName("aiViewLog"); actions->addWidget(m_logs);
     actions->addStretch();
     m_configure = new QPushButton(tr("配置 AI 连接"), service);
     m_configure->setObjectName(QStringLiteral("aiConfigureConnection"));
@@ -156,6 +160,14 @@ AiRecognitionPage::AiRecognitionPage(QWidget *parent)
     connect(m_start, &QPushButton::clicked, this, &AiRecognitionPage::startRecognition);
     connect(m_generate, &QPushButton::clicked, this, [this] { startGeneration(false); });
     connect(m_cancel, &QPushButton::clicked, this, &AiRecognitionPage::cancelRecognition);
+    connect(m_resume, &QPushButton::clicked, this, [this] {
+        if (!m_generationService || !m_resume->isEnabled()) return;
+        m_pendingGeneration=m_lastGeneration;
+        setStatus(tr("正在继续未完成的请求…"), "status"); refreshControls();
+        m_generationService->resume(m_pendingGeneration.jobId);
+    });
+    connect(m_preview, &QPushButton::clicked, this, [this] { if (m_hasDraft) emit generationDraftReady(m_cachedDraft); });
+    connect(m_logs, &QPushButton::clicked, this, [this] { showDiagnosticLog(this,m_lastGeneration.jobId); });
     connect(m_configure, &QPushButton::clicked, this, &AiRecognitionPage::configureConnectionRequested);
     const auto optionsChanged = [this] {
         if (m_updatingOptions) return;
@@ -174,6 +186,7 @@ AiRecognitionPage::AiRecognitionPage(QWidget *parent)
 AiRecognitionPage::~AiRecognitionPage() {
     if (!m_pendingContextId.isEmpty()) emit cancelRequested(m_pendingContextId);
     if (!m_pendingGeneration.jobId.isEmpty()) emit cancelGenerationRequested(m_pendingGeneration.jobId);
+    if (m_generationService && !m_lastGeneration.jobId.isEmpty()) m_generationService->discard(m_lastGeneration.jobId);
     for (const auto &connection : m_connections) disconnect(connection);
     for (const auto &connection : m_generationConnections) disconnect(connection);
 }
@@ -182,7 +195,7 @@ void AiRecognitionPage::setContext(const QString &audioFile, const QString &titl
                                    double offsetSeconds, double durationSeconds, bool busy) {
     const bool changed = m_audioFile != audioFile || m_title != title || m_bpm != bpm
         || m_offsetSeconds != offsetSeconds || m_durationSeconds != durationSeconds;
-    if (changed || busy) {
+    if (changed || (busy && m_legacyOverride)) {
         cancelRecognition();
         invalidateGeneration();
     }
@@ -208,7 +221,7 @@ void AiRecognitionPage::setContext(const QString &audioFile, const QString &titl
             .arg(bpm, 0, 'f', 2).arg(offsetSeconds, 0, 'f', 3).arg(duration));
     }
     refreshControls();
-    if (changed || busyChanged || m_status->text().isEmpty()) showIdleStatus();
+    if (changed || (busyChanged && m_lastGeneration.jobId.isEmpty()) || m_status->text().isEmpty()) showIdleStatus();
 }
 
 void AiRecognitionPage::setService(AiRecognitionService *service) {
@@ -298,6 +311,8 @@ void AiRecognitionPage::setGenerationService(AiGenerationService *service, AiGen
             [this, revision](const GenerationDraft &draft) {
                 if (revision != m_generationServiceRevision || !acceptsGeneration(draft.source)) return;
                 m_pendingGeneration = {};
+                m_cachedDraft=draft; m_hasDraft=!draft.source.analysisOnly;
+                m_progress->setRange(0,100); m_progress->setValue(100);
                 QString output = draft.summary;
                 if (!draft.source.analysisOnly) {
                     output += tr("\n\n%1 · 方向 %2 · 无方向 %3 · 炸弹 %4 · 墙 %5\n平均每秒 %6 个音符 · 峰值 %7")
@@ -315,7 +330,9 @@ void AiRecognitionPage::setGenerationService(AiGenerationService *service, AiGen
             [this, revision](const QString &jobId, const QString &message) {
                 if (revision != m_generationServiceRevision || jobId != m_pendingGeneration.jobId || jobId.isEmpty()) return;
                 m_pendingGeneration = {};
-                setStatus(message.isEmpty() ? tr("分析或生成失败，请检查模型连接。") : message, "error");
+                const auto state=m_generationService ? m_generationService->status() : AiGenerationService::Status{};
+                const QString retained=state.resumable ? tr("\n已保留 %1/%2 个乐句，检查连接后点击继续。").arg(state.completedSegments).arg(state.totalSegments) : QString();
+                setStatus((message.isEmpty() ? tr("分析或生成失败，请检查模型连接。") : message)+retained, "error");
                 refreshControls();
             }));
         m_generationConnections.append(connect(service, &AiGenerationService::progress, this,
@@ -324,20 +341,21 @@ void AiRecognitionPage::setGenerationService(AiGenerationService *service, AiGen
                 m_progress->setRange(0, percent < 0 ? 0 : 100);
                 if (percent >= 0) m_progress->setValue(qBound(0, percent, 100));
                 if (!stage.isEmpty()) setStatus(stage, "status");
+                refreshControls();
             }));
         m_generationConnections.append(connect(service, &AiGenerationService::cancelled, this,
             [this, revision](const QString &jobId) {
                 if (revision != m_generationServiceRevision || jobId != m_pendingGeneration.jobId || jobId.isEmpty()) return;
                 m_pendingGeneration = {};
-                setStatus(tr("任务已取消。"));
+                setStatus(tr("任务已停止，已完成进度保留。"));
                 refreshControls();
             }));
         m_generationConnections.append(connect(service, &AiGenerationService::availabilityChanged, this,
             [this, revision] {
                 if (revision != m_generationServiceRevision) return;
-                if (!m_generationService || !m_generationService->isAvailable()) invalidateGeneration();
+                if (!m_generationService || !m_generationService->isAvailable()) cancelRecognition();
                 refreshControls();
-                if (!isRecognizing()) showIdleStatus();
+                if (!isRecognizing() && m_lastGeneration.jobId.isEmpty()) showIdleStatus();
             }));
         m_generationConnections.append(connect(service, &QObject::destroyed, this,
             [this, revision] {
@@ -364,7 +382,7 @@ void AiRecognitionPage::setGenerationContext(const GenerationRequest &context, b
         || context.audio.revision != m_generationContext.audio.revision
         || context.profile.name != m_generationContext.profile.name || context.profile.rank != m_generationContext.profile.rank
         || !sameTiming(context.timeMap, m_generationContext.timeMap) || newSong != m_newSong;
-    if (changed || busy) invalidateGeneration();
+    if (changed) invalidateGeneration();
     if (context.documentId != m_generationContext.documentId
         || context.profile.name != m_generationContext.profile.name) {
         m_updatingOptions = true;
@@ -376,7 +394,7 @@ void AiRecognitionPage::setGenerationContext(const GenerationRequest &context, b
     m_newSong = newSong;
     m_contextBusy = busy;
     refreshControls();
-    if (changed || busy) showIdleStatus();
+    if (changed) showIdleStatus();
 }
 
 GeneratedTypes AiRecognitionPage::selectedTypes() const {
@@ -415,6 +433,7 @@ void AiRecognitionPage::startGeneration(bool analysisOnly) {
     m_pendingGeneration.profile = DifficultyProfile::forName(m_difficulty->currentData().toString());
     m_pendingGeneration.allowedTypes = selectedTypes();
     m_pendingGeneration.analysisOnly = analysisOnly;
+    m_lastGeneration=m_pendingGeneration; m_cachedDraft={}; m_hasDraft=false;
     m_result->clear();
     m_progress->setRange(0, 0);
     setStatus(analysisOnly ? tr("正在分析整首音乐…") : tr("正在分析音乐并生成候选谱…"), "status");
@@ -425,9 +444,13 @@ void AiRecognitionPage::startGeneration(bool analysisOnly) {
 
 void AiRecognitionPage::invalidateGeneration() {
     cancelRecognition();
+    if (m_generationService && !m_lastGeneration.jobId.isEmpty()) m_generationService->discard(m_lastGeneration.jobId);
+    m_lastGeneration={}; m_cachedDraft={}; m_hasDraft=false;
     m_result->clear();
+    refreshControls();
     emit generationInvalidated();
 }
+void AiRecognitionPage::pauseGenerationForConnectionChange() { cancelRecognition(); }
 
 void AiRecognitionPage::showGenerationApplied() {
     setStatus(tr("候选谱已应用，可在曲谱编辑中一次撤销。"), "success");
@@ -459,10 +482,11 @@ void AiRecognitionPage::cancelRecognition() {
     const auto jobId = m_pendingGeneration.jobId;
     m_pendingContextId.clear();
     m_pendingGeneration = {};
-    setStatus(tr("识别已取消。"));
+    setStatus(contextId.isEmpty() ? tr("任务已停止，已完成进度保留。") : tr("识别已取消。"));
     refreshControls();
     if (!contextId.isEmpty()) emit cancelRequested(contextId);
     if (!jobId.isEmpty()) emit cancelGenerationRequested(jobId);
+    refreshControls();
 }
 
 bool AiRecognitionPage::accepts(const QString &contextId) const {
@@ -487,7 +511,13 @@ void AiRecognitionPage::refreshControls() {
     for (auto box : {m_directional, m_dots, m_bombs, m_walls}) box->setEnabled(m_newSong && !m_contextBusy);
     m_cancel->setEnabled(isRecognizing());
     m_cancel->setVisible(isRecognizing());
-    m_progress->setVisible(isRecognizing());
+    const auto state=m_generationService ? m_generationService->status() : AiGenerationService::Status{};
+    const bool canResume=!m_lastGeneration.jobId.isEmpty() && state.jobId==m_lastGeneration.jobId && state.resumable;
+    m_resume->setVisible(canResume); m_resume->setEnabled(canResume && available && !m_contextBusy && !isRecognizing());
+    m_preview->setVisible(m_hasDraft); m_preview->setEnabled(m_hasDraft && !m_contextBusy && !isRecognizing());
+    m_logs->setVisible(!m_lastGeneration.jobId.isEmpty());
+    m_generate->setText(!m_lastGeneration.jobId.isEmpty() && !m_lastGeneration.analysisOnly ? tr("重新生成") : tr("生成候选谱"));
+    m_progress->setVisible(isRecognizing() || !m_lastGeneration.jobId.isEmpty());
     m_configure->setEnabled(!isRecognizing() && !m_contextBusy);
     m_serviceStatus->setText(available
         ? tr("已连接分析与编排服务")
@@ -505,7 +535,7 @@ void AiRecognitionPage::refreshControls() {
 }
 
 void AiRecognitionPage::showIdleStatus() {
-    if (isRecognizing()) return;
+    if (isRecognizing() || !m_lastGeneration.jobId.isEmpty()) return;
     const bool available = m_legacyOverride || !m_generationService
         ? m_service && m_service->isAvailable() : m_generationService->isAvailable();
     if (!available) {

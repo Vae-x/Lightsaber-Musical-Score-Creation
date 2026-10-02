@@ -129,7 +129,7 @@ QVector<AiProviderPreset> AppSettings::providerPresets() {
 }
 
 QString AppSettings::validateProxy(const NetworkProxyConfig &proxy) {
-    if (proxy.mode == QStringLiteral("system")) return {};
+    if (proxy.mode == QStringLiteral("system") || proxy.mode == QStringLiteral("direct")) return {};
     if (proxy.mode != QStringLiteral("manual"))
         return QStringLiteral("代理模式无效，请选择自动或手动设置。");
     const QString host = proxy.host.trimmed();
@@ -196,6 +196,15 @@ AppPreferences AppSettings::load(QString *error) const {
     else warnings.append(QStringLiteral("AI 连接方式无效，已使用 API。"));
     preferences.codexExecutable = root.value(QStringLiteral("codexExecutable")).toString();
     preferences.codexModel = root.value(QStringLiteral("codexModel")).toString();
+    if (root.contains("requestTimeoutMinutes")) {
+        const auto value = root.value("requestTimeoutMinutes");
+        const int minutes = value.toInt(-1);
+        if (value.isDouble() && value.toDouble() == minutes && minutes >= 1 && minutes <= 30)
+            preferences.requestTimeoutMinutes = minutes;
+        else warnings.append(QStringLiteral("请求超时设置无效，已使用十分钟。"));
+    }
+    if (root.value("diagnosticLogEnabled").isBool())
+        preferences.diagnosticLogEnabled = root.value("diagnosticLogEnabled").toBool();
     const QJsonValue proxyValue = root.value(QStringLiteral("networkProxy"));
     if (!proxyValue.isUndefined()) {
         const QJsonObject proxy = proxyValue.toObject();
@@ -252,6 +261,10 @@ AppPreferences AppSettings::load(QString *error) const {
 
 bool AppSettings::save(const AppPreferences &preferences, QString *error) const {
     if (error) error->clear();
+    if (preferences.requestTimeoutMinutes < 1 || preferences.requestTimeoutMinutes > 30) {
+        if (error) *error = QStringLiteral("请求超时必须为一至三十分钟。");
+        return false;
+    }
     if (!validChoice(preferences.themeMode,
                      {QStringLiteral("system"), QStringLiteral("light"), QStringLiteral("dark")})
             || !validChoice(preferences.aiConnection,
@@ -286,6 +299,8 @@ bool AppSettings::save(const AppPreferences &preferences, QString *error) const 
     root.insert(QStringLiteral("providerId"), preferences.providerId);
     root.insert(QStringLiteral("codexExecutable"), preferences.codexExecutable);
     root.insert(QStringLiteral("codexModel"), preferences.codexModel);
+    root.insert("requestTimeoutMinutes", preferences.requestTimeoutMinutes);
+    root.insert("diagnosticLogEnabled", preferences.diagnosticLogEnabled);
     root.insert(QStringLiteral("networkProxy"), QJsonObject{
         {QStringLiteral("mode"), preferences.networkProxy.mode},
         {QStringLiteral("host"), preferences.networkProxy.host.trimmed()},

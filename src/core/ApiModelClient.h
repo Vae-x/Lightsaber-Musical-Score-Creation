@@ -3,6 +3,8 @@
 #include "AppSettings.h"
 
 #include <QObject>
+#include <QElapsedTimer>
+#include <QJsonObject>
 #include <QPointer>
 #include <QStringList>
 
@@ -42,6 +44,8 @@ private:
     quint64 m_generation = 0;
     bool m_busy = false;
     NetworkProxyConfig m_proxy;
+    QElapsedTimer m_clock;
+    QJsonObject m_diagnostic;
 };
 
 } // namespace lmsc

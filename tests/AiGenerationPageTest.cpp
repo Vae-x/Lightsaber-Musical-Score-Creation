@@ -22,10 +22,16 @@ public:
     bool available = true;
     QVector<lmsc::GenerationRequest> requests;
     QStringList cancelledJobs;
+    Status current;
+    QStringList resumedJobs;
+    Status status() const override { return current; }
     bool isAvailable() const override { return available; }
-    void generate(const lmsc::GenerationRequest &request) override { requests.append(request); }
-    void cancel(const QString &jobId) override { cancelledJobs.append(jobId); emit cancelled(jobId); }
+    void generate(const lmsc::GenerationRequest &request) override { requests.append(request); current={}; current.jobId=request.jobId; current.state=Status::Running; }
+    void cancel(const QString &jobId) override { cancelledJobs.append(jobId); current.state=Status::Paused; current.resumable=true; emit cancelled(jobId); }
+    void discard(const QString &jobId) override { cancelledJobs.append(jobId); current={}; }
+    void resume(const QString &jobId) override { resumedJobs.append(jobId); current.state=Status::Running; current.resumable=false; emit progress(jobId,50,QStringLiteral("继续乐句")); }
     void finish(const lmsc::GenerationRequest &source, const QString &summary = QStringLiteral("测试规划")) {
+        current.state=Status::Completed; current.resumable=false;
         lmsc::GenerationDraft draft;
         draft.source = source;
         draft.summary = summary;
@@ -52,6 +58,8 @@ private slots:
     void backendReplacementAndDestructionAreSafe();
     void settingsAndAvailabilityInvalidateRequests();
     void previewHasReadOnlyTimelineAndExplicitApplication();
+    void busyAndNavigationPreserveProgressAndReusableDraft();
+    void pausedJobCanResumeWithoutStartingOver();
 private:
     lmsc::GenerationRequest context() const;
     void setup(lmsc::AiRecognitionPage &page, FakeGenerationService &service, bool newSong = true);
@@ -373,5 +381,39 @@ void AiGenerationPageTest::previewHasReadOnlyTimelineAndExplicitApplication() {
     QTRY_VERIFY(preview.isNull());
 }
 
+void AiGenerationPageTest::busyAndNavigationPreserveProgressAndReusableDraft() {
+    FakeGenerationService service; lmsc::AiRecognitionPage page; setup(page,service);
+    auto generate=page.findChild<QPushButton *>("aiGenerateButton"); generate->click();
+    const auto source=service.requests.last();
+    page.hide(); page.setGenerationContext(context(),true,true);
+    QVERIFY(service.cancelledJobs.isEmpty()); QVERIFY(page.isRecognizing());
+    service.finish(source); QVERIFY(!page.isRecognizing());
+    page.setGenerationContext(context(),true,false); page.show();
+    auto preview=page.findChild<QPushButton *>("aiViewCandidate"); QVERIFY(preview && preview->isEnabled());
+    QSignalSpy ready(&page,&lmsc::AiRecognitionPage::generationDraftReady);
+    preview->click(); preview->click(); QCOMPARE(ready.count(),2); QCOMPARE(service.requests.size(),1);
+    QCOMPARE(page.findChild<QProgressBar *>("aiRecognitionProgress")->value(),100);
+    page.invalidateGeneration(); QVERIFY(!preview->isEnabled());
+}
+void AiGenerationPageTest::pausedJobCanResumeWithoutStartingOver() {
+    FakeGenerationService service; lmsc::AiRecognitionPage page; setup(page,service);
+    page.findChild<QPushButton *>("aiGenerateButton")->click(); const auto source=service.requests.last();
+    page.cancelRecognition(); QVERIFY(!page.isRecognizing());
+    auto resume=page.findChild<QPushButton *>("aiResumeGeneration"); QVERIFY(resume && resume->isEnabled());
+    const QString captures=qEnvironmentVariable("LMSC_AI_DIAGNOSTICS_CAPTURE_DIRECTORY");
+    if (!captures.isEmpty()) {
+        QVERIFY(QDir().mkpath(captures)); page.resize(1050,660); page.show();
+        for (const auto &mode : {QString("dark"),QString("light")}) {
+            lmsc::ThemeManager::apply(mode); QTest::qWait(80);
+            QVERIFY(page.grab().save(QDir(captures).filePath("ai-paused-"+mode+".png")));
+            page.findChild<QPushButton *>("aiViewLog")->click();
+            auto viewer=page.findChild<QDialog *>("diagnosticLogDialog"); QVERIFY(viewer);
+            QTest::qWait(80); QVERIFY(viewer->grab().save(QDir(captures).filePath("ai-log-"+mode+".png")));
+            viewer->close();
+        }
+    }
+    resume->click(); QCOMPARE(service.resumedJobs,QStringList{source.jobId}); QCOMPARE(service.requests.size(),1);
+    QVERIFY(page.isRecognizing()); service.finish(source); QVERIFY(!page.isRecognizing());
+}
 QTEST_MAIN(AiGenerationPageTest)
 #include "AiGenerationPageTest.moc"

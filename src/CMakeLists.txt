@@ -21,6 +21,7 @@ find_package(Qt5 5.12 REQUIRED COMPONENTS Core Widgets Multimedia Concurrent Net
 
 add_library(lmsc_core STATIC
         core/AppInfo.h
+        core/DiagnosticLog.cpp core/DiagnosticLog.h core/AiDiagnostics.h
         core/BeatmapDocument.cpp
         core/BeatmapDocument.h
         core/TimeMap.cpp
@@ -154,6 +155,10 @@ endif ()
 
 if (BUILD_TESTING)
     find_package(Qt5 5.12 REQUIRED COMPONENTS Test)
+    add_executable(diagnostic_log_tests "${LMSC_REPOSITORY_DIR}/tests/DiagnosticLogTest.cpp")
+    target_link_libraries(diagnostic_log_tests PRIVATE lmsc_core Qt5::Test)
+    set_target_properties(diagnostic_log_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    find_package(Qt5 5.12 REQUIRED COMPONENTS Test)
     # Both entry points use these same tests; the paths are independent of cwd.
     add_executable(core_tests "${LMSC_REPOSITORY_DIR}/tests/core_tests.cpp")
     target_link_libraries(core_tests PRIVATE lmsc_core)
@@ -192,6 +197,7 @@ if (BUILD_TESTING)
             gui/EditorViews.cpp gui/EditorViews.h
             gui/ThemeManager.cpp gui/ThemeManager.h)
     target_link_libraries(ai_generation_page_tests PRIVATE lmsc_core Qt5::Widgets Qt5::Test)
+    target_sources(ai_generation_page_tests PRIVATE ../resources/app.qrc)
     set_target_properties(ai_generation_page_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
     add_test(NAME ai_generation_page COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:ai_generation_page_tests>")
     set_tests_properties(ai_generation_page PROPERTIES TIMEOUT 90 LABELS "gui;ai")
@@ -305,3 +311,13 @@ if (BUILD_TESTING)
                 WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
     endif ()
 endif ()
+
+foreach(LMSC_LOG_UI_TARGET src ai_generation_page_tests ai_recognition_tests settings_dialog_tests main_window_tests)
+    if(TARGET ${LMSC_LOG_UI_TARGET})
+        target_sources(${LMSC_LOG_UI_TARGET} PRIVATE gui/DiagnosticLogDialog.cpp gui/DiagnosticLogDialog.h)
+    endif()
+endforeach()
+if(TARGET diagnostic_log_tests)
+    add_test(NAME diagnostic_log COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:diagnostic_log_tests>")
+    set_tests_properties(diagnostic_log PROPERTIES TIMEOUT 60 LABELS "core;diagnostics")
+endif()

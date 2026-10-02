@@ -29,6 +29,7 @@ public:
     void cancel();
 
 signals:
+    void networkDetails(const QString &stage, int nativeCode);
     void replyReady(int status, const QByteArray &contents, const QString &error);
 
 private:

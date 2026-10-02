@@ -29,6 +29,7 @@ public:
     void setGenerationService(AiGenerationService *service, AiGenerationService *fallback = nullptr);
     void setGenerationContext(const GenerationRequest &context, bool newSong, bool busy);
     void invalidateGeneration();
+    void pauseGenerationForConnectionChange();
     void showGenerationApplied();
     bool isRecognizing() const { return !m_pendingContextId.isEmpty() || !m_pendingGeneration.jobId.isEmpty(); }
 
@@ -63,6 +64,9 @@ private:
     QVector<QMetaObject::Connection> m_generationConnections;
     GenerationRequest m_generationContext;
     GenerationRequest m_pendingGeneration;
+    GenerationRequest m_lastGeneration;
+    GenerationDraft m_cachedDraft;
+    bool m_hasDraft = false;
     quint64 m_generationServiceRevision = 0;
     bool m_newSong = false;
     bool m_legacyOverride = false;
@@ -85,6 +89,7 @@ private:
     QComboBox *m_difficulty;
     QCheckBox *m_directional, *m_dots, *m_bombs, *m_walls;
     QPushButton *m_cancel;
+    QPushButton *m_resume, *m_preview, *m_logs;
     QPushButton *m_configure;
     QProgressBar *m_progress;
     QPlainTextEdit *m_result;

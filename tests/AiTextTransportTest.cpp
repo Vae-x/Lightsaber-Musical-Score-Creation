@@ -136,7 +136,7 @@ int mockServer() {
         auto event = [&](const QString &name, const QJsonObject &extra) {
             QJsonObject payload = extra;
             payload.insert("threadId", "mock-thread");
-            if (name.startsWith("item/")) payload.insert("turnId", "mock-turn");
+            if (name.startsWith("item/") || name=="error") payload.insert("turnId", "mock-turn");
             output({{"method", name}, {"params", payload}}, mode == "split");
         };
         if (method == "initialize") reply({{"userAgent", "mock"}});
@@ -167,9 +167,17 @@ int mockServer() {
                    {"sandbox", sandbox}});
         } else if (method == "turn/start") {
             if (!params.value("outputSchema").isObject()) return 7;
+            if (mode=="delayedTurnStart") QThread::msleep(200);
             reply({{"turn", QJsonObject{{"id", "mock-turn"}, {"status", "inProgress"}}}});
             event("turn/started", {{"turn", QJsonObject{{"id", "mock-turn"}, {"status", "inProgress"}}}});
             if (mode == "pause") continue;
+            if (mode=="recovering" || mode=="permanentError") {
+                event("error",{{"willRetry",mode=="recovering"},{"error",QJsonObject{{"codexErrorInfo","responseStreamDisconnected"},
+                    {"message","test-only-secret connection lost"}}}});
+                if (mode=="permanentError") continue;
+            }
+            if (mode=="staleError") output({{"method","error"},{"params",QJsonObject{{"threadId","mock-thread"},
+                {"turnId","old-turn"},{"willRetry",false},{"error",QJsonObject{{"message","old failure"}}}}}});
             if (mode == "toolRequest") {
                 output({{"id", "server-tool-request"}, {"method", "item/commandExecution/requestApproval"},
                         {"params", QJsonObject{{"threadId", "mock-thread"}, {"turnId", "mock-turn"}}}});
@@ -300,10 +308,14 @@ void AiTextTransportTest::invalidResponse() {
     transport.configure(fixture.preferences());
     QSignalSpy failed(&transport, &lmsc::AiTextTransport::failed);
     QSignalSpy completed(&transport, &lmsc::AiTextTransport::completed);
+    QSignalSpy details(&transport, &lmsc::AiTextTransport::failureInfo);
     transport.complete(request());
     QTRY_COMPARE(failed.count(), 1);
     QCOMPARE(completed.count(), 0);
     QVERIFY(!failed.first().at(1).toString().contains("test-only-api-key"));
+    QCOMPARE(details.count(),1);
+    QCOMPARE(qvariant_cast<lmsc::AiFailure>(details.first().first()).category,
+             body.contains("\"length\"") ? QString("truncated") : QString("protocol"));
 }
 
 void AiTextTransportTest::errorsNeverRetry_data() {
@@ -311,6 +323,10 @@ void AiTextTransportTest::errorsNeverRetry_data() {
     QTest::newRow("bad-optional-parameter") << 400;
     QTest::newRow("rate-limit") << 429;
     QTest::newRow("redirect") << 307;
+    QTest::newRow("authentication") << 401;
+    QTest::newRow("permission") << 403;
+    QTest::newRow("proxy-authentication") << 407;
+    QTest::newRow("server-error") << 503;
 }
 void AiTextTransportTest::errorsNeverRetry() {
     QFETCH(int, status);
@@ -321,11 +337,17 @@ void AiTextTransportTest::errorsNeverRetry() {
     lmsc::ConfiguredAiTextTransport transport;
     transport.configure(fixture.preferences());
     QSignalSpy failed(&transport, &lmsc::AiTextTransport::failed);
+    QSignalSpy details(&transport, &lmsc::AiTextTransport::failureInfo);
     transport.complete(request());
     QTRY_COMPARE(failed.count(), 1);
     QTest::qWait(100);
     QCOMPARE(fixture.requests.size(), 1);
     QVERIFY(!failed.first().at(1).toString().contains("test-only-api-key"));
+    QCOMPARE(details.count(),1);
+    const auto error=qvariant_cast<lmsc::AiFailure>(details.first().first());
+    QCOMPARE(error.httpStatus,status);
+    QCOMPARE(error.category,status==307 ? QString("redirect") : lmsc::aiHttpCategory(status));
+    QVERIFY(!error.stage.isEmpty());
 }
 
 void AiTextTransportTest::cancelledAndReconfiguredRepliesAreDiscarded() {
@@ -390,6 +412,9 @@ void AiTextTransportTest::codexCompletedTextAndSecurity_data() {
     QTest::addColumn<QString>("mode");
     QTest::newRow("split-lines") << QStringLiteral("split");
     QTest::newRow("read-only-omits-network-default") << QStringLiteral("noNetworkField");
+    QTest::newRow("recoverable-error-completes") << QStringLiteral("recovering");
+    QTest::newRow("stale-turn-error-ignored") << QStringLiteral("staleError");
+    QTest::newRow("delayed-turn-start") << QStringLiteral("delayedTurnStart");
 }
 void AiTextTransportTest::codexCompletedTextAndSecurity() {
     QFETCH(QString, mode);
@@ -431,7 +456,7 @@ void AiTextTransportTest::codexCompletedTextAndSecurity() {
 
 void AiTextTransportTest::codexFailures_data() {
     QTest::addColumn<QString>("mode");
-    for (const char *mode : {"toolRequest", "toolItem", "unsafeConfig", "unsafeThread", "unsafeNetwork", "failedTurn", "multipleFinal", "loggedOut", "badVersion"})
+    for (const char *mode : {"toolRequest", "toolItem", "unsafeConfig", "unsafeThread", "unsafeNetwork", "failedTurn", "multipleFinal", "loggedOut", "badVersion", "permanentError"})
         QTest::newRow(mode) << QString::fromLatin1(mode);
 }
 void AiTextTransportTest::codexFailures() {
@@ -442,10 +467,16 @@ void AiTextTransportTest::codexFailures() {
     transport.configure(codexPreferences(mode, log));
     QSignalSpy completed(&transport, &lmsc::AiTextTransport::completed);
     QSignalSpy failed(&transport, &lmsc::AiTextTransport::failed);
+    QSignalSpy details(&transport,&lmsc::AiTextTransport::failureInfo);
     transport.complete(request());
     QTRY_COMPARE(failed.count(), 1);
     QCOMPARE(completed.count(), 0);
     QVERIFY(!failed.first().at(1).toString().contains("test-only-secret"));
+    QCOMPARE(details.count(),1);
+    if (mode=="permanentError") {
+        const auto error=qvariant_cast<lmsc::AiFailure>(details.first().first());
+        QCOMPARE(error.category,QString("network")); QVERIFY(error.retryable); QVERIFY(!error.stage.isEmpty());
+    }
     if (mode == "unsafeConfig" || mode == "unsafeThread" || mode == "unsafeNetwork" || mode == "loggedOut" || mode == "badVersion")
         QVERIFY(!loggedMethod(log, "turn/start"));
     if (mode.startsWith("tool")) QTRY_VERIFY(loggedMethod(log, "turn/interrupt"));

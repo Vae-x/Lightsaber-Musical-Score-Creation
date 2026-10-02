@@ -1,6 +1,8 @@
 #include "SettingsPanel.h"
 #include "NavigationSidebar.h"
 #include "ThemeManager.h"
+#include "DiagnosticLogDialog.h"
+#include "core/DiagnosticLog.h"
 #include "core/ApiModelClient.h"
 #include "core/AppInfo.h"
 #include "core/CodexAccountClient.h"
@@ -10,6 +12,9 @@
 #include <QDesktopServices>
 #include <QDialogButtonBox>
 #include <QFile>
+#include <QDir>
+#include <QTcpSocket>
+#include <QTimer>
 #include <QFileDialog>
 #include <QFormLayout>
 #include <QFrame>
@@ -479,8 +484,12 @@ QWidget *SettingsPanel::buildNetworkPage() {
     m_proxyMode->setObjectName(QStringLiteral("networkProxyMode"));
     m_proxyMode->addItem(tr("自动（系统代理）"), QStringLiteral("system"));
     m_proxyMode->addItem(tr("手动（HTTP 代理）"), QStringLiteral("manual"));
+    m_proxyMode->addItem(tr("直连（不使用代理）"), QStringLiteral("direct"));
     m_proxyMode->setCurrentIndex(qMax(0, m_proxyMode->findData(m_preferences.networkProxy.mode)));
     modeForm->addRow(tr("代理模式"), m_proxyMode);
+    m_requestTimeout=new QSpinBox(group); m_requestTimeout->setObjectName("aiRequestTimeoutMinutes");
+    m_requestTimeout->setRange(1,30); m_requestTimeout->setValue(m_preferences.requestTimeoutMinutes);
+    modeForm->addRow(tr("单次请求超时（分钟）"),m_requestTimeout);
     groupLayout->addLayout(modeForm);
     m_manualProxy = new QWidget(group);
     auto manualForm = settingsForm();
@@ -498,6 +507,44 @@ QWidget *SettingsPanel::buildNetworkPage() {
     manualForm->addRow(tr("端口"), m_proxyPort);
     manualForm->addRow(description(tr("地址只填 IP 或域名，端口单独填写。"), m_manualProxy));
     groupLayout->addWidget(m_manualProxy);
+    auto probeButton=new QPushButton(tr("检查代理端口"),group); probeButton->setObjectName("checkProxyConnection");
+    auto probeStatus=description({},group); probeStatus->setObjectName("proxyCheckStatus");
+    groupLayout->addWidget(probeButton,0,Qt::AlignLeft); groupLayout->addWidget(probeStatus);
+    probeButton->setEnabled(m_preferences.networkProxy.mode=="manual");
+    connect(m_proxyMode,QOverload<int>::of(&QComboBox::currentIndexChanged),this,[this,probeButton] {
+        probeButton->setEnabled(m_proxyMode->currentData().toString()=="manual");
+    });
+    connect(probeButton,&QPushButton::clicked,this,[this,probeButton,probeStatus] {
+        const auto proxy=proxyConfig();
+        const auto error=AppSettings::validateProxy(proxy);
+        if (!error.isEmpty()) { statusText(probeStatus,error,"error"); return; }
+        probeButton->setEnabled(false); statusText(probeStatus,tr("正在检查 HTTP 代理端口…"),"muted");
+        auto socket=new QTcpSocket(this); auto timer=new QTimer(socket); timer->setSingleShot(true);
+        const auto finish=[this,socket,timer,probeButton,probeStatus,proxy](const QString &text,bool ok) {
+            if (socket->property("probeDone").toBool()) return;
+            socket->setProperty("probeDone",true); timer->stop(); socket->abort();
+            probeButton->setEnabled(m_proxyMode->currentData().toString()=="manual");
+            statusText(probeStatus,text,ok ? "success" : "error");
+            DiagnosticLog::instance().record("proxy.probe",{{"proxyMode",proxy.mode},{"host",proxy.host},{"port",proxy.port},
+                {"category",ok ? "httpProxy" : "network"}}); socket->deleteLater();
+        };
+        connect(socket,&QTcpSocket::connected,this,[socket] {
+            socket->write("CONNECT 127.0.0.1:1 HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n");
+        });
+        connect(socket,&QTcpSocket::readyRead,this,[socket,finish] {
+            QByteArray response=socket->property("probeResponse").toByteArray()+socket->read(1024);
+            socket->setProperty("probeResponse",response);
+            if (!response.contains('\n') && response.size()<1024) return;
+            const bool http=response.startsWith("HTTP/1.0 ") || response.startsWith("HTTP/1.1 ");
+            finish(http ? QObject::tr("端口能响应 HTTP 代理请求；请继续获取模型验证实际服务连接。")
+                        : QObject::tr("端口未返回 HTTP 代理响应，请核对 HTTP 或混合端口。"),http);
+        });
+        connect(socket,QOverload<QAbstractSocket::SocketError>::of(&QTcpSocket::error),this,[finish](QAbstractSocket::SocketError) {
+            finish(QObject::tr("无法连接代理端口，请检查代理程序、地址和端口。"),false);
+        });
+        connect(timer,&QTimer::timeout,this,[finish] { finish(QObject::tr("代理端口检查超时。"),false); });
+        timer->start(5000); socket->connectToHost(proxy.host,quint16(proxy.port));
+    });
     m_manualProxy->setEnabled(m_proxyMode->currentData().toString() == QStringLiteral("manual"));
     layout->addWidget(group);
     layout->addWidget(description(tr("点击应用或保存后，下次启动会沿用。"), page));
@@ -549,6 +596,20 @@ QWidget *SettingsPanel::buildAboutPage() {
     groupLayout->addLayout(form);
     layout->addWidget(group);
     auto homepage = new QPushButton(tr("打开项目主页"), page);
+    auto logs=settingsCard(page,tr("诊断日志"),tr("保留最近七天的请求阶段与错误记录，最多 25 MiB。"));
+    auto logsLayout=qobject_cast<QVBoxLayout *>(logs->layout());
+    m_logEnabled=new QCheckBox(tr("启用诊断日志"),logs); m_logEnabled->setObjectName("diagnosticLogEnabled");
+    m_logEnabled->setChecked(m_preferences.diagnosticLogEnabled); logsLayout->addWidget(m_logEnabled);
+    auto logActions=new QHBoxLayout;
+    auto viewLog=new QPushButton(tr("查看 / 导出日志"),logs); viewLog->setObjectName("viewDiagnosticLogs");
+    auto openLogs=new QPushButton(tr("打开日志目录"),logs); openLogs->setObjectName("openDiagnosticLogDirectory");
+    logActions->addWidget(viewLog); logActions->addWidget(openLogs); logActions->addStretch(); logsLayout->addLayout(logActions);
+    connect(viewLog,&QPushButton::clicked,this,[this] { showDiagnosticLog(this); });
+    connect(openLogs,&QPushButton::clicked,this,[] {
+        const auto directory=DiagnosticLog::instance().directory(); QDir().mkpath(directory);
+        QDesktopServices::openUrl(QUrl::fromLocalFile(directory));
+    });
+    layout->addWidget(logs);
     homepage->setObjectName(QStringLiteral("openProjectHomepage"));
     homepage->setToolTip(AppInfo::homepageUrl());
     layout->addWidget(homepage, 0, Qt::AlignLeft);
@@ -679,12 +740,15 @@ bool SettingsPanel::applyPreferences() {
     m_preferences.codexExecutable = m_codexPath->text().trimmed();
     m_preferences.codexModel = m_codexModels->currentText().trimmed();
     m_preferences.networkProxy = proxyConfig();
+    m_preferences.requestTimeoutMinutes=m_requestTimeout->value();
+    m_preferences.diagnosticLogEnabled=m_logEnabled->isChecked();
     QString error;
     if (!m_store.save(m_preferences, &error)) {
         statusText(m_saveStatus, tr("保存失败：") + error, "error");
         return false;
     }
     m_savedPreferences = m_preferences;
+    DiagnosticLog::instance().setEnabled(m_preferences.diagnosticLogEnabled);
     m_savedTheme = m_preferences.themeMode;
     ThemeManager::apply(m_savedTheme);
     statusText(m_saveStatus, tr("设置已保存。"), "success");
@@ -711,6 +775,8 @@ void SettingsPanel::discardChanges() {
     m_proxyMode->setCurrentIndex(qMax(0, m_proxyMode->findData(m_preferences.networkProxy.mode)));
     m_proxyHost->setText(m_preferences.networkProxy.host);
     m_proxyPort->setValue(m_preferences.networkProxy.port);
+    m_requestTimeout->setValue(m_preferences.requestTimeoutMinutes);
+    m_logEnabled->setChecked(m_preferences.diagnosticLogEnabled);
     m_manualProxy->setEnabled(m_proxyMode->currentData().toString() == QStringLiteral("manual"));
     m_codexPath->setText(m_preferences.codexExecutable);
     replaceModelList(m_codexModels, {}, m_preferences.codexModel);

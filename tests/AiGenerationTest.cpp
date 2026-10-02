@@ -132,6 +132,8 @@ private slots:
     void destroyedTransportAndServiceAreSafe();
     void requestAndWholeTaskTimeouts();
     void networkFailuresDoNotRetry();
+    void resumePreservesValidatedSegmentsAndRejectsLateReplies();
+    void completedAnalysisIsReusedForGeneration();
     void emptyOrUnknownOptionsAreRejected();
     void completedAndCancelledTasksReleaseAudioLease();
 private:
@@ -267,7 +269,7 @@ void AiGenerationTest::generationOptions() {
     }
     QVERIFY(transport.requests.size()>=2);
     for (const auto &message:transport.requests) {
-        QCOMPARE(message.timeoutMs,180000); QVERIFY(!message.userPrompt.contains(shortPcm));
+        QCOMPARE(message.timeoutMs,600000); QVERIFY(!message.userPrompt.contains(shortPcm));
         QVERIFY(!message.userPrompt.contains(source.audio.sourcePath)); QVERIFY(!message.outputSchema.isEmpty());
     }
 }
@@ -426,9 +428,13 @@ void AiGenerationTest::requestAndWholeTaskTimeouts() {
     FakeTransport transport; transport.hold=true; lmsc::LlmAiGenerationService service(&transport);
     QSignalSpy failed(&service,&lmsc::AiGenerationService::requestFailed);
     service.generate(request()); QTRY_COMPARE(transport.requests.size(),1);
-    auto *timer=service.findChild<QTimer *>("aiGenerationRequestTimer"); QVERIFY(timer); timer->start(1);
+    const auto pending=transport.requests.last();
+    QCOMPARE(pending.timeoutMs,600000);
+    QVERIFY(!service.findChild<QTimer *>("aiGenerationRequestTimer"));
+    emit transport.failed(pending.requestId,QStringLiteral("模拟传输超时"));
     QTRY_COMPARE(failed.count(),1); QVERIFY(!transport.cancellations.isEmpty());
-    service.generate(request(188)); timer=service.findChild<QTimer *>("aiGenerationTaskTimer"); QVERIFY(timer); timer->start(1);
+    QVERIFY(service.status().resumable);
+    service.generate(request(188)); auto *timer=service.findChild<QTimer *>("aiGenerationTaskTimer"); QVERIFY(timer); timer->start(1);
     QTRY_COMPARE(failed.count(),2); QTest::qWait(50);
 }
 void AiGenerationTest::networkFailuresDoNotRetry() {
@@ -449,11 +455,47 @@ void AiGenerationTest::completedAndCancelledTasksReleaseAudioLease() {
     auto source=request(); auto lease=std::make_shared<int>(1); std::weak_ptr<int> weak=lease;
     source.audio.lease=lease; lease.reset(); service.generate(source); source.audio.lease.reset();
     QTRY_COMPARE(ready.count(),1); QVERIFY(!weak.expired()); // The preview owns its copy.
-    ready.clear(); QTRY_VERIFY(weak.expired());
+    ready.clear(); QVERIFY(!weak.expired()); service.discard(source.jobId); QTRY_VERIFY(weak.expired());
     source=request(188); lease=std::make_shared<int>(2); weak=lease;
     source.audio.lease=lease; lease.reset(); service.generate(source); source.audio.lease.reset(); service.cancel(source.jobId);
+    QVERIFY(!weak.expired()); service.discard(source.jobId);
     QTRY_VERIFY(weak.expired());
 }
 
+void AiGenerationTest::resumePreservesValidatedSegmentsAndRejectsLateReplies() {
+    FakeTransport transport; transport.hold=true; lmsc::LlmAiGenerationService service(&transport);
+    QSignalSpy ready(&service,&lmsc::AiGenerationService::draftReady);
+    const auto reply=[&](const lmsc::AiTextRequest &message) {
+        const auto input=QJsonDocument::fromJson(message.userPrompt.toUtf8()).object();
+        const auto output=input.value("stage").toString()=="plan" ? validPlan(input) : validSegment(input);
+        emit transport.completed({message.requestId,QString::fromUtf8(QJsonDocument(output).toJson()),1,1});
+    };
+    service.generate(request()); QTRY_COMPARE(transport.requests.size(),1); reply(transport.requests.last());
+    QTRY_COMPARE(transport.requests.size(),2); reply(transport.requests.last());
+    QTRY_COMPARE(transport.requests.size(),3);
+    const auto failedSegment=transport.requests.last();
+    const auto failedInput=QJsonDocument::fromJson(failedSegment.userPrompt.toUtf8()).object();
+    QCOMPARE(service.status().completedSegments,1);
+    emit transport.failed(failedSegment.requestId,QStringLiteral("模拟连接失败"));
+    QVERIFY(service.status().resumable); QCOMPARE(service.status().state,lmsc::AiGenerationService::Status::Paused);
+    QTest::qWait(30); QCOMPARE(transport.requests.size(),3);
+    service.resume("job-1"); QTRY_COMPARE(transport.requests.size(),4);
+    const auto retry=transport.requests.last(); QVERIFY(retry.requestId!=failedSegment.requestId);
+    const auto retryInput=QJsonDocument::fromJson(retry.userPrompt.toUtf8()).object();
+    QCOMPARE(retryInput.value("music"),failedInput.value("music")); QCOMPARE(retryInput.value("handContext"),failedInput.value("handContext"));
+    reply(failedSegment); QCOMPARE(ready.count(),0); QCOMPARE(service.status().completedSegments,1);
+    transport.hold=false; reply(retry); QTRY_COMPARE(ready.count(),1);
+    QCOMPARE(service.status().state,lmsc::AiGenerationService::Status::Completed);
+    QCOMPARE(service.status().percent,100);
+}
+void AiGenerationTest::completedAnalysisIsReusedForGeneration() {
+    FakeTransport transport; lmsc::LlmAiGenerationService service(&transport); QSignalSpy ready(&service,&lmsc::AiGenerationService::draftReady);
+    auto source=request(); source.analysisOnly=true; service.generate(source); QTRY_COMPARE(ready.count(),1);
+    QCOMPARE(transport.requests.size(),1);
+    source.analysisOnly=false; source.jobId="generation-from-analysis"; service.generate(source); QTRY_COMPARE(ready.count(),2);
+    int plans=0;
+    for (const auto &message:transport.requests) if (QJsonDocument::fromJson(message.userPrompt.toUtf8()).object().value("stage").toString()=="plan") ++plans;
+    QCOMPARE(plans,1); QVERIFY(!qvariant_cast<lmsc::GenerationDraft>(ready.last().first()).objects.isEmpty());
+}
 QTEST_GUILESS_MAIN(AiGenerationTest)
 #include "AiGenerationTest.moc"

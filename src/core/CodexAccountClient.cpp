@@ -1,4 +1,5 @@
 #include "CodexAccountClient.h"
+#include "DiagnosticLog.h"
 #include "AppInfo.h"
 
 #include <QCoreApplication>
@@ -111,11 +112,14 @@ CodexAccountClient::CodexAccountClient(QObject *parent) : QObject(parent) {
     connect(&m_watchdog, &QTimer::timeout, this, [this] {
         const qint64 now = m_clock.elapsed();
         if (m_startDeadline && now > m_startDeadline) {
+            DiagnosticLog::instance().record("account.timeout", {{"stage", "startup"}, {"timeoutMs", 60000}});
             fail(QStringLiteral("启动 Codex 账号服务超时，请检查 CLI 路径。"));
             return;
         }
         for (auto iterator = m_pending.constBegin(); iterator != m_pending.constEnd(); ++iterator) {
             if (now > iterator->deadline) {
+                DiagnosticLog::instance().record("account.timeout", {{"stage", iterator->method},
+                    {"timeoutMs", 60000}, {"elapsedMs", double(now-iterator->deadline+60000)}});
                 fail(QStringLiteral("Codex 账号服务请求超时（%1），请检查网络后重试。")
                      .arg(iterator->method));
                 return;
@@ -244,12 +248,17 @@ void CodexAccountClient::startServer() {
         return;
     }
     m_output.clear();
-    m_startDeadline = m_clock.elapsed() + 15000;
+    m_startDeadline = m_clock.elapsed() + 60000;
     m_watchdog.start();
     // Automatic mode preserves the official CLI's inherited proxy environment.
     // Manual mode overrides proxy variables only for this child process. Never
     // change qputenv(), the desktop Codex process, or Windows proxy preferences.
     QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    if (m_proxy.mode == "direct") {
+        for (const QString &name : {QStringLiteral("HTTP_PROXY"), QStringLiteral("HTTPS_PROXY"), QStringLiteral("ALL_PROXY"),
+            QStringLiteral("http_proxy"), QStringLiteral("https_proxy"), QStringLiteral("all_proxy")}) environment.remove(name);
+        environment.insert("NO_PROXY", "*"); environment.insert("no_proxy", "*");
+    }
     if (m_proxy.mode == QStringLiteral("manual")) {
         QUrl url;
         url.setScheme(QStringLiteral("http"));
@@ -293,8 +302,9 @@ bool CodexAccountClient::hasRequest(const QString &method) const {
 }
 
 int CodexAccountClient::sendRequest(const QString &method, const QJsonObject &parameters) {
+    DiagnosticLog::instance().record("account.request", {{"method", method}, {"proxyMode", m_proxy.mode}});
     const int id = m_nextId++;
-    m_pending.insert(id, PendingRequest{method, m_clock.elapsed() + 30000});
+    m_pending.insert(id, PendingRequest{method, m_clock.elapsed() + 60000});
     sendMessage(QJsonObject{{"id", id}, {"method", method}, {"params", parameters}});
     return id;
 }
@@ -362,8 +372,12 @@ void CodexAccountClient::handleMessage(const QJsonObject &message) {
     const auto iterator = m_pending.find(id);
     if (iterator == m_pending.end()) return;
     const QString request = iterator->method;
+    const qint64 elapsed = m_clock.elapsed()-iterator->deadline+60000;
     m_pending.erase(iterator);
     if (message.contains("error")) {
+        DiagnosticLog::instance().record("account.rpcFailed", {{"stage", request},
+            {"rpcCode", message.value("error").toObject().value("code").toInt()}, {"elapsedMs", double(elapsed)},
+            {"proxyMode", m_proxy.mode}});
         const QString detail = safeError(message.value("error").toObject().value("message").toString());
         const QString error = QStringLiteral("Codex 请求失败（%1）：%2").arg(request,
             detail.isEmpty() ? QStringLiteral("服务未提供错误详情") : detail);
@@ -384,6 +398,7 @@ void CodexAccountClient::handleMessage(const QJsonObject &message) {
         return;
     }
     handleResult(request, message.value("result").toObject());
+    DiagnosticLog::instance().record("account.completed", {{"stage", request}, {"elapsedMs", double(elapsed)}});
 }
 
 void CodexAccountClient::handleResult(const QString &method, const QJsonObject &result) {
@@ -510,6 +525,7 @@ void CodexAccountClient::stop() {
 }
 
 void CodexAccountClient::fail(const QString &message) {
+    DiagnosticLog::instance().record("account.failed", {{"stage", m_pending.isEmpty() ? QStringLiteral("startup") : m_pending.constBegin().value().method}});
     const bool login = m_loginRequested;
     stop();
     if (login) emit loginFinished(false, message);

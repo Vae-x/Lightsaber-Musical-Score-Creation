@@ -23,6 +23,28 @@
 namespace lmsc {
 namespace {
 constexpr int maximumResponseSize = 4 * 1024 * 1024;
+QString errorCategory(const QJsonObject &error) {
+    const auto info=error.value("codexErrorInfo");
+    const QString code=info.isString() ? info.toString() : info.toObject().keys().value(0);
+    const QString evidence=code+' '+error.value("message").toString();
+    if (evidence.contains("401") || evidence.contains("unauthor", Qt::CaseInsensitive) || evidence.contains("authentication", Qt::CaseInsensitive)) return "authentication";
+    if (evidence.contains("403") || evidence.contains("permission", Qt::CaseInsensitive)) return "permission";
+    if (evidence.contains("429") || evidence.contains("usageLimit", Qt::CaseInsensitive) || evidence.contains("rateLimit", Qt::CaseInsensitive)) return "quota";
+    if (evidence.contains("proxy", Qt::CaseInsensitive)) return "proxy";
+    if (evidence.contains("stream", Qt::CaseInsensitive) || evidence.contains("connect", Qt::CaseInsensitive)) return "network";
+    if (evidence.contains("timeout", Qt::CaseInsensitive)) return "timeout";
+    if (evidence.contains("contextWindow", Qt::CaseInsensitive) || evidence.contains("modelNotFound", Qt::CaseInsensitive)) return "parameters";
+    if (evidence.contains("overload", Qt::CaseInsensitive) || evidence.contains("internalServer", Qt::CaseInsensitive)) return "server";
+    return "protocol";
+}
+QString categoryLabel(const QString &category) {
+    static const QHash<QString, QString> labels{{"authentication", QStringLiteral("账号认证")},
+        {"permission", QStringLiteral("模型权限")}, {"quota", QStringLiteral("额度或频率限制")},
+        {"proxy", QStringLiteral("代理连接")}, {"network", QStringLiteral("网络连接")},
+        {"timeout", QStringLiteral("等待超时")}, {"parameters", QStringLiteral("模型或参数")},
+        {"server", QStringLiteral("服务端异常")}, {"protocol", QStringLiteral("协议异常")}};
+    return labels.value(category, QStringLiteral("未知异常"));
+}
 
 // These names are verified against the official 0.147.0 feature registry.
 // Unknown CLI versions fail before inference instead of silently accepting a
@@ -111,6 +133,13 @@ bool resolveExecutable(QString chosen, QString *program, QStringList *prefix) {
 
 QProcessEnvironment childEnvironment(const NetworkProxyConfig &proxy) {
     QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    if (proxy.mode == "direct") {
+        for (const QString &name : {QStringLiteral("HTTP_PROXY"), QStringLiteral("HTTPS_PROXY"),
+             QStringLiteral("ALL_PROXY"), QStringLiteral("http_proxy"), QStringLiteral("https_proxy"), QStringLiteral("all_proxy")})
+            environment.remove(name);
+        environment.insert("NO_PROXY", "*"); environment.insert("no_proxy", "*");
+        return environment;
+    }
     if (proxy.mode != "manual") return environment;
     QUrl url;
     url.setScheme("http");
@@ -131,6 +160,9 @@ struct CodexTextSession::Impl {
     AiTextRequest request;
     Success success;
     Failure failure;
+    Progress progress;
+    QString phase = "version";
+    qint64 lastReportedSecond = -1;
     QTemporaryDir directory;
     QProcess process;
     QTimer watchdog;
@@ -151,9 +183,9 @@ struct CodexTextSession::Impl {
     bool cancelWaitingForTurn = false;
 
     Impl(CodexTextSession *owner, const AppPreferences &preferences, const AiTextRequest &request,
-         Success success, Failure failure)
+         Success success, Failure failure, Progress progress)
         : owner(owner), preferences(preferences), request(request), success(std::move(success)),
-          failure(std::move(failure)),
+          failure(std::move(failure)), progress(std::move(progress)),
           directory(QDir(QDir::tempPath()).filePath(QStringLiteral("lmsc-codex-generation-XXXXXX"))) {
         directory.setAutoRemove(false);
 #ifdef Q_OS_WIN
@@ -192,22 +224,30 @@ struct CodexTextSession::Impl {
                     return;
                 }
                 checkingVersion = false;
+                DiagnosticLog::instance().record("codex.version", {{"jobId", this->request.jobId},
+                    {"requestId", this->request.requestId}, {"cliVersion", "0.147.0"}});
                 buffer.clear();
                 totalBytes = 0;
-                phaseDeadline = clock.elapsed() + 15000;
+                setPhase("startup", 60000);
                 process.start(program, prefix + securityArguments(), QIODevice::ReadWrite);
                 return;
             }
             const QString phase = pending.isEmpty() ? QStringLiteral("生成期间") : pending.constBegin().value();
-            fail(QStringLiteral("Codex 生成服务已退出（%1），未取得完整结果。").arg(phase));
+            DiagnosticLog::instance().record("codex.exited", {{"jobId", this->request.jobId},
+                {"requestId", this->request.requestId}, {"exitCode", code}, {"stage", this->phase}});
+            fail(QStringLiteral("Codex 生成服务已退出（%1），可查看本次日志。").arg(phase), "process", 0, true);
         });
         watchdog.setInterval(100);
         QObject::connect(&watchdog, &QTimer::timeout, owner, [this] {
             if (!active) return;
             if (clock.elapsed() >= this->request.timeoutMs)
-                fail(QStringLiteral("AI 生成超时，未应用任何结果。"));
+                fail(QStringLiteral("AI 请求超时（%1），已完成的进度可手动继续。").arg(phase), "timeout", 0, true);
             else if (phaseDeadline && clock.elapsed() >= phaseDeadline)
-                fail(QStringLiteral("Codex 服务启动或协议请求超时，未应用任何结果。"));
+                fail(QStringLiteral("Codex 阶段超时（%1），可查看本次日志后继续。").arg(phase), "timeout", 0, true);
+            else if (clock.elapsed()/1000 != lastReportedSecond) {
+                lastReportedSecond=clock.elapsed()/1000;
+                if (this->progress) this->progress(phase, clock.elapsed());
+            }
         });
     }
 
@@ -219,7 +259,7 @@ struct CodexTextSession::Impl {
         process.setWorkingDirectory(directory.path());
         process.setProcessEnvironment(childEnvironment(preferences.networkProxy));
         clock.start();
-        phaseDeadline = 15000;
+        setPhase("version", 60000);
         watchdog.start();
         process.start(program, prefix + QStringList{"--version"}, QIODevice::ReadWrite);
     }
@@ -254,10 +294,22 @@ struct CodexTextSession::Impl {
                {"params", QJsonObject{{"threadId", threadId}, {"turnId", turnId}}}});
     }
 
-    void fail(const QString &message) {
+    void setPhase(const QString &value, int budget = 60000) {
+        phase=value;
+        phaseDeadline=budget ? clock.elapsed()+budget : 0;
+        DiagnosticLog::instance().record("codex.phase", {{"jobId", request.jobId}, {"requestId", request.requestId},
+            {"stage", phase}, {"elapsedMs", double(clock.elapsed())}, {"timeoutMs", budget}});
+        if (progress) progress(phase, clock.elapsed());
+    }
+    void fail(const QString &message, const QString &category = "protocol", int rpcCode = 0, bool retryable = false) {
         if (!active) return;
+        AiFailure error;
+        error.requestId=request.requestId; error.jobId=request.jobId; error.stage=phase;
+        error.category=category; error.rpcCode=rpcCode; error.message=message;
+        error.elapsedMs=clock.elapsed(); error.retryable=retryable;
+        logAiFailure(error);
         stop(true);
-        failure(message); // Only client-authored errors; never forward raw CLI output.
+        failure(error); // Only classified client-authored errors; never raw CLI output.
     }
 
     bool write(const QJsonObject &message) {
@@ -270,7 +322,7 @@ struct CodexTextSession::Impl {
     void send(const QString &method, const QJsonObject &parameters) {
         const int id = nextId++;
         pending.insert(id, method);
-        phaseDeadline = clock.elapsed() + 30000;
+        setPhase(method, method=="turn/start" ? 0 : 60000);
         write({{"id", id}, {"method", method}, {"params", parameters}});
     }
 
@@ -337,8 +389,10 @@ struct CodexTextSession::Impl {
         const QString requestMethod = pending.take(id);
         if (requestMethod.isEmpty()) return;
         if (message.contains("error") || !message.value("result").isObject()) {
-            fail(QStringLiteral("Codex 请求失败（%1），请检查账号、模型和 CLI 配置。")
-                 .arg(requestMethod));
+            const QJsonObject error=message.value("error").toObject();
+            const QString category=errorCategory(error);
+            fail(QStringLiteral("Codex 请求失败（%1，%2），请查看本次日志。")
+                 .arg(requestMethod, categoryLabel(category)), category, error.value("code").toInt(), true);
             return;
         }
         result(requestMethod, message.value("result").toObject());
@@ -350,7 +404,7 @@ struct CodexTextSession::Impl {
             if (active) send("account/read", {{"refreshToken", false}});
         } else if (method == "account/read") {
             if (result.value("account").toObject().value("type").toString() != "chatgpt") {
-                fail(QStringLiteral("请先在设置中完成 ChatGPT 账号授权。"));
+                fail(QStringLiteral("请先在设置中完成 ChatGPT 账号授权。"), "authentication", 0, true);
                 return;
             }
             send("config/read", {{"cwd", directory.path()}, {"includeLayers", false}});
@@ -425,10 +479,6 @@ struct CodexTextSession::Impl {
         if (method != "item/started" && method != "item/completed"
                 && method != "turn/started" && method != "turn/completed" && method != "error") return;
         if (parameters.value("threadId").toString() != threadId || !turnRequested) return;
-        if (method == "error") {
-            fail(QStringLiteral("Codex 模型生成失败，未取得完整结果。"));
-            return;
-        }
         const QString notificationTurn = method.startsWith("turn/")
                 ? parameters.value("turn").toObject().value("id").toString()
                 : parameters.value("turnId").toString();
@@ -438,6 +488,17 @@ struct CodexTextSession::Impl {
         }
         if (!turnId.isEmpty() && notificationTurn != turnId) return;
         if (turnId.isEmpty()) turnId = notificationTurn;
+        if (method == "error") {
+            const QString category=errorCategory(parameters.value("error").toObject());
+            if (parameters.value("willRetry").isBool() && parameters.value("willRetry").toBool()) {
+                setPhase("reconnecting", 0);
+                DiagnosticLog::instance().record("codex.recovering", {{"jobId", request.jobId},
+                    {"requestId", request.requestId}, {"category", category}, {"elapsedMs", double(clock.elapsed())}});
+                return;
+            }
+            fail(QStringLiteral("Codex 模型生成失败（%1），可查看本次日志。").arg(categoryLabel(category)), category, 0, true);
+            return;
+        }
         if (method.startsWith("item/")) {
             const QJsonObject item = parameters.value("item").toObject();
             const QString type = item.value("type").toString();
@@ -462,6 +523,11 @@ struct CodexTextSession::Impl {
             finalMessages.insert(id, text.toString());
         } else if (method == "turn/completed") {
             const QJsonObject turn = parameters.value("turn").toObject();
+            if (turn.value("status").toString()=="failed") {
+                const QString category=errorCategory(turn.value("error").toObject());
+                fail(QStringLiteral("Codex 生成失败（%1），可查看本次日志。").arg(categoryLabel(category)), category, 0, true);
+                return;
+            }
             if (turn.value("status").toString() != "completed" || finalMessages.size() != 1) {
                 fail(QStringLiteral("Codex 生成未完整结束，未应用任何结果。"));
                 return;
@@ -476,8 +542,8 @@ struct CodexTextSession::Impl {
 };
 
 CodexTextSession::CodexTextSession(const AppPreferences &preferences, const AiTextRequest &request,
-                                 Success success, Failure failure, QObject *parent)
-    : QObject(parent), d(new Impl(this, preferences, request, std::move(success), std::move(failure))) {}
+                                 Success success, Failure failure, QObject *parent, Progress progress)
+    : QObject(parent), d(new Impl(this, preferences, request, std::move(success), std::move(failure), std::move(progress))) {}
 
 CodexTextSession::~CodexTextSession() {
     d->process.disconnect(this);

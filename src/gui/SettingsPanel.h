@@ -10,6 +10,7 @@ class QListWidget;
 class QPushButton;
 class QSpinBox;
 class QStackedWidget;
+class QCheckBox;
 
 namespace lmsc {
 class ApiModelClient;
@@ -64,6 +65,8 @@ private:
     QWidget *m_manualProxy;
     QLineEdit *m_proxyHost;
     QSpinBox *m_proxyPort;
+    QSpinBox *m_requestTimeout;
+    QCheckBox *m_logEnabled;
     QComboBox *m_connection;
     QComboBox *m_provider;
     QComboBox *m_models;

@@ -1,4 +1,5 @@
 #include "ApiModelClient.h"
+#include "AiDiagnostics.h"
 #ifdef Q_OS_WIN
 #include "WinHttpModelTransport.h"
 #endif
@@ -16,6 +17,7 @@
 #include <QSslSocket>
 #include <QTimer>
 #include <QUrl>
+#include <QUuid>
 
 namespace lmsc {
 namespace {
@@ -51,8 +53,21 @@ QString httpFailure(int status) {
 
 ApiModelClient::ApiModelClient(QObject *parent)
     : QObject(parent), m_timeout(new QTimer(this)) {
+    connect(this,&ApiModelClient::requestFailed,this,[this](const QString &) {
+        m_diagnostic["elapsedMs"]=m_clock.isValid() ? double(m_clock.elapsed()) : 0;
+        DiagnosticLog::instance().record("models.failed",m_diagnostic);
+    });
+    connect(this,&ApiModelClient::modelsReady,this,[this](const QStringList &) {
+        m_diagnostic["elapsedMs"]=double(m_clock.elapsed());
+        m_diagnostic.remove("category");
+        DiagnosticLog::instance().record("models.completed",m_diagnostic);
+    });
 #ifdef Q_OS_WIN
     m_native = new WinHttpModelTransport(this);
+    connect(m_native,&WinHttpModelTransport::networkDetails,this,[this](const QString &stage,int code) {
+        if (!m_busy) return;
+        m_diagnostic["stage"]=stage; m_diagnostic["nativeCode"]=code;
+    });
     connect(m_native, &WinHttpModelTransport::replyReady, this,
             [this](int status, const QByteArray &contents, const QString &error) {
         if (!m_busy) return;
@@ -66,6 +81,7 @@ ApiModelClient::ApiModelClient(QObject *parent)
     m_timeout->setSingleShot(true);
     connect(m_timeout, &QTimer::timeout, this, [this] {
         if (!m_busy) return;
+        m_diagnostic["category"]="timeout";
         cancel();
         emit requestFailed(QStringLiteral("获取模型超时，请检查网络或服务地址后重试。"));
     });
@@ -98,6 +114,11 @@ void ApiModelClient::cancel() {
 void ApiModelClient::fetchModels(const QString &baseUrl, const QString &apiKey,
                                 const QString &providerId, int timeoutMs) {
     cancel();
+    m_clock.start();
+    DiagnosticLog::instance().addSecret(apiKey.trimmed());
+    m_diagnostic={{"requestId",QStringLiteral("models-")+QUuid::createUuid().toString(QUuid::WithoutBraces)},
+        {"provider",providerId},{"proxyMode",m_proxy.mode},{"stage","prepare"},{"category","parameters"},{"timeoutMs",timeoutMs}};
+    DiagnosticLog::instance().record("models.started",m_diagnostic);
     const QString proxyError = AppSettings::validateProxy(m_proxy);
     if (!proxyError.isEmpty()) {
         emit requestFailed(proxyError);
@@ -130,6 +151,8 @@ void ApiModelClient::fetchModels(const QString &baseUrl, const QString &apiKey,
     while (path.endsWith(QLatin1Char('/'))) path.chop(1);
     if (!path.endsWith(QStringLiteral("/models"))) path += QStringLiteral("/models");
     url.setPath(path);
+    m_diagnostic["host"]=url.host(); m_diagnostic["stage"]="http.wait";
+    m_diagnostic["category"]="protocol";
     m_busy = true;
     m_timeout->start(qMax(1, timeoutMs));
 #ifdef Q_OS_WIN
@@ -138,7 +161,7 @@ void ApiModelClient::fetchModels(const QString &baseUrl, const QString &apiKey,
     // Local gateways stay on this computer in either proxy mode.
     const bool loopback = url.host().compare(QStringLiteral("localhost"), Qt::CaseInsensitive) == 0
             || QHostAddress(url.host()).isLoopback();
-    if (loopback) {
+    if (loopback || m_proxy.mode == "direct") {
         m_network->setProxy(QNetworkProxy(QNetworkProxy::NoProxy));
     } else if (m_proxy.mode == QStringLiteral("manual")) {
         m_network->setProxy(QNetworkProxy(QNetworkProxy::HttpProxy, m_proxy.host.trimmed(),
@@ -190,6 +213,10 @@ void ApiModelClient::fetchModels(const QString &baseUrl, const QString &apiKey,
 }
 
 void ApiModelClient::completeReply(int status, const QByteArray &contents, const QString &error) {
+    m_diagnostic["httpStatus"]=status;
+    m_diagnostic["category"]=status>=400 ? aiHttpCategory(status) : !error.isEmpty()
+        ? error.contains(QStringLiteral("TLS")) ? QString("tls") : error.contains(QStringLiteral("超时")) ? QString("timeout") : QString("network")
+        : QString("protocol");
     if (status >= 300 && status < 400) {
         emit requestFailed(QStringLiteral("API 地址发生重定向，已停止请求以保护密钥；请填写最终服务地址。"));
         return;

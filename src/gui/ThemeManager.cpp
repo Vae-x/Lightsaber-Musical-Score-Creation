@@ -97,7 +97,7 @@ QString stylesheet(bool dark) {
 
         /* Hallmark · genre modern-minimal · macrostructure navigation workbench
            critique P4 H4 E4 S4 R5 V4: quiet surfaces and clear form hierarchy. */
-        QDialog#settingsDialog, QWidget#workspaceContent { background: @settingsWindow; }
+        QDialog#settingsDialog, QDialog#diagnosticLogDialog, QWidget#workspaceContent { background: @settingsWindow; }
         QWidget#mainSidebar {
             background: @settingsSidebar; border-right: 1px solid @settingsBorder;
         }

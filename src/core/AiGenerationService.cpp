@@ -5,6 +5,7 @@
 
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QFileInfo>
 #include <QMap>
 #include <QPointer>
 #include <QSet>
@@ -15,7 +16,6 @@
 
 namespace lmsc {
 namespace {
-constexpr int requestTimeoutMs = 180000;
 constexpr int taskTimeoutMs = 45 * 60 * 1000;
 constexpr int maximumRepairs = 10;
 QStringList knownDifficulties() { return {"Easy", "Normal", "Hard", "Expert", "ExpertPlus"}; }
@@ -128,7 +128,7 @@ struct LlmAiGenerationService::Impl {
     QPointer<AiTextTransport> transport;
     QMap<QThread *, std::shared_ptr<WorkerResult>> workers;
     QThread *currentWorker=nullptr;
-    QTimer taskTimer, requestTimer, analysisTimer;
+    QTimer taskTimer, analysisTimer;
     GenerationRequest request;
     MusicAnalysis analysis;
     QJsonObject plan;
@@ -139,19 +139,21 @@ struct LlmAiGenerationService::Impl {
     quint64 generation=0, nextRequest=0;
     int index=0, planRepairs=0, segmentRepairs=0, repairs=0, lastPercent=-1;
     bool active=false, planning=true;
+    bool analysisReady=false, lastRetryable=true;
+    QString connectionKey;
+    QStringList pendingErrors;
+    AiGenerationService::Status status;
     explicit Impl(LlmAiGenerationService *parent, AiTextTransport *textTransport)
         : owner(parent), transport(textTransport) {
-        taskTimer.setSingleShot(true); requestTimer.setSingleShot(true);
-        taskTimer.setParent(owner); requestTimer.setParent(owner); analysisTimer.setParent(owner);
+        taskTimer.setSingleShot(true);
+        taskTimer.setParent(owner); analysisTimer.setParent(owner);
         taskTimer.setObjectName(QStringLiteral("aiGenerationTaskTimer"));
-        requestTimer.setObjectName(QStringLiteral("aiGenerationRequestTimer"));
         analysisTimer.setInterval(80);
-        QObject::connect(&taskTimer, &QTimer::timeout, owner, [this] { fail(QStringLiteral("整曲生成已达到 45 分钟时限，请重新生成。")); });
-        QObject::connect(&requestTimer, &QTimer::timeout, owner, [this] { fail(QStringLiteral("AI 请求超时，未自动重发或补谱。")); });
+        QObject::connect(&taskTimer, &QTimer::timeout, owner, [this] { fail(QStringLiteral("连续生成已达到 45 分钟，进度已保留，可手动继续。"), true); });
         QObject::connect(&analysisTimer, &QTimer::timeout, owner, [this] {
             if (!active || !currentWorker || !workers.contains(currentWorker)) return;
             const int percent = workers.value(currentWorker)->percent.load()*15/100;
-            if (percent != lastPercent) { lastPercent=percent; emit owner->progress(request.jobId, percent, QStringLiteral("正在提取整曲音乐证据")); }
+            if (percent != lastPercent) { lastPercent=percent; publish(percent, QStringLiteral("正在提取整曲音乐证据")); }
         });
     }
     ~Impl() {
@@ -166,17 +168,37 @@ struct LlmAiGenerationService::Impl {
         const bool wasActive=active;
         const QString job=request.jobId, pending=pendingId;
         active=false; ++generation; pendingId.clear();
-        taskTimer.stop(); requestTimer.stop(); analysisTimer.stop();
+        taskTimer.stop(); analysisTimer.stop();
         if (currentWorker) currentWorker->requestInterruption();
         currentWorker=nullptr;
         if (transport && !pending.isEmpty()) transport->cancel(pending);
         request={}; analysis={}; plan={}; sections.clear(); objects.clear(); motifs.clear();
+        analysisReady=false; status={}; pendingErrors.clear();
         if (announce && wasActive) emit owner->cancelled(job);
     }
-    void fail(const QString &message) {
+    void publish(int percent, const QString &stage) {
+        status.jobId=request.jobId; status.percent=percent; status.stage=stage;
+        status.completedSegments=index; status.totalSegments=analysis.segments.size();
+        emit owner->progress(request.jobId, percent, stage);
+        DiagnosticLog::instance().record("generation.progress", {{"jobId", request.jobId}, {"percent", percent},
+            {"segment", index}, {"segments", analysis.segments.size()}, {"objects", objects.size()}, {"repairs", repairs}});
+    }
+    void pause(const QString &message, bool resumable) {
+        const QString pending=pendingId;
+        active=false; ++generation; pendingId.clear(); taskTimer.stop(); analysisTimer.stop();
+        if (currentWorker) currentWorker->requestInterruption();
+        currentWorker=nullptr;
+        if (transport && !pending.isEmpty()) transport->cancel(pending);
+        status.state=resumable ? AiGenerationService::Status::Paused : AiGenerationService::Status::Failed;
+        status.resumable=resumable; status.message=message;
+        publish(status.percent, message);
+        DiagnosticLog::instance().record("generation.paused", {{"jobId", request.jobId},
+            {"segment", index}, {"segments", analysis.segments.size()}, {"retryable", resumable}});
+    }
+    void fail(const QString &message, bool resumable = false) {
         if (!active) return;
         const QString job=request.jobId;
-        stop(false);
+        pause(message, resumable);
         emit owner->requestFailed(job, message);
     }
     bool validatePlan(const QJsonObject &json, QStringList *errors) {
@@ -217,12 +239,14 @@ struct LlmAiGenerationService::Impl {
         return errors->isEmpty();
     }
     void send(const QStringList &errors = {}) {
+        pendingErrors=errors;
         if (!active || !transport || !transport->isAvailable()) { fail(QStringLiteral("AI 连接已不可用，未生成替代谱面。")); return; }
         QJsonObject input{{"stage", planning ? "plan" : "segment"}, {"jobId", request.jobId},
                           {"constraints", profileJson(request)}};
         AiTextRequest message;
         message.requestId=QStringLiteral("%1-%2-%3").arg(request.jobId).arg(generation).arg(++nextRequest);
-        message.timeoutMs=requestTimeoutMs;
+        message.timeoutMs=transport ? transport->requestTimeoutMs() : 600000;
+        message.jobId=request.jobId;
         message.maxOutputTokens=8192;
         message.systemPrompt=QStringLiteral(
             "你是为双手光剑节奏游戏编排曲谱的音乐编排师。目标是贴合音乐、丝滑连贯、重复主题有少量变化。"
@@ -274,13 +298,32 @@ struct LlmAiGenerationService::Impl {
         if (!errors.isEmpty()) input.insert("validationErrors", QJsonArray::fromStringList(errors));
         message.userPrompt=QString::fromUtf8(QJsonDocument(input).toJson(QJsonDocument::Compact));
         pendingId=message.requestId;
-        requestTimer.start(requestTimeoutMs);
+        lastRetryable=true;
         const quint64 epoch=generation;
         QTimer::singleShot(0, owner, [this, message, epoch] {
             if (active && generation==epoch && pendingId==message.requestId && transport) transport->complete(message);
         });
     }
+    void logValidation(const QStringList &errors, const QString &stage) {
+        QSet<QString> reasons;
+        for (const auto &error : errors) {
+            QString reason="constraint";
+            if (error.contains(QStringLiteral("动作变化比例"))) reason="motifVariation";
+            else if (error.contains("JSON") || error.contains(QStringLiteral("字段"))) reason="schema";
+            else if (error.contains(QStringLiteral("密度"))) reason="density";
+            else if (error.contains(QStringLiteral("锚点"))) reason="anchor";
+            else if (error.contains(QStringLiteral("炸弹"))) reason="bombConflict";
+            else if (error.contains(QStringLiteral("墙"))) reason="wallConflict";
+            else if (error.contains(QStringLiteral("间隔")) || error.contains(QStringLiteral("回位"))
+                     || error.contains(QStringLiteral("双手"))) reason="handMotion";
+            reasons.insert(reason);
+        }
+        for (const auto &reason : reasons) DiagnosticLog::instance().record("generation.validationFailed",
+            {{"jobId",request.jobId},{"stage",stage},{"category","validation"},{"reason",reason},
+             {"segment",index+1},{"repairs",repairs}});
+    }
     void repairOrFail(const QStringList &errors) {
+        logValidation(errors,planning ? QString("plan") : QString("segment"));
         int &attempt=planning ? planRepairs : segmentRepairs;
         const int limit=planning ? 1 : 2;
         if (attempt>=limit || repairs>=maximumRepairs) {
@@ -289,7 +332,7 @@ struct LlmAiGenerationService::Impl {
             return;
         }
         ++attempt; ++repairs;
-        emit owner->progress(request.jobId, planning ? 18 : 20+index*75/qMax(1,analysis.segments.size()),
+        publish(planning ? 18 : 20+index*75/qMax(1,analysis.segments.size()),
                              QStringLiteral("AI 正在定向返修%1").arg(planning ? QStringLiteral("规划") : QStringLiteral("乐句 %1").arg(index+1)));
         send(errors);
     }
@@ -298,6 +341,7 @@ struct LlmAiGenerationService::Impl {
         if (!request.analysisOnly && objects.isEmpty()) { fail(QStringLiteral("模型未生成所选类别的任何物件，未创建空谱或规则替代谱。")); return; }
         QStringList errors;
         if (!request.analysisOnly && !BeatmapPlayabilityValidator::validateObjects(objects, request, analysis, &errors)) {
+            logValidation(errors,"final");
             fail(QStringLiteral("整曲最终校验失败，未应用草稿：\n%1").arg(errors.join('\n'))); return;
         }
         GenerationDraft draft;
@@ -307,13 +351,14 @@ struct LlmAiGenerationService::Impl {
         draft.metrics=BeatmapPlayabilityValidator::metrics(objects, request.timeMap, analysis.activeSeconds);
         const QString job=request.jobId;
         const bool analysisOnly=request.analysisOnly;
-        stop(false);
-        emit owner->progress(job, 100, analysisOnly ? QStringLiteral("音乐分析完成") : QStringLiteral("整曲草稿已通过校验，可预览"));
+        active=false; pendingId.clear(); taskTimer.stop(); analysisTimer.stop();
+        status.state=AiGenerationService::Status::Completed; status.resumable=false; status.message.clear();
+        publish(100, analysisOnly ? QStringLiteral("音乐分析完成") : QStringLiteral("整曲草稿已通过校验，可预览"));
         emit owner->draftReady(draft);
     }
     void received(const AiTextResult &result) {
         if (!active || result.requestId!=pendingId) return;
-        pendingId.clear(); requestTimer.stop();
+        pendingId.clear();
         QJsonObject json; QStringList errors;
         if (!parseJson(result.text, &json, &errors)) { repairOrFail(errors); return; }
         if (planning) {
@@ -346,7 +391,7 @@ struct LlmAiGenerationService::Impl {
             ++index; segmentRepairs=0;
         }
         if (index>=analysis.segments.size()) { finish(); return; }
-        emit owner->progress(request.jobId, 20+index*75/qMax(1,analysis.segments.size()),
+        publish(20+index*75/qMax(1,analysis.segments.size()),
                              QStringLiteral("AI 正在编排乐句 %1/%2").arg(index+1).arg(analysis.segments.size()));
         send();
     }
@@ -354,14 +399,32 @@ struct LlmAiGenerationService::Impl {
         analysisTimer.stop();
         if (!result->success) { fail(result->error.isEmpty() ? QStringLiteral("音乐分析未完成。") : result->error); return; }
         analysis=result->analysis;
+        analysisReady=true;
         if (!request.analysisOnly && (request.allowedTypes.testFlag(DirectionalType) || request.allowedTypes.testFlag(DotType))) {
             bool hasHit=false;
             for (const auto &anchor:analysis.anchors) if (anchor.kind==MusicAnchorKind::Hit) { hasHit=true; break; }
             if (!hasHit) { fail(QStringLiteral("未找到可绑定当前拍线的可靠起音，请校准 BPM 或偏移后再生成。")); return; }
         }
         planning=true;
-        emit owner->progress(request.jobId, 16, QStringLiteral("AI 正在规划整曲动作主题"));
+        publish(16, QStringLiteral("AI 正在规划整曲动作主题"));
         send();
+    }
+    void startAnalysis() {
+        const quint64 epoch=generation;
+        const auto result=std::make_shared<WorkerResult>();
+        const auto snapshot=request;
+        QThread *thread=QThread::create([snapshot,result] {
+            result->success=MusicFeatureAnalyzer::analyze(snapshot, &result->analysis, &result->error,
+                [] { return QThread::currentThread()->isInterruptionRequested(); },
+                [result](int percent) { result->percent.store(percent); });
+        });
+        workers.insert(thread,result); currentWorker=thread;
+        QObject::connect(thread, &QThread::finished, owner, [this,thread,result,epoch] {
+            workers.remove(thread); thread->deleteLater();
+            if (currentWorker==thread) currentWorker=nullptr;
+            if (active && generation==epoch) analyzed(result);
+        });
+        analysisTimer.start(); publish(0, QStringLiteral("正在读取原速音频并提取整曲起音")); thread->start();
     }
 };
 
@@ -371,21 +434,57 @@ LlmAiGenerationService::LlmAiGenerationService(AiTextTransport *transport, QObje
     if (transport) {
         connect(transport, &AiTextTransport::completed, this, [this](const AiTextResult &result) { d->received(result); });
         connect(transport, &AiTextTransport::failed, this, [this](const QString &id, const QString &message) {
-            if (d->active && id==d->pendingId) d->fail(message.isEmpty() ? QStringLiteral("AI 请求失败，未自动补谱。") : message);
+            if (d->active && id==d->pendingId) d->fail(message.isEmpty() ? QStringLiteral("AI 请求失败，进度已保留。") : message, d->lastRetryable);
+        });
+        connect(transport, &AiTextTransport::failureInfo, this, [this](const AiFailure &error) {
+            if (d->active && error.requestId==d->pendingId) d->lastRetryable=error.retryable;
+        });
+        connect(transport, &AiTextTransport::requestProgress, this, [this](const QString &id, const QString &stage, qint64 elapsed) {
+            if (!d->active || id!=d->pendingId) return;
+            const QString location=d->planning ? QStringLiteral("整曲规划") : QStringLiteral("乐句 %1/%2").arg(d->index+1).arg(d->analysis.segments.size());
+            static const QMap<QString, QString> stages{
+                {"version", QStringLiteral("检查连接程序")}, {"startup", QStringLiteral("启动连接")},
+                {"initialize", QStringLiteral("初始化连接")}, {"account/read", QStringLiteral("检查账号")},
+                {"config/read", QStringLiteral("确认连接配置")}, {"mcpServerStatus/list", QStringLiteral("确认连接配置")},
+                {"thread/start", QStringLiteral("创建生成会话")}, {"turn/start", QStringLiteral("等待模型生成")},
+                {"reconnecting", QStringLiteral("连接中断，服务正在恢复")},
+                {"prepare", QStringLiteral("准备请求")}, {"http.send", QStringLiteral("发送请求")},
+                {"http.wait", QStringLiteral("等待模型响应")}, {"http.read", QStringLiteral("接收模型结果")}};
+            const QString text=QStringLiteral("%1 · %2 · 本次请求已等 %3 秒")
+                .arg(location, stages.value(stage, QStringLiteral("等待模型响应"))).arg(elapsed/1000);
+            d->status.stage=text; emit progress(d->request.jobId, d->status.percent, text);
         });
         connect(transport, &AiTextTransport::availabilityChanged, this, [this] {
-            d->fail(QStringLiteral("AI 连接发生变化或不可用，已停止整曲生成。"));
+            d->fail(QStringLiteral("AI 连接发生变化或不可用，进度已保留。"), true);
             emit availabilityChanged();
         });
         connect(transport, &QObject::destroyed, this, [this] {
-            d->transport.clear(); d->fail(QStringLiteral("AI 连接已断开，已停止生成。")); emit availabilityChanged();
+            d->transport.clear(); d->fail(QStringLiteral("AI 连接已断开，进度已保留。"), true); emit availabilityChanged();
         });
     }
 }
 LlmAiGenerationService::~LlmAiGenerationService() = default;
 bool LlmAiGenerationService::isAvailable() const { return d->transport && d->transport->isAvailable(); }
+AiGenerationService::Status LlmAiGenerationService::status() const { return d->status; }
 
 void LlmAiGenerationService::generate(const GenerationRequest &request) {
+    const auto &prior=d->request;
+    bool sameTiming=prior.timeMap.initialBpm()==request.timeMap.initialBpm()
+        && prior.timeMap.offsetSeconds()==request.timeMap.offsetSeconds()
+        && prior.timeMap.changes().size()==request.timeMap.changes().size();
+    for (int i=0; sameTiming && i<prior.timeMap.changes().size(); ++i)
+        sameTiming=prior.timeMap.changes()[i].beat==request.timeMap.changes()[i].beat
+            && prior.timeMap.changes()[i].bpm==request.timeMap.changes()[i].bpm;
+    const bool reuse=d->status.state==Status::Completed && prior.analysisOnly && !request.analysisOnly
+        && d->analysisReady && !d->plan.isEmpty() && sameTiming && prior.documentId==request.documentId
+        && prior.documentRevision==request.documentRevision && prior.difficultyId==request.difficultyId
+        && prior.audioRevision==request.audioRevision && prior.audio.path==request.audio.path
+        && prior.audio.revision==request.audio.revision && prior.audio.sourcePath==request.audio.sourcePath
+        && prior.audio.durationSeconds==request.audio.durationSeconds && prior.profile.name==request.profile.name
+        && prior.allowedTypes==request.allowedTypes && d->transport && d->connectionKey==d->transport->connectionIdentity();
+    const auto cachedAnalysis=reuse ? d->analysis : MusicAnalysis{};
+    const auto cachedPlan=reuse ? d->plan : QJsonObject{};
+    const auto cachedSections=reuse ? d->sections : QVector<QJsonObject>{};
     d->stop(true);
     if (!isAvailable()) { emit requestFailed(request.jobId, QStringLiteral("请先配置可用的 AI 模型连接。")); return; }
     if (request.jobId.isEmpty() || !request.audio.isValid() || !knownDifficulties().contains(request.profile.name)
@@ -399,25 +498,34 @@ void LlmAiGenerationService::generate(const GenerationRequest &request) {
     d->request.profile=DifficultyProfile::forName(request.profile.name);
     d->analysis={}; d->plan={}; d->sections.clear(); d->objects.clear(); d->motifs.clear();
     d->index=d->planRepairs=d->segmentRepairs=d->repairs=0; d->planning=true; d->active=true; d->lastPercent=-1;
+    d->connectionKey=d->transport->connectionIdentity(); d->status.state=Status::Running;
     d->taskTimer.start(taskTimeoutMs);
-    const quint64 epoch=d->generation;
-    const auto result=std::make_shared<Impl::WorkerResult>();
-    const auto snapshot=d->request;
-    QThread *thread=QThread::create([snapshot,result] {
-        result->success=MusicFeatureAnalyzer::analyze(snapshot, &result->analysis, &result->error,
-            [] { return QThread::currentThread()->isInterruptionRequested(); },
-            [result](int percent) { result->percent.store(percent); });
-    });
-    d->workers.insert(thread,result); d->currentWorker=thread;
-    connect(thread, &QThread::finished, this, [this,thread,result,epoch] {
-        d->workers.remove(thread); thread->deleteLater();
-        if (d->currentWorker==thread) d->currentWorker=nullptr;
-        if (d->active && d->generation==epoch) d->analyzed(result);
-    });
-    d->analysisTimer.start();
-    emit progress(request.jobId, 0, QStringLiteral("正在读取原速音频并提取整曲起音"));
-    thread->start();
+    if (reuse) {
+        d->analysis=cachedAnalysis; d->plan=cachedPlan; d->sections=cachedSections;
+        d->analysisReady=true; d->planning=false;
+        d->publish(20, QStringLiteral("沿用已完成分析，开始编排乐句")); d->send();
+    } else d->startAnalysis();
 }
-void LlmAiGenerationService::cancel(const QString &jobId) { if (d->active && d->request.jobId==jobId) d->stop(true); }
+void LlmAiGenerationService::cancel(const QString &jobId) {
+    if (d->active && d->request.jobId==jobId) {
+        d->pause(QStringLiteral("任务已停止，已完成进度保留，可继续。"), true); emit cancelled(jobId);
+    }
+}
+void LlmAiGenerationService::discard(const QString &jobId) {
+    if (d->request.jobId==jobId) { d->stop(false); DiagnosticLog::instance().record("generation.discarded", {{"jobId", jobId}}); }
+}
+void LlmAiGenerationService::resume(const QString &jobId) {
+    if (d->request.jobId!=jobId || d->status.state!=Status::Paused || !d->status.resumable) return;
+    if (!isAvailable() || !d->request.audio.isValid() || !QFileInfo(d->request.audio.path).isFile()
+        || d->connectionKey!=d->transport->connectionIdentity()) {
+        emit requestFailed(jobId, QStringLiteral("当前连接或音源不满足继续条件，请检查设置或重新生成。")); return;
+    }
+    ++d->generation; d->active=true; d->status.state=Status::Running; d->status.resumable=false;
+    d->status.message.clear(); d->taskTimer.start(taskTimeoutMs);
+    DiagnosticLog::instance().record("generation.resumed", {{"jobId", jobId}, {"segment", d->index}});
+    if (d->analysisReady) {
+        d->publish(d->status.percent, QStringLiteral("正在继续未完成的请求")); d->send(d->pendingErrors);
+    } else d->startAnalysis();
+}
 
 } // namespace lmsc
