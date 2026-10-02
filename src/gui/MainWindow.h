@@ -28,6 +28,14 @@ class QTimer;
 class QTemporaryDir;
 class QSlider;
 class QAction;
+class QStackedWidget;
+class QToolBar;
+namespace lmsc {
+class NavigationSidebar;
+class SettingsPanel;
+class AiRecognitionPage;
+class AiRecognitionService;
+}
 struct DocumentLoadResult {
     std::shared_ptr<lmsc::BeatmapDocument> document;
     QString error;
@@ -36,12 +44,15 @@ struct DocumentLoadResult {
 class MainWindow : public QMainWindow {
     Q_OBJECT
 public:
-    explicit MainWindow(QWidget *parent = nullptr);
+    explicit MainWindow(QWidget *parent = nullptr, const QString &settingsFile = {});
     ~MainWindow() override;
     void openPath(const QString &path);
     void setTestMode(bool enabled) { m_testMode = enabled; }
     bool isAudioReady() const;
     bool runEditorCheck(const QString &outputFolder, QString *error);
+    // The caller owns the recognition backend and keeps it in the GUI thread.
+    // A backend may dispatch its analysis to workers; none is connected by default.
+    void setAiRecognitionService(lmsc::AiRecognitionService *service);
 signals:
     void documentReady();
     void loadFailed(const QString &error);
@@ -49,6 +60,10 @@ protected:
     void closeEvent(QCloseEvent *event) override;
 private:
     void buildEditor();
+    void buildWorkspace();
+    void selectWorkspacePage(int row);
+    void refreshRecognitionContext();
+    void updateWorkspaceActions();
     void buildActions();
     void connectAudio();
     void refreshDocument();
@@ -84,6 +99,13 @@ private:
     void restoreDocumentAudio();
 
     Ui::MainWindow *ui;
+    QString m_settingsFile;
+    QWidget *m_editorPage = nullptr;
+    QStackedWidget *m_workspacePages = nullptr;
+    lmsc::NavigationSidebar *m_sidebar = nullptr;
+    lmsc::SettingsPanel *m_settingsPanel = nullptr;
+    lmsc::AiRecognitionPage *m_aiPage = nullptr;
+    QToolBar *m_editorToolbar = nullptr;
     std::shared_ptr<lmsc::BeatmapDocument> m_document;
     QVector<lmsc::BeatObject> m_clipboard;
     QSet<QString> m_selection;

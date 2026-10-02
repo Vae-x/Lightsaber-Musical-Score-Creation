@@ -17,13 +17,13 @@ namespace {
 QColor themedColor(const QColor &dark, const QColor &light) {
     return lmsc::ThemeManager::isDark() ? dark : light;
 }
-QColor background() { return themedColor(QColor(18, 24, 35), QColor(248, 250, 253)); }
-QColor panel() { return themedColor(QColor(25, 33, 47), QColor(233, 239, 247)); }
-QColor muted() { return themedColor(QColor(150, 165, 187), QColor(83, 103, 129)); }
-QColor gridLine() { return themedColor(QColor(55, 68, 87), QColor(195, 208, 222)); }
+QColor background() { return themedColor(QColor(20, 21, 24), QColor(250, 251, 252)); }
+QColor panel() { return themedColor(QColor(35, 37, 41), QColor(238, 240, 243)); }
+QColor muted() { return themedColor(QColor(166, 171, 180), QColor(101, 110, 123)); }
+QColor gridLine() { return themedColor(QColor(54, 57, 63), QColor(220, 224, 230)); }
 QColor accent() { return themedColor(QColor(66, 211, 189), QColor(19, 132, 116)); }
 QColor selectionColor() { return themedColor(QColor(255, 217, 94), QColor(151, 103, 0)); }
-QColor foreground() { return themedColor(QColor(224, 234, 245), QColor(36, 50, 71)); }
+QColor foreground() { return themedColor(QColor(231, 232, 235), QColor(35, 39, 47)); }
 QColor translucentAccent(int alpha) {
     QColor color = accent();
     color.setAlpha(alpha);
@@ -762,8 +762,8 @@ void TrackView::paintGL() {
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
     QLinearGradient gradient(0, 0, 0, height());
-    gradient.setColorAt(0, themedColor(QColor(12, 18, 32), QColor(245, 249, 255)));
-    gradient.setColorAt(1, themedColor(QColor(29, 40, 58), QColor(220, 231, 245)));
+    gradient.setColorAt(0, themedColor(QColor(20, 21, 24), QColor(250, 251, 252)));
+    gradient.setColorAt(1, themedColor(QColor(39, 42, 48), QColor(233, 237, 242)));
     painter.fillRect(rect(), gradient);
     painter.setPen(QPen(themedColor(QColor(63, 91, 122), QColor(160, 184, 209)), 1));
     for (int x = -2; x <= 2; ++x)

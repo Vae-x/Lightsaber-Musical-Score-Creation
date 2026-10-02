@@ -1,18 +1,29 @@
 # AI 设置与自动制谱方案
 
-本轮只实现主题、连接配置、模型读取和 Codex 账号授权，不实现音乐分析或曲谱生成。自动编排的目标是音乐贴合、挥刀顺畅、段落有变化，生成结果可继续在编辑器中修改。
+当前实现主窗口导航、主题、连接配置、模型读取和 Codex 账号授权，并预留 AI 识别页面与服务接口。真实 AI 音频分析与曲谱生成尚未实现。后续自动编排的目标是音乐贴合、挥刀顺畅、段落有变化，生成结果可继续在编辑器中修改。
 
 ## 已实现的设置
 
-- 独立设置窗口，浅色、深色与跟随 Windows 系统主题，切换同时更新放置网格、波形时间轴和轨道预览。
+- 设置集成在主窗口，左侧导航依次为曲谱编辑、AI 识别、外观、大语言模型、账号授权、网络、关于；默认收起为 64 像素图标栏，可展开为 208 像素文字导航。主题支持浅色、深色与跟随 Windows 系统，切换同时更新放置网格、波形时间轴和轨道预览。
+- 菜单“设置 → 外观设置”与 `Ctrl+,` 切换到外观页；切换页面保留设置草稿及曲谱、选中物件、播放位置。“应用”保存并留在当前设置页，“保存并返回”保存后回到曲谱编辑，“取消并返回”恢复最近成功保存的全部设置与主题后返回编辑。
 - DeepSeek、Kimi、MiMo、OpenAI、通义千问及自定义 OpenAI 兼容提供商预设。各提供商配置独立保存；模型通过 `GET <API 地址>/models` 获取，保留手动输入与重新读取入口。API 请求使用 Bearer 鉴权，MiMo 同时使用其官方要求的 `api-key` 头。
 - API Key 使用 Windows 当前账户 DPAPI 加密后原子保存到应用配置目录。歌曲文档、工程和游戏导出不携带密钥。
 - Codex 账号方式通过本机官方 CLI 的 App Server 标准输入输出通信，完成初始化、账号读取、浏览器授权与 `model/list` 分页读取。账号令牌由 Codex 持有与续期；本程序不读取令牌文件。设置阶段不创建 Codex thread/turn。
 - Windows 模型请求使用系统 WinHTTP 的 TLS、证书校验与代理支持，避免依赖 Qt 5.12 安装包缺失的 OpenSSL 运行库。请求可取消、有超时与大小限制，重定向不会携带密钥自动跳转。
 - 网络代理默认自动，API 使用系统代理，Codex 自动沿用 CLI 的运行环境。手动 HTTP 代理地址、端口独立保存在应用设置中，并用于 API 以及本程序启动的 Codex 子进程，本机服务保持直连；不修改 Windows 系统代理。旧设置没有代理字段时继续使用自动模式，非法手动配置不会保存或发起请求。
-- 设置窗口的“关于”和帮助菜单共享应用名称、版本、作者与项目主页信息，主页按钮调用默认浏览器。
+- 帮助菜单的“关于光剑曲谱制作”切换到主窗口关于页，显示应用名称、版本、作者与项目主页，主页按钮调用默认浏览器；GPLv3 官方原文在关于页内展开、滚动阅读和收起。
 
 来源：[DeepSeek 接入](https://api-docs.deepseek.com/zh-cn/)、[Kimi 接口](https://platform.kimi.com/docs/api/overview)、[MiMo 平台](https://platform.xiaomimimo.com/)、[通义千问兼容接口](https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope)、[OpenAI 模型列表](https://developers.openai.com/api/reference/resources/models/methods/list)、[Codex App Server](https://developers.openai.com/codex/app-server)、[Codex 开源实现](https://github.com/openai/codex/tree/main/codex-rs/app-server)。提供商模型名称动态读取，列表存在不代表该模型一定适合对话或制谱。
+
+## 已预留的 AI 识别接口
+
+主窗口的“AI 识别”页显示当前歌曲及时间参数，并提供“配置 AI 连接”入口。默认服务为 `UnavailableAiRecognitionService`，明确显示尚未接入，“开始识别”保持禁用；模型设置完成也不会启用识别。当前没有真实识别结果，不会读取或上传音频、调用模型推理、生成或写入音符。
+
+识别服务契约位于 `src/core/AiRecognitionService.h`，界面位于 `src/gui/AiRecognitionPage.h`，后续可通过 `MainWindow::setAiRecognitionService()` 注入实现。调用方保留服务所有权，服务对象留在界面线程，耗时分析可交给内部工作线程。核心接口不依赖界面控件，也不持有编辑文档，职责是返回供用户参考的分析建议。
+
+- `AiRecognitionRequest` 携带请求标识、歌曲修订号、本地音频路径、BPM、偏移和时长。传入本地路径仅表示待分析的资源，不能作为自动上传授权。
+- `analyze(request)` 启动识别，`cancel(contextId)` 取消对应请求；结果、失败、进度与取消信号均带请求标识。界面忽略取消后、切歌后和更换服务后的过期回调。
+- `AiRecognitionResult` 返回摘要及带秒数、标签、置信度的事件建议。页面只展示结果，用户确认后仍在曲谱编辑中手动修改；自动制谱另按后续流程实现。
 
 ## 后续自动编排流程（尚未实现）
 

@@ -1,7 +1,9 @@
 #include "MainWindow.h"
 #include "ui_MainWindow.h"
 #include "EditorViews.h"
-#include "SettingsDialog.h"
+#include "SettingsPanel.h"
+#include "NavigationSidebar.h"
+#include "AiRecognitionPage.h"
 #include "ThemeManager.h"
 #include "core/AppInfo.h"
 #include "core/AppSettings.h"
@@ -17,7 +19,6 @@
 #include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
-#include <QDesktopServices>
 #include <QDir>
 #include <QDoubleSpinBox>
 #include <QEventLoop>
@@ -45,9 +46,9 @@
 #include <QSpinBox>
 #include <QSplitter>
 #include <QStatusBar>
+#include <QStackedWidget>
 #include <QTemporaryDir>
 #include <QTabWidget>
-#include <QTextBrowser>
 #include <QTimer>
 #include <QToolBar>
 #include <QUrl>
@@ -67,16 +68,29 @@ QString safeName(QString name) {
     return name.trimmed().isEmpty() ? QStringLiteral("MySong") : name.left(100);
 }
 struct StorageResult { bool ok = false; QString error; };
+
+// Dense editor panes must not set the minimum size of a hidden settings page.
+class WorkspacePages final : public QStackedWidget {
+public:
+    explicit WorkspacePages(QWidget *parent) : QStackedWidget(parent) {
+        layout()->setSizeConstraint(QLayout::SetNoConstraint);
+        connect(this, &QStackedWidget::currentChanged, this, [this] { updateGeometry(); });
+    }
+    QSize minimumSizeHint() const override {
+        const auto page = currentWidget();
+        return page ? page->minimumSizeHint().expandedTo(page->minimumSize()) : QSize();
+    }
+};
 }
 
-MainWindow::MainWindow(QWidget *parent)
-    : QMainWindow(parent), ui(new Ui::MainWindow),
+MainWindow::MainWindow(QWidget *parent, const QString &settingsFile)
+    : QMainWindow(parent), ui(new Ui::MainWindow), m_settingsFile(settingsFile),
       m_document(std::make_shared<lmsc::BeatmapDocument>()),
       m_audio(new AudioService(this)), m_analyzer(new RhythmAnalyzer(this)),
       m_mtp(new MtpImportService(this)),
       m_loader(new QFutureWatcher<DocumentLoadResult>(this)) {
     ui->setupUi(this);
-    lmsc::ThemeManager::apply(lmsc::AppSettings().load().themeMode);
+    lmsc::ThemeManager::apply(lmsc::AppSettings(m_settingsFile).load().themeMode);
     lmsc::ThemeManager::watchSystemChanges(qApp);
     setWindowIcon(QIcon(QStringLiteral(":/icons/app.png")));
     lmsc::WorkspacePaths::projectsDirectory();
@@ -85,6 +99,7 @@ MainWindow::MainWindow(QWidget *parent)
     setMinimumSize(std::min(1050, available.width() - 40), std::min(660, available.height() - 60));
     buildEditor();
     buildActions();
+    buildWorkspace();
     connectAudio();
     connect(m_mtp, &MtpImportService::songImported, this, [this](const QString &folder) {
         if (!m_mtpImportPending) return;
@@ -149,6 +164,8 @@ MainWindow::MainWindow(QWidget *parent)
 }
 
 MainWindow::~MainWindow() {
+    m_aiPage->cancelRecognition();
+    m_settingsPanel->discardChanges();
     m_mtp->cancel();
     m_audio->cancel();
     m_analyzer->cancel();
@@ -157,9 +174,11 @@ MainWindow::~MainWindow() {
 }
 
 void MainWindow::buildEditor() {
-    auto outer = new QVBoxLayout(ui->centralwidget);
+    m_editorPage = new QWidget(ui->centralwidget);
+    m_editorPage->setObjectName(QStringLiteral("editorPage"));
+    auto outer = new QVBoxLayout(m_editorPage);
     outer->setContentsMargins(10, 8, 10, 6);
-    auto split = new QSplitter(Qt::Horizontal, ui->centralwidget);
+    auto split = new QSplitter(Qt::Horizontal, m_editorPage);
     outer->addWidget(split, 1);
     auto leftScroll = new QScrollArea(split);
     leftScroll->setWidgetResizable(true);
@@ -211,6 +230,7 @@ void MainWindow::buildEditor() {
     });
     leftLayout->addWidget(new QLabel(tr("文件中可用的难度"), left));
     m_difficulties = new QListWidget(left);
+    m_difficulties->setObjectName(QStringLiteral("difficultyList"));
     m_difficulties->setMinimumHeight(100);
     leftLayout->addWidget(m_difficulties, 1);
     connect(m_difficulties, &QListWidget::currentItemChanged, this,
@@ -321,21 +341,21 @@ void MainWindow::buildEditor() {
     rl->addStretch(); rl->addWidget(hint);
     split->setStretchFactor(1, 1);
     auto transport = new QHBoxLayout;
-    m_playButton = new QPushButton(tr("▶ 播放"), ui->centralwidget);
-    auto stop = new QPushButton(tr("停止"), ui->centralwidget);
+    m_playButton = new QPushButton(tr("▶ 播放"), m_editorPage);
+    auto stop = new QPushButton(tr("停止"), m_editorPage);
     transport->addWidget(m_playButton); transport->addWidget(stop);
     connect(m_playButton, &QPushButton::clicked, this, [this] {
         if (m_audio->isPlaying()) m_audio->pause(); else if (!m_busy && isAudioReady()) m_audio->play();
     });
     connect(stop, &QPushButton::clicked, m_audio, &AudioService::stop);
-    m_speed = new QComboBox(ui->centralwidget);
+    m_speed = new QComboBox(m_editorPage);
     for (double value : {0.5, 0.75, 1.0, 1.25, 1.5}) m_speed->addItem(QString::number(value) + "×", value);
     m_speed->setCurrentIndex(2);
     transport->addWidget(new QLabel(tr("速度"))); transport->addWidget(m_speed);
     connect(m_speed, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
         if (!m_busy && isAudioReady()) m_audio->setPlaybackSpeed(m_speed->currentData().toDouble());
     });
-    m_snap = new QComboBox(ui->centralwidget);
+    m_snap = new QComboBox(m_editorPage);
     for (int value : {1, 2, 4, 8, 16}) m_snap->addItem("1/" + QString::number(value) + tr(" 拍"), value);
     m_snap->setCurrentIndex(2);
     transport->addWidget(new QLabel(tr("吸附"))); transport->addWidget(m_snap);
@@ -344,8 +364,8 @@ void MainWindow::buildEditor() {
         m_editBeat->setSingleStep(1.0 / m_snap->currentData().toInt());
         m_grid->setBeat(currentBeat());
     });
-    m_loop = new QCheckBox(tr("循环"), ui->centralwidget);
-    m_metronome = new QCheckBox(tr("节拍器"), ui->centralwidget);
+    m_loop = new QCheckBox(tr("循环"), m_editorPage);
+    m_metronome = new QCheckBox(tr("节拍器"), m_editorPage);
     transport->addWidget(m_loop); transport->addWidget(m_metronome);
     connect(m_loop, &QCheckBox::toggled, this, [this](bool on) {
         m_audio->setLoop(m_loopStart, m_loopEnd, on);
@@ -353,13 +373,13 @@ void MainWindow::buildEditor() {
     connect(m_metronome, &QCheckBox::toggled, this, [this](bool on) {
         m_audio->setMetronome(on, m_document->timeMap().baseBpm(), m_document->timeMap().firstBeatSeconds());
     });
-    m_seekSlider = new QSlider(Qt::Horizontal, ui->centralwidget);
+    m_seekSlider = new QSlider(Qt::Horizontal, m_editorPage);
     m_seekSlider->setRange(0, 10000);
     transport->addWidget(m_seekSlider, 1);
     connect(m_seekSlider, &QSlider::valueChanged, this, [this](int value) {
         seek(m_audio->duration() * value / 10000.0);
     });
-    m_positionLabel = new QLabel(tr("0.00 秒 · 0.00 拍"), ui->centralwidget);
+    m_positionLabel = new QLabel(tr("0.00 秒 · 0.00 拍"), m_editorPage);
     m_positionLabel->setMinimumWidth(180);
     transport->addWidget(m_positionLabel);
     outer->addLayout(transport);
@@ -389,10 +409,95 @@ void MainWindow::buildEditor() {
     });
 }
 
+void MainWindow::buildWorkspace() {
+    ui->centralwidget->setObjectName(QStringLiteral("workspaceContent"));
+    auto layout = new QHBoxLayout(ui->centralwidget);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(0);
+    m_sidebar = new lmsc::NavigationSidebar(ui->centralwidget);
+    m_sidebar->setObjectName(QStringLiteral("mainSidebar"));
+    m_sidebar->setHeadingText(tr("工作区"));
+    auto navigation = m_sidebar->listWidget();
+    navigation->setObjectName(QStringLiteral("mainNavigation"));
+    navigation->setAccessibleName(tr("工作区导航"));
+    navigation->setAccessibleDescription(tr("使用上下方向键切换曲谱编辑、AI 识别或设置页面。"));
+    m_sidebar->addItem(tr("曲谱编辑"), lmsc::NavigationIcon::Editor);
+    m_sidebar->addItem(tr("AI 识别"), lmsc::NavigationIcon::Recognition);
+    m_sidebar->addItem(tr("外观"), lmsc::NavigationIcon::Appearance);
+    m_sidebar->addItem(tr("大语言模型"), lmsc::NavigationIcon::Model);
+    m_sidebar->addItem(tr("账号授权"), lmsc::NavigationIcon::Account);
+    m_sidebar->addItem(tr("网络"), lmsc::NavigationIcon::Network);
+    m_sidebar->addItem(tr("关于"), lmsc::NavigationIcon::About);
+    m_sidebar->setCollapsed(true);
+    m_workspacePages = new WorkspacePages(ui->centralwidget);
+    m_workspacePages->setObjectName(QStringLiteral("workspacePages"));
+    m_workspacePages->addWidget(m_editorPage);
+    m_aiPage = new lmsc::AiRecognitionPage(m_workspacePages);
+    m_workspacePages->addWidget(m_aiPage);
+    m_settingsPanel = new lmsc::SettingsPanel(m_workspacePages, m_settingsFile, true);
+    m_workspacePages->addWidget(m_settingsPanel);
+    layout->addWidget(m_sidebar);
+    layout->addWidget(m_workspacePages, 1);
+    connect(navigation, &QListWidget::currentRowChanged, this, &MainWindow::selectWorkspacePage);
+    connect(m_settingsPanel, &lmsc::SettingsPanel::navigationRequested, this, [navigation](int index) {
+        navigation->setCurrentRow(index + 2);
+    });
+    const auto returnToEditor = [navigation] { navigation->setCurrentRow(0); };
+    connect(m_settingsPanel, &lmsc::SettingsPanel::done, this, returnToEditor);
+    connect(m_settingsPanel, &lmsc::SettingsPanel::canceled, this, returnToEditor);
+    connect(m_settingsPanel, &lmsc::SettingsPanel::preferencesChanged, this, [this] {
+        statusBar()->showMessage(tr("设置已保存"), 5000);
+    });
+    connect(m_aiPage, &lmsc::AiRecognitionPage::configureConnectionRequested, this, [navigation] {
+        navigation->setCurrentRow(3);
+    });
+    navigation->setCurrentRow(0);
+}
+
+void MainWindow::selectWorkspacePage(int row) {
+    if (row < 0 || row > 6) return;
+    if (row != 1 && m_workspacePages->currentWidget() == m_aiPage)
+        m_aiPage->cancelRecognition();
+    if (row < 2) {
+        m_workspacePages->setCurrentIndex(row);
+        if (row == 1) refreshRecognitionContext();
+    } else {
+        m_workspacePages->setCurrentWidget(m_settingsPanel);
+        m_settingsPanel->selectPage(row - 2);
+    }
+    updateWorkspaceActions();
+}
+
+void MainWindow::refreshRecognitionContext() {
+    if (!m_aiPage) return;
+    const bool loaded = m_document->isLoaded();
+    m_aiPage->setContext(loaded ? m_document->audioPath() : QString(),
+                         loaded ? m_document->title() : QString(),
+                         m_document->timeMap().baseBpm(),
+                         m_document->timeMap().firstBeatSeconds(),
+                         loaded ? m_audio->duration() : 0,
+                         m_busy || m_audio->isBusy() || m_queuedAudio);
+}
+
+void MainWindow::setAiRecognitionService(lmsc::AiRecognitionService *service) {
+    m_aiPage->setService(service);
+    refreshRecognitionContext();
+}
+
+void MainWindow::updateWorkspaceActions() {
+    const bool editing = m_workspacePages && m_workspacePages->currentWidget() == m_editorPage;
+    m_editorToolbar->setVisible(editing);
+    m_saveAction->setEnabled(editing && m_document->isLoaded() && !m_busy);
+    m_exportAction->setEnabled(editing && m_document->isLoaded() && !m_busy);
+    m_undoAction->setEnabled(editing && !m_busy && m_document->canUndo());
+    m_redoAction->setEnabled(editing && !m_busy && m_document->canRedo());
+}
+
 bool MainWindow::editorCommandAllowed() const {
     // Text fields keep their own editing shortcuts.
     const QWidget *focus = QApplication::focusWidget();
-    return !m_busy && m_document->isLoaded() && !qobject_cast<const QLineEdit *>(focus)
+    return m_workspacePages && m_workspacePages->currentWidget() == m_editorPage
+        && !m_busy && m_document->isLoaded() && !qobject_cast<const QLineEdit *>(focus)
         && !qobject_cast<const QAbstractSpinBox *>(focus);
 }
 
@@ -400,6 +505,8 @@ void MainWindow::buildActions() {
     auto file = menuBar()->addMenu(tr("文件"));
     auto edit = menuBar()->addMenu(tr("编辑"));
     auto toolbar = addToolBar(tr("编辑操作"));
+    m_editorToolbar = toolbar;
+    toolbar->setObjectName(QStringLiteral("editorToolbar"));
     toolbar->setMovable(false);
     auto action = [this](QMenu *menu, const QString &name, const QKeySequence &shortcut, auto callback) {
         auto a = menu->addAction(name); a->setShortcut(shortcut);
@@ -437,12 +544,11 @@ void MainWindow::buildActions() {
     toolbar->addAction(m_saveAction); toolbar->addAction(m_exportAction); toolbar->addSeparator();
     toolbar->addAction(m_undoAction); toolbar->addAction(m_redoAction);
     auto settings = menuBar()->addMenu(tr("设置"));
-    auto settingsAction = action(settings, tr("偏好设置…"), QKeySequence("Ctrl+,"), [this] { showSettings(); });
+    auto settingsAction = action(settings, tr("外观设置"), QKeySequence("Ctrl+,"), [this] { showSettings(); });
     settingsAction->setObjectName(QStringLiteral("openSettingsAction"));
-    toolbar->addSeparator();
-    toolbar->addAction(settingsAction);
     auto play = new QAction(tr("播放 / 暂停"), this); play->setShortcut(Qt::Key_Space);
     addAction(play); connect(play, &QAction::triggered, this, [this] {
+        if (m_workspacePages->currentWidget() != m_editorPage) return;
         const auto focus = QApplication::focusWidget();
         if (qobject_cast<QLineEdit *>(focus) || qobject_cast<QAbstractSpinBox *>(focus)) return;
         if (m_audio->isPlaying()) m_audio->pause(); else if (!m_busy && isAudioReady()) m_audio->play();
@@ -460,11 +566,7 @@ void MainWindow::buildActions() {
 }
 
 void MainWindow::showSettings() {
-    lmsc::SettingsDialog dialog(this);
-    connect(&dialog, &lmsc::SettingsDialog::preferencesChanged, this, [this] {
-        statusBar()->showMessage(tr("设置已保存"), 5000);
-    });
-    dialog.exec();
+    m_sidebar->listWidget()->setCurrentRow(2);
 }
 
 void MainWindow::importSongFolder() {
@@ -563,45 +665,7 @@ void MainWindow::importSongFolder() {
 }
 
 void MainWindow::showAbout() {
-    QMessageBox about(this);
-    about.setObjectName(QStringLiteral("aboutDialog"));
-    about.setWindowTitle(tr("关于%1").arg(lmsc::AppInfo::name()));
-    about.setIconPixmap(QPixmap(QStringLiteral(":/icons/app.png")).scaled(96, 96, Qt::KeepAspectRatio, Qt::SmoothTransformation));
-    about.setTextFormat(Qt::RichText);
-    about.setText(tr("<h3>%1</h3><p>版本 %2 · Qt5 · Windows</p><p>作者：%3</p>"
-        "<p>VR 节奏游戏曲谱编辑工具，支持音频裁剪、试听和 PICO 头显歌曲导入。</p>"
-        "<p>本项目使用 GNU GPL 第 3 版许可。Qt、FFmpeg 等第三方组件遵循各自的许可，随包附有许可和来源说明。</p>")
-        .arg(lmsc::AppInfo::name().toHtmlEscaped(), lmsc::AppInfo::version().toHtmlEscaped(),
-             lmsc::AppInfo::author().toHtmlEscaped()));
-    auto homepageButton = about.addButton(tr("项目主页"), QMessageBox::ActionRole);
-    homepageButton->setObjectName(QStringLiteral("aboutHomepageButton"));
-    auto licenseButton = about.addButton(tr("查看 GPLv3 许可"), QMessageBox::ActionRole);
-    about.addButton(tr("关闭"), QMessageBox::RejectRole);
-    about.exec();
-    if (about.clickedButton() == homepageButton) {
-        if (!QDesktopServices::openUrl(QUrl(lmsc::AppInfo::homepageUrl())))
-            QMessageBox::warning(this, tr("打开项目主页失败"), tr("无法打开浏览器，请手动访问：\n%1").arg(lmsc::AppInfo::homepageUrl()));
-        return;
-    }
-    if (about.clickedButton() != licenseButton) return;
-    QDialog license(this);
-    license.setObjectName(QStringLiteral("gplLicenseDialog"));
-    license.setWindowTitle(tr("GNU GPL 第 3 版许可"));
-    license.resize(760, 620);
-    auto layout = new QVBoxLayout(&license);
-    auto explanation = new QLabel(tr("以下为 GNU GPL 第 3 版官方英文条款全文，保留原文。"), &license);
-    explanation->setWordWrap(true);
-    layout->addWidget(explanation);
-    auto text = new QTextBrowser(&license);
-    text->setObjectName(QStringLiteral("gplLicenseText"));
-    QFile source(QStringLiteral(":/licenses/GPL-3.0.txt"));
-    if (source.open(QIODevice::ReadOnly)) text->setPlainText(QString::fromUtf8(source.readAll()));
-    layout->addWidget(text, 1);
-    auto buttons = new QDialogButtonBox(QDialogButtonBox::Close, &license);
-    buttons->button(QDialogButtonBox::Close)->setText(tr("关闭"));
-    connect(buttons, &QDialogButtonBox::rejected, &license, &QDialog::reject);
-    layout->addWidget(buttons);
-    license.exec();
+    m_sidebar->listWidget()->setCurrentRow(6);
 }
 
 void MainWindow::connectAudio() {
@@ -625,6 +689,7 @@ void MainWindow::connectAudio() {
         m_playButton->setEnabled(!m_busy);
         m_estimateButton->setEnabled(!m_busy && m_document->isNewSong() && !m_analyzer->isBusy());
         m_speed->setEnabled(!m_busy);
+        refreshRecognitionContext();
         if (m_analyzeNew) {
             requestRhythmAnalysis();
         }
@@ -665,6 +730,7 @@ void MainWindow::connectAudio() {
         if (percent == 100 && !m_audio->isBusy() && !m_busy) {
             m_progress->hide(); m_cancelButton->hide();
         }
+        refreshRecognitionContext();
     });
     connect(m_audio, &AudioService::errorOccurred, this, [this](const QString &error) {
         m_newPending = m_previewPending = m_analyzeNew = false;
@@ -721,6 +787,7 @@ void MainWindow::openPath(const QString &input) {
 }
 
 void MainWindow::replaceDocument(std::shared_ptr<lmsc::BeatmapDocument> document) {
+    m_aiPage->cancelRecognition();
     m_document = std::move(document);
     m_initializeAudio = true;
     m_selection.clear(); m_clipboard.clear(); m_loopStart = 0; m_loopEnd = 0;
@@ -737,6 +804,7 @@ void MainWindow::replaceDocument(std::shared_ptr<lmsc::BeatmapDocument> document
     queueAudioTask([this, audioPath] { m_audio->loadAudio(audioPath); });
     m_audio->setMetronome(m_metronome->isChecked(), m_document->timeMap().baseBpm(),
                          m_document->timeMap().firstBeatSeconds());
+    m_sidebar->listWidget()->setCurrentRow(0);
     emit documentReady();
 }
 
@@ -790,6 +858,8 @@ void MainWindow::refreshDocument() {
           .arg(display.size()).arg(protectedCount).arg(m_document->readOnlyReason()) : tr("支持 BeatSaver v2/v3 曲谱"));
     refreshSelection();
     m_grid->setBeat(currentBeat());
+    refreshRecognitionContext();
+    updateWorkspaceActions();
     m_refreshing = false;
 }
 
@@ -1141,6 +1211,8 @@ void MainWindow::setBusy(bool busy, const QString &message) {
     if (busy) { m_progress->setRange(0, 0); m_progress->show(); m_cancelButton->show(); }
     else { m_progress->hide(); m_cancelButton->hide(); }
     refreshSelection();
+    refreshRecognitionContext();
+    updateWorkspaceActions();
     if (!message.isEmpty()) statusBar()->showMessage(message);
 }
 void MainWindow::closeEvent(QCloseEvent *event) {
@@ -1150,6 +1222,8 @@ void MainWindow::closeEvent(QCloseEvent *event) {
     ++m_analysisGeneration; ++m_audioGeneration; m_queuedAudio = false;
     m_analyzer->cancel(); m_audio->cancel(); m_audio->stop();
     m_mtp->cancel();
+    m_aiPage->cancelRecognition();
+    m_settingsPanel->discardChanges();
     event->accept();
 }
 bool MainWindow::isAudioReady() const { return m_document->isLoaded() && !m_queuedAudio && m_audio->isReady() && !m_audio->isBusy(); }
@@ -1157,6 +1231,7 @@ bool MainWindow::isAudioReady() const { return m_document->isLoaded() && !m_queu
 void MainWindow::queueAudioTask(std::function<void()> operation) {
     const quint64 generation = ++m_audioGeneration;
     m_queuedAudio = true;
+    refreshRecognitionContext();
     m_audio->cancel();
     auto timer = new QTimer(this);
     timer->setInterval(25);

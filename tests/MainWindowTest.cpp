@@ -1,7 +1,10 @@
 #include "gui/MainWindow.h"
+#include "gui/AiRecognitionPage.h"
 #include "gui/EditorViews.h"
+#include "gui/NavigationSidebar.h"
 #include "gui/ThemeManager.h"
 #include "core/AppInfo.h"
+#include "core/AppSettings.h"
 #include "core/AudioService.h"
 #include "core/MtpImportService.h"
 #include "core/ProjectStore.h"
@@ -24,13 +27,16 @@
 #include <QMouseEvent>
 #include <QProcess>
 #include <QPixmap>
+#include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSpinBox>
 #include <QStatusBar>
+#include <QStackedWidget>
 #include <QTemporaryDir>
 #include <QTextBrowser>
 #include <QTimer>
+#include <QToolButton>
 #include <QUrl>
 #include <cmath>
 
@@ -47,6 +53,18 @@ public slots:
 };
 
 namespace {
+class MainRecognitionService final : public lmsc::AiRecognitionService {
+public:
+    QVector<lmsc::AiRecognitionRequest> requests;
+    QStringList cancelledIds;
+    bool isAvailable() const override { return true; }
+    void analyze(const lmsc::AiRecognitionRequest &request) override { requests.append(request); }
+    void cancel(const QString &contextId) override {
+        cancelledIds.append(contextId);
+        emit cancelled(contextId);
+    }
+};
+
 class ScopedHttpsUrlHandler {
 public:
     explicit ScopedHttpsUrlHandler(QObject *receiver) {
@@ -102,6 +120,9 @@ private slots:
     void chineseBrandIconAndAboutLicense();
     void aboutHomepageOpensProject();
     void settingsEntryAndThemeCancel();
+    void navigationPreservesEditorAndSettingsDraft();
+    void aiRecognitionEntry();
+    void aiSuggestionsPreserveLoadedDocument();
     void clickPlaceApplyUndoAndDifficulty();
     void protectedSelectionRejectsEntireDrag();
     void importMp3AndCropThroughDialogs_data();
@@ -109,42 +130,282 @@ private slots:
     void importDryHands();
     void importHeadsetThroughDialog();
     void trackFramebufferUsesLoadedObjects();
+    void captureWorkspace();
 private:
+    QString settingsFile() const {
+        return m_temp.filePath(QString::fromLatin1(QTest::currentTestFunction()) + QStringLiteral(".json"));
+    }
     QTemporaryDir m_temp;
     QString m_song;
 };
 
 void MainWindowTest::settingsEntryAndThemeCancel() {
-    MainWindow window;
+    MainWindow window(nullptr, settingsFile());
     window.setTestMode(true);
     window.show();
     auto action = window.findChild<QAction *>(QStringLiteral("openSettingsAction"));
+    auto nav = window.findChild<QListWidget *>(QStringLiteral("mainNavigation"));
+    auto workspace = window.findChild<QStackedWidget *>(QStringLiteral("workspacePages"));
+    auto panel = window.findChild<QWidget *>(QStringLiteral("settingsPanel"));
+    auto pages = window.findChild<QStackedWidget *>(QStringLiteral("settingsPages"));
+    auto combo = window.findChild<QComboBox *>(QStringLiteral("themeMode"));
+    auto buttons = window.findChild<QDialogButtonBox *>(QStringLiteral("settingsButtons"));
     QVERIFY(action);
+    QVERIFY(nav && workspace && panel && pages && combo && buttons);
     QCOMPARE(action->shortcut(), QKeySequence(QStringLiteral("Ctrl+,")));
     const QString originalTheme = lmsc::ThemeManager::mode();
-    bool opened = false;
-    QTimer::singleShot(60, &window, [&] {
-        auto dialog = window.findChild<QDialog *>(QStringLiteral("settingsDialog"));
-        if (!dialog) return;
-        auto combo = dialog->findChild<QComboBox *>(QStringLiteral("themeMode"));
-        auto buttons = dialog->findChild<QDialogButtonBox *>(QStringLiteral("settingsButtons"));
-        if (!combo || !buttons) { dialog->reject(); return; }
-        opened = true;
-        combo->setCurrentIndex(combo->findData(QStringLiteral("dark")));
-        buttons->button(QDialogButtonBox::Cancel)->click();
-    });
-    QTimer::singleShot(3000, &window, [&] {
-        if (auto dialog = window.findChild<QDialog *>(QStringLiteral("settingsDialog"))) dialog->reject();
-    });
-    action->trigger();
-    QVERIFY(opened);
+    QApplication::setActiveWindow(&window);
+    QTest::keyClick(&window, Qt::Key_Comma, Qt::ControlModifier);
+    QTRY_COMPARE(nav->currentRow(), 2);
+    QCOMPARE(workspace->currentWidget(), panel);
+    QCOMPARE(pages->currentIndex(), 0);
+    QVERIFY(!panel->isWindow());
+    QVERIFY(!QApplication::activeModalWidget());
+    for (auto *topLevel : QApplication::topLevelWidgets())
+        QVERIFY(topLevel->objectName() != QStringLiteral("settingsDialog"));
+    const QString preview = originalTheme == QStringLiteral("dark") ? QStringLiteral("light") : QStringLiteral("dark");
+    combo->setCurrentIndex(combo->findData(preview));
+    QCOMPARE(lmsc::ThemeManager::mode(), preview);
+    QCOMPARE(buttons->button(QDialogButtonBox::Save)->text(), QStringLiteral("保存并返回"));
+    QCOMPARE(buttons->button(QDialogButtonBox::Cancel)->text(), QStringLiteral("取消并返回"));
+    QTest::mouseClick(buttons->button(QDialogButtonBox::Cancel), Qt::LeftButton);
+    QCOMPARE(nav->currentRow(), 0);
+    QCOMPARE(workspace->currentIndex(), 0);
     QCOMPARE(lmsc::ThemeManager::mode(), originalTheme);
+    QVERIFY(!QFile::exists(settingsFile()));
+
+    action->trigger();
+    QCOMPARE(nav->currentRow(), 2);
+    combo->setCurrentIndex(combo->findData(QStringLiteral("dark")));
+    QTest::mouseClick(buttons->button(QDialogButtonBox::Apply), Qt::LeftButton);
+    QCOMPARE(workspace->currentWidget(), panel);
+    QCOMPARE(lmsc::AppSettings(settingsFile()).load().themeMode, QStringLiteral("dark"));
+    combo->setCurrentIndex(combo->findData(QStringLiteral("light")));
+    QTest::mouseClick(buttons->button(QDialogButtonBox::Cancel), Qt::LeftButton);
+    QCOMPARE(workspace->currentIndex(), 0);
+    QCOMPARE(lmsc::ThemeManager::mode(), QStringLiteral("dark"));
+    action->trigger();
+    QCOMPARE(combo->currentData().toString(), QStringLiteral("dark"));
+    combo->setCurrentIndex(combo->findData(QStringLiteral("light")));
+    QTest::mouseClick(buttons->button(QDialogButtonBox::Save), Qt::LeftButton);
+    QCOMPARE(workspace->currentIndex(), 0);
+    QCOMPARE(lmsc::AppSettings(settingsFile()).load().themeMode, QStringLiteral("light"));
+    window.close();
+}
+
+void MainWindowTest::navigationPreservesEditorAndSettingsDraft() {
+    MainWindow window(nullptr, settingsFile());
+    window.setTestMode(true);
+    window.show();
+    auto sidebar = window.findChild<lmsc::NavigationSidebar *>(QStringLiteral("mainSidebar"));
+    auto nav = window.findChild<QListWidget *>(QStringLiteral("mainNavigation"));
+    auto workspace = window.findChild<QStackedWidget *>(QStringLiteral("workspacePages"));
+    auto settingsPages = window.findChild<QStackedWidget *>(QStringLiteral("settingsPages"));
+    auto toggle = sidebar ? sidebar->findChild<QToolButton *>(QStringLiteral("navigationToggle")) : nullptr;
+    QVERIFY(sidebar && nav && workspace && settingsPages && toggle);
+    const QStringList names{QStringLiteral("曲谱编辑"), QStringLiteral("AI 识别"),
+        QStringLiteral("外观"), QStringLiteral("大语言模型"), QStringLiteral("账号授权"),
+        QStringLiteral("网络"), QStringLiteral("关于")};
+    QCOMPARE(nav->count(), names.size());
+    QCOMPARE(workspace->count(), 3);
+    QCOMPARE(workspace->widget(0)->objectName(), QStringLiteral("editorPage"));
+    QCOMPARE(workspace->widget(1)->objectName(), QStringLiteral("aiRecognitionPage"));
+    QCOMPARE(workspace->widget(2)->objectName(), QStringLiteral("settingsPanel"));
+    QCOMPARE(nav->currentRow(), 0);
+    QVERIFY(sidebar->isCollapsed());
+    QCOMPARE(sidebar->width(), 64);
+    for (int row = 0; row < nav->count(); ++row) {
+        QCOMPARE(nav->item(row)->text(), names.at(row));
+        QCOMPARE(nav->item(row)->toolTip(), names.at(row));
+        QCOMPARE(nav->item(row)->data(Qt::AccessibleTextRole).toString(), names.at(row));
+        QVERIFY(!nav->item(row)->icon().isNull());
+    }
+
+    QSignalSpy ready(&window, &MainWindow::documentReady);
+    window.openPath(m_song);
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 20000);
+    QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
+    auto difficulties = window.findChild<QListWidget *>(QStringLiteral("difficultyList"));
+    auto grid = window.findChild<GridEditor *>();
+    auto audio = window.findChild<AudioService *>();
+    auto apply = button(window, QStringLiteral("应用属性"));
+    auto beat = field<QDoubleSpinBox>(window, QStringLiteral("拍位置"));
+    QVERIFY(difficulties && grid && audio && apply && beat);
+    difficulties->setCurrentRow(1);
+    audio->seek(1.25);
+    QApplication::setActiveWindow(&window);
+    QTest::mouseClick(grid, Qt::LeftButton, Qt::NoModifier, gridCell(*grid, 1, 1));
+    QCOMPARE(objectCount(window), 2);
+    QTest::mouseClick(grid, Qt::LeftButton, Qt::NoModifier, gridCell(*grid, 1, 1));
+    QVERIFY(apply->isEnabled());
+    const double selectedBeat = beat->value();
+    const double playbackPosition = audio->position();
+    const QString title = window.windowTitle();
+    QWidget *const editor = workspace->currentWidget();
+
+    nav->setCurrentRow(3);
+    QCOMPARE(workspace->currentIndex(), 2);
+    QCOMPARE(settingsPages->currentIndex(), 1);
+    auto model = window.findChild<QComboBox *>(QStringLiteral("aiModel"));
+    auto key = window.findChild<QLineEdit *>(QStringLiteral("aiApiKey"));
+    QVERIFY(model && key);
+    // Keep the synthetic key out of the focus/auto-fetch path.
+    nav->setFocus();
+    model->setEditText(QStringLiteral("unsaved-workspace-model"));
+    key->setText(QStringLiteral("test-only-workspace-key"));
+    QTest::mouseClick(toggle, Qt::LeftButton);
+    QVERIFY(!sidebar->isCollapsed());
+    QCOMPARE(sidebar->width(), 208);
+    QCOMPARE(nav->currentRow(), 3);
+    QCOMPARE(model->currentText(), QStringLiteral("unsaved-workspace-model"));
+    QCOMPARE(key->text(), QStringLiteral("test-only-workspace-key"));
+
+    nav->setFocus();
+    QTest::keyClick(nav, Qt::Key_Z, Qt::ControlModifier);
+    QTest::keyClick(nav, Qt::Key_Delete);
+    QTest::keyClick(nav, Qt::Key_Space);
+    QCOMPARE(objectCount(window), 2);
+    QCOMPARE(difficulties->currentRow(), 1);
+    QCOMPARE(beat->value(), selectedBeat);
+    QVERIFY(!audio->isPlaying());
+    QCOMPARE(audio->position(), playbackPosition);
+    QCOMPARE(window.windowTitle(), title);
+    QVERIFY(!QApplication::activeModalWidget());
+
+    nav->setCurrentRow(1);
+    QCOMPARE(workspace->currentIndex(), 1);
+    nav->setFocus();
+    QTest::keyClick(nav, Qt::Key_Z, Qt::ControlModifier);
+    QTest::keyClick(nav, Qt::Key_Delete);
+    QTest::keyClick(nav, Qt::Key_Space);
+    QCOMPARE(objectCount(window), 2);
+    QVERIFY(!audio->isPlaying());
+    QCOMPARE(audio->position(), playbackPosition);
+    nav->setCurrentRow(3);
+    QCOMPARE(model->currentText(), QStringLiteral("unsaved-workspace-model"));
+    QCOMPARE(key->text(), QStringLiteral("test-only-workspace-key"));
+    QTest::mouseClick(toggle, Qt::LeftButton);
+    QVERIFY(sidebar->isCollapsed());
+    QCOMPARE(sidebar->width(), 64);
+    nav->setCurrentRow(0);
+    QCOMPARE(workspace->currentWidget(), editor);
+    QCOMPARE(difficulties->currentRow(), 1);
+    QCOMPARE(objectCount(window), 2);
+    QCOMPARE(beat->value(), selectedBeat);
+    QVERIFY(apply->isEnabled());
+    QCOMPARE(audio->position(), playbackPosition);
+    QCOMPARE(window.windowTitle(), title);
+    grid->setFocus();
+    QTest::keyClick(grid, Qt::Key_Z, Qt::ControlModifier);
+    QCOMPARE(objectCount(window), 1);
+    window.close();
+}
+
+void MainWindowTest::aiRecognitionEntry() {
+    MainWindow window(nullptr, settingsFile());
+    window.setTestMode(true);
+    window.show();
+    auto nav = window.findChild<QListWidget *>(QStringLiteral("mainNavigation"));
+    auto workspace = window.findChild<QStackedWidget *>(QStringLiteral("workspacePages"));
+    auto recognize = window.findChild<QPushButton *>(QStringLiteral("aiRecognizeButton"));
+    auto configure = window.findChild<QPushButton *>(QStringLiteral("aiConfigureConnection"));
+    auto status = window.findChild<QLabel *>(QStringLiteral("aiRecognitionStatus"));
+    QVERIFY(nav && workspace && recognize && configure && status);
+    nav->setCurrentRow(1);
+    QCOMPARE(workspace->currentIndex(), 1);
+    QVERIFY(recognize->isVisible());
+    QVERIFY(!recognize->isEnabled());
+    QVERIFY(!status->text().isEmpty());
+    QSignalSpy ready(&window, &MainWindow::documentReady);
+    window.openPath(m_song);
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 20000);
+    QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
+    nav->setCurrentRow(1);
+    QVERIFY(!recognize->isEnabled());
+    QVERIFY(hasText(*workspace->currentWidget(), QStringLiteral("GUI Fixture")));
+    QCOMPARE(objectCount(window), 3);
+    QTest::mouseClick(configure, Qt::LeftButton);
+    QCOMPARE(nav->currentRow(), 3);
+    QCOMPARE(workspace->currentIndex(), 2);
+    QCOMPARE(window.findChild<QStackedWidget *>(QStringLiteral("settingsPages"))->currentIndex(), 1);
+    QVERIFY(!QApplication::activeModalWidget());
+    window.close();
+}
+
+void MainWindowTest::aiSuggestionsPreserveLoadedDocument() {
+    MainRecognitionService service;
+    MainWindow window(nullptr, settingsFile());
+    window.setTestMode(true);
+    window.show();
+    window.setAiRecognitionService(&service);
+    QVERIFY(!service.parent());
+    QSignalSpy ready(&window, &MainWindow::documentReady);
+    window.openPath(m_song);
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 20000);
+    QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
+    auto grid = window.findChild<GridEditor *>();
+    auto audio = window.findChild<AudioService *>();
+    auto nav = window.findChild<QListWidget *>(QStringLiteral("mainNavigation"));
+    auto difficulties = window.findChild<QListWidget *>(QStringLiteral("difficultyList"));
+    auto beat = field<QDoubleSpinBox>(window, QStringLiteral("拍位置"));
+    auto apply = button(window, QStringLiteral("应用属性"));
+    auto start = window.findChild<QPushButton *>(QStringLiteral("aiRecognizeButton"));
+    auto result = window.findChild<QPlainTextEdit *>(QStringLiteral("aiRecognitionResult"));
+    QVERIFY(grid && audio && nav && difficulties && beat && apply && start && result);
+    audio->seek(3.0);
+    QTest::mouseClick(grid, Qt::LeftButton, Qt::NoModifier, gridCell(*grid, 2, 2));
+    QVERIFY(apply->isEnabled());
+    QCOMPARE(beat->value(), 6.0);
+    const QString originalTitle = window.windowTitle();
+    const double originalPosition = audio->position();
+    nav->setCurrentRow(1);
+    QVERIFY(start->isEnabled());
+    QTest::mouseClick(start, Qt::LeftButton);
+    QCOMPARE(service.requests.count(), 1);
+    const auto request = service.requests.first();
+    QVERIFY(QFileInfo::exists(request.audioFile));
+    QCOMPARE(request.bpm, 120.0);
+    QCOMPARE(request.offsetSeconds, 0.0);
+    QVERIFY(request.durationSeconds > 0.0);
+    QFile audioFile(request.audioFile);
+    QVERIFY(audioFile.open(QIODevice::ReadOnly));
+    const QByteArray audioHash = QCryptographicHash::hash(audioFile.readAll(), QCryptographicHash::Sha256);
+    audioFile.close();
+    emit service.recognitionFinished({request.contextId, QStringLiteral("仅供参考的 AI 节拍建议"),
+                                      {{0.75, QStringLiteral("建议强拍"), 0.95}}});
+    QVERIFY(result->toPlainText().contains(QStringLiteral("仅供参考的 AI 节拍建议")));
+    QCOMPARE(objectCount(window), 3);
+    QCOMPARE(difficulties->currentRow(), 0);
+    QCOMPARE(beat->value(), 6.0);
+    QCOMPARE(audio->position(), originalPosition);
+    QCOMPARE(window.windowTitle(), originalTitle);
+    QVERIFY(audioFile.open(QIODevice::ReadOnly));
+    QCOMPARE(QCryptographicHash::hash(audioFile.readAll(), QCryptographicHash::Sha256), audioHash);
+    nav->setCurrentRow(0);
+    QVERIFY(apply->isEnabled());
+    QAction *undo = nullptr;
+    for (auto *action : window.findChildren<QAction *>())
+        if (action->text() == QStringLiteral("撤销")) undo = action;
+    QVERIFY(undo);
+    QVERIFY(!undo->isEnabled());
+    QCOMPARE(objectCount(window), 3);
+    nav->setCurrentRow(1);
+    QTest::mouseClick(start, Qt::LeftButton);
+    QCOMPARE(service.requests.count(), 2);
+    const auto pending = service.requests.last();
+    nav->setCurrentRow(0);
+    QCOMPARE(service.cancelledIds.last(), pending.contextId);
+    emit service.recognitionFinished({pending.contextId, QStringLiteral("已离开页面的迟到结果"), {}});
+    QVERIFY(result->toPlainText().isEmpty());
+    QCOMPARE(objectCount(window), 3);
+    QVERIFY(apply->isEnabled());
+    window.close();
 }
 
 void MainWindowTest::importHeadsetThroughDialog() {
     if (!qEnvironmentVariableIsSet("LMSC_TEST_HEADSET"))
         QSKIP("实机检查通过 LMSC_TEST_HEADSET=1 显式启用");
-    MainWindow window;
+    MainWindow window(nullptr, settingsFile());
     window.setTestMode(true);
     window.show();
     auto service = window.findChild<MtpImportService *>();
@@ -229,7 +490,7 @@ void MainWindowTest::initTestCase() {
 }
 
 void MainWindowTest::chineseBrandIconAndAboutLicense() {
-    MainWindow window; window.setTestMode(true); window.show();
+    MainWindow window(nullptr, settingsFile()); window.setTestMode(true); window.show();
     QCOMPARE(window.windowTitle(), QStringLiteral("光剑曲谱制作"));
     QVERIFY(!window.windowIcon().isNull());
     const QPixmap icon = window.windowIcon().pixmap(32, 32);
@@ -247,92 +508,55 @@ void MainWindowTest::chineseBrandIconAndAboutLicense() {
         if (action->text() == QStringLiteral("关于光剑曲谱制作")) aboutAction = action;
     QVERIFY(aboutAction);
 
-    bool sawAbout = false;
-    bool sawLicense = false;
-    bool aboutIconPresent = false;
-    bool homepageButtonPresent = false;
-    QString aboutTitle, aboutBody, displayedLicense, licenseTitle;
-    QTimer driver;
-    connect(&driver, &QTimer::timeout, &window, [&] {
-        if (!sawAbout) {
-            auto *about = window.findChild<QMessageBox *>(QStringLiteral("aboutDialog"));
-            if (!about || !about->isVisible()) return;
-            auto *showLicense = button(*about, QStringLiteral("查看 GPLv3 许可"));
-            aboutTitle = about->windowTitle();
-            aboutBody = about->text();
-            aboutIconPresent = !about->iconPixmap().isNull();
-            homepageButtonPresent = about->findChild<QPushButton *>(QStringLiteral("aboutHomepageButton")) != nullptr;
-            sawAbout = true;
-            if (showLicense) QTest::mouseClick(showLicense, Qt::LeftButton);
-            else about->reject();
-            return;
-        }
-        auto *dialog = window.findChild<QDialog *>(QStringLiteral("gplLicenseDialog"));
-        if (!dialog || !dialog->isVisible()) return;
-        auto *text = dialog->findChild<QTextBrowser *>(QStringLiteral("gplLicenseText"));
-        licenseTitle = dialog->windowTitle();
-        if (text) displayedLicense = text->toPlainText();
-        sawLicense = true;
-        driver.stop();
-        dialog->reject();
-    });
-    driver.start(10);
-    // 回归时及时关闭弹窗，避免整个界面测试被模态窗口卡住。
-    QTimer::singleShot(3000, &window, [&] {
-        driver.stop();
-        if (auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget())) dialog->reject();
-    });
     aboutAction->trigger();
-    driver.stop();
-    QVERIFY(sawAbout);
-    QVERIFY(aboutIconPresent);
-    QVERIFY(homepageButtonPresent);
-    QCOMPARE(aboutTitle, QStringLiteral("关于光剑曲谱制作"));
-    QVERIFY(aboutBody.contains(QStringLiteral("版本 0.2.0")));
-    QVERIFY(aboutBody.contains(QStringLiteral("作者：Vae-x")));
-    QVERIFY(aboutBody.contains(QStringLiteral("GNU GPL 第 3 版许可")));
-    QVERIFY(aboutBody.contains(QStringLiteral("第三方组件")));
-    QVERIFY(sawLicense);
-    QCOMPARE(licenseTitle, QStringLiteral("GNU GPL 第 3 版许可"));
-    QCOMPARE(displayedLicense.trimmed(), officialLicense.trimmed());
+    auto nav = window.findChild<QListWidget *>(QStringLiteral("mainNavigation"));
+    auto workspace = window.findChild<QStackedWidget *>(QStringLiteral("workspacePages"));
+    auto pages = window.findChild<QStackedWidget *>(QStringLiteral("settingsPages"));
+    auto version = window.findChild<QLabel *>(QStringLiteral("aboutVersion"));
+    auto author = window.findChild<QLabel *>(QStringLiteral("aboutAuthor"));
+    auto homepage = window.findChild<QPushButton *>(QStringLiteral("openProjectHomepage"));
+    auto showLicense = window.findChild<QPushButton *>(QStringLiteral("showGplLicense"));
+    auto displayedLicense = window.findChild<QTextBrowser *>(QStringLiteral("gplLicenseText"));
+    QVERIFY(nav && workspace && pages && version && author && homepage && showLicense && displayedLicense);
+    QCOMPARE(nav->currentRow(), 6);
+    QCOMPARE(workspace->currentIndex(), 2);
+    QCOMPARE(pages->currentIndex(), 4);
+    QCOMPARE(version->text(), QStringLiteral("0.2.0"));
+    QCOMPARE(author->text(), QStringLiteral("Vae-x"));
+    QVERIFY(hasText(*pages->currentWidget(), QStringLiteral("GNU GPL 第 3 版")));
+    QVERIFY(hasText(*pages->currentWidget(), QStringLiteral("第三方组件")));
+    QVERIFY(!QApplication::activeModalWidget());
+    QVERIFY(!displayedLicense->isVisible());
+    QTest::mouseClick(showLicense, Qt::LeftButton);
+    QVERIFY(displayedLicense->isVisible());
+    QCOMPARE(displayedLicense->toPlainText().trimmed(), officialLicense.trimmed());
+    QVERIFY(!QApplication::activeModalWidget());
     window.close();
 }
 
 void MainWindowTest::aboutHomepageOpensProject() {
     HomepageUrlReceiver receiver;
     ScopedHttpsUrlHandler handler(&receiver);
-    MainWindow window; window.setTestMode(true); window.show();
+    MainWindow window(nullptr, settingsFile()); window.setTestMode(true); window.show();
     QAction *aboutAction = nullptr;
     for (auto *action : window.findChildren<QAction *>())
         if (action->text() == QStringLiteral("关于光剑曲谱制作")) aboutAction = action;
     QVERIFY(aboutAction);
 
-    bool clickedHomepage = false;
-    QTimer driver;
-    connect(&driver, &QTimer::timeout, &window, [&] {
-        auto *about = window.findChild<QMessageBox *>(QStringLiteral("aboutDialog"));
-        if (!about || !about->isVisible()) return;
-        auto *homepage = about->findChild<QPushButton *>(QStringLiteral("aboutHomepageButton"));
-        driver.stop();
-        if (!homepage) { about->reject(); return; }
-        clickedHomepage = true;
-        QTest::mouseClick(homepage, Qt::LeftButton);
-    });
-    driver.start(10);
-    QTimer::singleShot(3000, &window, [&] {
-        driver.stop();
-        if (auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget())) dialog->reject();
-    });
     aboutAction->trigger();
-    driver.stop();
-    QVERIFY(clickedHomepage);
+    auto homepage = window.findChild<QPushButton *>(QStringLiteral("openProjectHomepage"));
+    QVERIFY(homepage);
+    QVERIFY(homepage->isVisible());
+    QTest::mouseClick(homepage, Qt::LeftButton);
     QCOMPARE(receiver.openedCount, 1);
     QCOMPARE(receiver.openedUrl, QUrl(lmsc::AppInfo::homepageUrl()));
+    QVERIFY(window.isVisible());
+    QVERIFY(!QApplication::activeModalWidget());
     window.close();
 }
 
 void MainWindowTest::clickPlaceApplyUndoAndDifficulty() {
-    MainWindow window; window.setTestMode(true); window.show();
+    MainWindow window(nullptr, settingsFile()); window.setTestMode(true); window.show();
     QSignalSpy ready(&window, &MainWindow::documentReady);
     QSignalSpy failed(&window, &MainWindow::loadFailed);
     window.openPath(m_song);
@@ -374,7 +598,7 @@ void MainWindowTest::clickPlaceApplyUndoAndDifficulty() {
     QCOMPARE(objectCount(window), 3);
     QTest::keyClick(grid, Qt::Key_Z, Qt::ControlModifier);
     QCOMPARE(objectCount(window), 4);
-    auto *difficulties = window.findChild<QListWidget *>();
+    auto *difficulties = window.findChild<QListWidget *>(QStringLiteral("difficultyList"));
     QVERIFY(difficulties);
     QCOMPARE(difficulties->count(), 2);
     difficulties->setCurrentRow(1);
@@ -386,7 +610,7 @@ void MainWindowTest::clickPlaceApplyUndoAndDifficulty() {
 }
 
 void MainWindowTest::protectedSelectionRejectsEntireDrag() {
-    MainWindow window; window.setTestMode(true); window.show();
+    MainWindow window(nullptr, settingsFile()); window.setTestMode(true); window.show();
     QSignalSpy ready(&window, &MainWindow::documentReady);
     window.openPath(m_song);
     QTRY_VERIFY_WITH_TIMEOUT(ready.count() == 1, 20000);
@@ -431,7 +655,7 @@ void MainWindowTest::importMp3AndCropThroughDialogs() {
     QFETCH(int, streamIndex);
     QFETCH(bool, previewBeforeConvert);
     const QString inputMedia = QString::fromUtf8(LMSC_AUDIO_FIXTURES_DIR) + "/" + mediaName;
-    MainWindow window; window.setTestMode(true); window.show();
+    MainWindow window(nullptr, settingsFile()); window.setTestMode(true); window.show();
     QSignalSpy ready(&window, &MainWindow::documentReady);
     int phase = 0;
     bool configuredCrop = false;
@@ -514,7 +738,7 @@ void MainWindowTest::importMp3AndCropThroughDialogs() {
     QTRY_VERIFY_WITH_TIMEOUT(ready.count() == 1, 20000);
     QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
     QVERIFY(window.windowTitle().contains(QStringLiteral("GUI Crop")));
-    QCOMPARE(window.findChild<QListWidget *>()->count(), 1);
+    QCOMPARE(window.findChild<QListWidget *>(QStringLiteral("difficultyList"))->count(), 1);
     QCOMPARE(objectCount(window), 0);
     QVERIFY(std::abs(window.findChild<AudioService *>()->duration() - 3.0) < 0.06);
     QTRY_VERIFY_WITH_TIMEOUT(hasText(window, QStringLiteral("建议")), 20000);
@@ -543,7 +767,7 @@ void MainWindowTest::importMp3AndCropThroughDialogs() {
 void MainWindowTest::importDryHands() {
     const QString sample = QString::fromUtf8(LMSC_REPOSITORY_DIR) + "/samples/beatmaps/2369d (Dry Hands - Darkrealm7).zip";
     if (!QFileInfo::exists(sample)) QSKIP("Local Dry Hands reference ZIP is unavailable");
-    MainWindow window; window.setTestMode(true); window.show();
+    MainWindow window(nullptr, settingsFile()); window.setTestMode(true); window.show();
     QSignalSpy ready(&window, &MainWindow::documentReady);
     QSignalSpy failed(&window, &MainWindow::loadFailed);
     window.openPath(sample);
@@ -551,7 +775,7 @@ void MainWindowTest::importDryHands() {
     QCOMPARE(failed.count(), 0);
     QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
     QVERIFY(window.windowTitle().contains(QStringLiteral("Dry Hands")));
-    QVERIFY(window.findChild<QListWidget *>()->count() > 0);
+    QVERIFY(window.findChild<QListWidget *>(QStringLiteral("difficultyList"))->count() > 0);
     const int before = objectCount(window);
     QVERIFY(before > 0);
     auto *grid = window.findChild<GridEditor *>();
@@ -561,7 +785,7 @@ void MainWindowTest::importDryHands() {
 }
 
 void MainWindowTest::trackFramebufferUsesLoadedObjects() {
-    MainWindow window; window.setTestMode(true); window.show();
+    MainWindow window(nullptr, settingsFile()); window.setTestMode(true); window.show();
     QSignalSpy ready(&window, &MainWindow::documentReady);
     window.openPath(m_song);
     QTRY_VERIFY_WITH_TIMEOUT(ready.count() == 1, 20000);
@@ -581,6 +805,77 @@ void MainWindowTest::trackFramebufferUsesLoadedObjects() {
     QVERIFY2(redPixels > 20, "Loaded red note is absent from the OpenGL framebuffer");
     QVERIFY2(bluePixels > 20, "Loaded blue note is absent from the OpenGL framebuffer");
     window.close();
+}
+
+void MainWindowTest::captureWorkspace() {
+    const QString directory = qEnvironmentVariable("LMSC_MAIN_CAPTURE_DIRECTORY");
+    if (directory.isEmpty()) QSKIP("通过 LMSC_MAIN_CAPTURE_DIRECTORY 显式启用主界面截图");
+    QVERIFY(QDir().mkpath(directory));
+    MainWindow window(nullptr, settingsFile());
+    window.setTestMode(true);
+    window.resize(1440, 900);
+    window.show();
+    QSignalSpy ready(&window, &MainWindow::documentReady);
+    window.openPath(m_song);
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 20000);
+    QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
+    auto sidebar = window.findChild<lmsc::NavigationSidebar *>(QStringLiteral("mainSidebar"));
+    auto nav = window.findChild<QListWidget *>(QStringLiteral("mainNavigation"));
+    auto theme = window.findChild<QComboBox *>(QStringLiteral("themeMode"));
+    auto key = window.findChild<QLineEdit *>(QStringLiteral("aiApiKey"));
+    auto workspace = window.findChild<QStackedWidget *>(QStringLiteral("workspacePages"));
+    auto settingsPanel = window.findChild<QWidget *>(QStringLiteral("settingsPanel"));
+    auto settingsButtons = window.findChild<QDialogButtonBox *>(QStringLiteral("settingsButtons"));
+    auto start = window.findChild<QPushButton *>(QStringLiteral("aiRecognizeButton"));
+    auto configure = window.findChild<QPushButton *>(QStringLiteral("aiConfigureConnection"));
+    QVERIFY(sidebar && nav && theme && key && workspace && settingsPanel && settingsButtons && start && configure);
+    QVERIFY(key->text().isEmpty());
+    const QString originalTheme = lmsc::ThemeManager::mode();
+    const auto capture = [&](const QString &name) {
+        QApplication::processEvents();
+        QTest::qWait(150);
+        return window.grab().save(QDir(directory).filePath(name + QStringLiteral(".png")));
+    };
+    const auto fullyInside = [](QWidget *widget, QWidget *page) {
+        return widget->isVisible() && page->rect().contains(QRect(widget->mapTo(page, QPoint()), widget->size()));
+    };
+    for (const QString &mode : {QStringLiteral("dark"), QStringLiteral("light")}) {
+        window.resize(1440, 900);
+        nav->setCurrentRow(2);
+        theme->setCurrentIndex(theme->findData(mode));
+        sidebar->setCollapsed(true);
+        nav->setCurrentRow(0);
+        QVERIFY(capture(QStringLiteral("main-editor-%1").arg(mode)));
+        sidebar->setCollapsed(false);
+        QVERIFY(capture(QStringLiteral("main-editor-%1-expanded").arg(mode)));
+        nav->setCurrentRow(2);
+        QVERIFY(capture(QStringLiteral("main-settings-appearance-%1").arg(mode)));
+        nav->setCurrentRow(3);
+        QVERIFY(capture(QStringLiteral("main-settings-model-%1").arg(mode)));
+        nav->setCurrentRow(1);
+        QVERIFY(capture(QStringLiteral("main-ai-recognition-%1").arg(mode)));
+        nav->setCurrentRow(6);
+        QVERIFY(capture(QStringLiteral("main-about-%1").arg(mode)));
+        sidebar->setCollapsed(true);
+        nav->setCurrentRow(3);
+        QApplication::processEvents();
+        const QSize minimum = window.minimumSize();
+        window.resize(minimum);
+        QApplication::processEvents();
+        qInfo() << "Main minimum capture" << mode << "minimum" << minimum
+                << "actual" << window.size() << "workspace hint" << workspace->minimumSizeHint();
+        QCOMPARE(window.size(), minimum);
+        for (const auto role : {QDialogButtonBox::Save, QDialogButtonBox::Apply, QDialogButtonBox::Cancel})
+            QVERIFY(fullyInside(settingsButtons->button(role), settingsPanel));
+        QVERIFY(capture(QStringLiteral("main-settings-model-%1-minimum").arg(mode)));
+        nav->setCurrentRow(1);
+        QApplication::processEvents();
+        QVERIFY(fullyInside(start, workspace->currentWidget()));
+        QVERIFY(fullyInside(configure, workspace->currentWidget()));
+        QVERIFY(capture(QStringLiteral("main-ai-recognition-%1-minimum").arg(mode)));
+    }
+    window.close();
+    lmsc::ThemeManager::apply(originalTheme);
 }
 
 int main(int argc, char **argv) {

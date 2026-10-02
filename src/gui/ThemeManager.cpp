@@ -97,154 +97,172 @@ QString stylesheet(bool dark) {
 
         /* Hallmark · genre modern-minimal · macrostructure navigation workbench
            critique P4 H4 E4 S4 R5 V4: quiet surfaces and clear form hierarchy. */
-        QDialog#settingsDialog { background: @settingsWindow; }
-        QDialog#settingsDialog QWidget { background: transparent; }
-        QDialog#settingsDialog QLabel { font-size: 14px; }
-        QDialog#settingsDialog QWidget#settingsHeader {
-            background: @settingsSidebar; border-bottom: 1px solid @settingsBorder;
-        }
-        QDialog#settingsDialog QWidget#settingsSidebar {
+        QDialog#settingsDialog, QWidget#workspaceContent { background: @settingsWindow; }
+        QWidget#mainSidebar {
             background: @settingsSidebar; border-right: 1px solid @settingsBorder;
         }
-        QDialog#settingsDialog QWidget#settingsFooter {
+        QWidget#mainSidebar QLabel { background: transparent; font-size: 14px; }
+        QListWidget#mainNavigation {
+            background: transparent; border: 0; outline: 0; padding: 0; font-size: 14px;
+        }
+        QListWidget#mainNavigation::item { background: transparent; border: 0; padding: 0; }
+        QListWidget#mainNavigation::item:selected { background: transparent; color: @text; }
+        QMainWindow QMenuBar, QMainWindow QToolBar { background: @settingsSidebar; }
+        QMainWindow QMenuBar::item { padding: 6px 12px; background: transparent; }
+        QMainWindow QMenuBar::item:selected { background: @settingsHover; color: @text; }
+        QWidget[workspaceSurface="true"] { background: @settingsWindow; }
+        QWidget[workspaceSurface="true"] QWidget { background: transparent; }
+        QWidget[workspaceSurface="true"] QLabel { font-size: 14px; }
+        QWidget[workspaceSurface="true"] QWidget#settingsHeader {
+            background: @settingsSidebar; border-bottom: 1px solid @settingsBorder;
+        }
+        QWidget[workspaceSurface="true"] QWidget#settingsSidebar {
+            background: @settingsSidebar; border-right: 1px solid @settingsBorder;
+        }
+        QWidget[workspaceSurface="true"] QWidget#settingsFooter {
             background: @settingsWindow; border-top: 1px solid @settingsBorder;
         }
-        QDialog#settingsDialog QListWidget#settingsNavigation {
+        QWidget[workspaceSurface="true"] QListWidget#settingsNavigation {
             background: transparent; border: 0; outline: 0; padding: 0;
         }
-        QDialog#settingsDialog QListWidget#settingsNavigation::item {
+        QWidget[workspaceSurface="true"] QListWidget#settingsNavigation::item {
             background: transparent; border: 0; padding: 0;
         }
-        QDialog#settingsDialog QListWidget#settingsNavigation::item:selected {
+        QWidget[workspaceSurface="true"] QListWidget#settingsNavigation::item:selected {
             background: transparent; color: @text;
         }
-        QDialog#settingsDialog QLabel[role="pageTitle"] {
+        QWidget[workspaceSurface="true"] QLabel[role="pageTitle"] {
             font-size: 26px; font-weight: 600;
         }
-        QDialog#settingsDialog QLabel[role="cardTitle"],
-        QDialog#settingsDialog QLabel[role="settingSection"] {
+        QWidget[workspaceSurface="true"] QLabel[role="cardTitle"],
+        QWidget[workspaceSurface="true"] QLabel[role="settingSection"] {
             font-size: 14px; font-weight: 600;
         }
-        QDialog#settingsDialog QLabel#settingsAppName { font-size: 14px; font-weight: 600; }
-        QDialog#settingsDialog QLabel#settingsCaption { color: @muted; }
-        QDialog#settingsDialog QLabel[role="link"] { color: @noteBlue; }
-        QDialog#settingsDialog QFrame[role="settingsCard"] {
+        QWidget[workspaceSurface="true"] QLabel#settingsAppName { font-size: 14px; font-weight: 600; }
+        QWidget[workspaceSurface="true"] QLabel#settingsCaption { color: @muted; }
+        QWidget[workspaceSurface="true"] QLabel[role="link"] { color: @noteBlue; }
+        QWidget[workspaceSurface="true"] QFrame[role="settingsCard"] {
             background: @settingsCard; border: 1px solid @settingsBorder; border-radius: 8px;
         }
-        QDialog#settingsDialog QPushButton, QDialog#settingsDialog QComboBox,
-        QDialog#settingsDialog QLineEdit, QDialog#settingsDialog QSpinBox,
-        QDialog#settingsDialog QDoubleSpinBox {
+        QWidget[workspaceSurface="true"] QPlainTextEdit,
+        QWidget[workspaceSurface="true"] QTextBrowser {
+            background: @settingsWindow; border: 1px solid @settingsBorder;
+            border-radius: 5px; padding: 9px; font-size: 14px;
+        }
+        QWidget[workspaceSurface="true"] QPushButton, QWidget[workspaceSurface="true"] QComboBox,
+        QWidget[workspaceSurface="true"] QLineEdit, QWidget[workspaceSurface="true"] QSpinBox,
+        QWidget[workspaceSurface="true"] QDoubleSpinBox {
             background: @settingsWindow; border: 1px solid @settingsBorder;
             border-radius: 5px; padding: 6px 9px; font-size: 14px;
         }
-        QDialog#settingsDialog QPushButton:hover, QDialog#settingsDialog QComboBox:hover,
-        QDialog#settingsDialog QLineEdit:hover, QDialog#settingsDialog QSpinBox:hover,
-        QDialog#settingsDialog QDoubleSpinBox:hover {
+        QWidget[workspaceSurface="true"] QPushButton:hover, QWidget[workspaceSurface="true"] QComboBox:hover,
+        QWidget[workspaceSurface="true"] QLineEdit:hover, QWidget[workspaceSurface="true"] QSpinBox:hover,
+        QWidget[workspaceSurface="true"] QDoubleSpinBox:hover {
             background: @settingsHover;
         }
-        QDialog#settingsDialog QPushButton:pressed,
-        QDialog#settingsDialog QPushButton:checked {
+        QWidget[workspaceSurface="true"] QPushButton:pressed,
+        QWidget[workspaceSurface="true"] QPushButton:checked {
             background: @settingsBorder; color: @text;
         }
-        QDialog#settingsDialog QPushButton:disabled, QDialog#settingsDialog QComboBox:disabled,
-        QDialog#settingsDialog QLineEdit:disabled, QDialog#settingsDialog QSpinBox:disabled,
-        QDialog#settingsDialog QDoubleSpinBox:disabled {
+        QWidget[workspaceSurface="true"] QPushButton:disabled, QWidget[workspaceSurface="true"] QComboBox:disabled,
+        QWidget[workspaceSurface="true"] QLineEdit:disabled, QWidget[workspaceSurface="true"] QSpinBox:disabled,
+        QWidget[workspaceSurface="true"] QDoubleSpinBox:disabled {
             background: @settingsSidebar; color: @disabled; border-color: @settingsBorder;
         }
-        QDialog#settingsDialog QPushButton:focus, QDialog#settingsDialog QComboBox:focus,
-        QDialog#settingsDialog QLineEdit:focus, QDialog#settingsDialog QSpinBox:focus,
-        QDialog#settingsDialog QDoubleSpinBox:focus { border-color: @accent; }
-        QDialog#settingsDialog QComboBox { padding-right: 30px; }
-        QDialog#settingsDialog QComboBox::drop-down { width: 26px; border: 0; }
-        QDialog#settingsDialog QComboBox QLineEdit,
-        QDialog#settingsDialog QComboBox QLineEdit:focus,
-        QDialog#settingsDialog QComboBox QLineEdit:hover,
-        QDialog#settingsDialog QComboBox QLineEdit:disabled {
+        QWidget[workspaceSurface="true"] QPushButton:focus, QWidget[workspaceSurface="true"] QComboBox:focus,
+        QWidget[workspaceSurface="true"] QLineEdit:focus, QWidget[workspaceSurface="true"] QSpinBox:focus,
+        QWidget[workspaceSurface="true"] QDoubleSpinBox:focus { border-color: @accent; }
+        QWidget[workspaceSurface="true"] QComboBox { padding-right: 30px; }
+        QWidget[workspaceSurface="true"] QComboBox::drop-down { width: 26px; border: 0; }
+        QWidget[workspaceSurface="true"] QComboBox QLineEdit,
+        QWidget[workspaceSurface="true"] QComboBox QLineEdit:focus,
+        QWidget[workspaceSurface="true"] QComboBox QLineEdit:hover,
+        QWidget[workspaceSurface="true"] QComboBox QLineEdit:disabled {
             background: transparent; border: 0; border-radius: 0; padding: 0;
         }
-        QDialog#settingsDialog QComboBox QAbstractItemView {
+        QWidget[workspaceSurface="true"] QComboBox QAbstractItemView {
             background: @settingsCard; border-color: @settingsBorder;
         }
-        QDialog#settingsDialog QPushButton[role="primary"] {
+        QWidget[workspaceSurface="true"] QPushButton[role="primary"] {
             background: @accent; color: @primaryText; border-color: @accent; font-weight: 600;
         }
-        QDialog#settingsDialog QPushButton[role="primary"]:hover {
+        QWidget[workspaceSurface="true"] QPushButton[role="primary"]:hover {
             background: @primaryHover; border-color: @primaryHover;
         }
-        QDialog#settingsDialog QPushButton[role="primary"]:pressed {
+        QWidget[workspaceSurface="true"] QPushButton[role="primary"]:pressed {
             background: @primaryPressed; border-color: @primaryPressed;
         }
-        QDialog#settingsDialog QPushButton[role="primary"]:focus {
+        QWidget[workspaceSurface="true"] QPushButton[role="primary"]:focus {
             border: 1px solid @text;
         }
-        QDialog#settingsDialog QPushButton[role="primary"]:disabled {
+        QWidget[workspaceSurface="true"] QPushButton[role="primary"]:disabled {
             background: @settingsBorder; color: @disabled; border-color: @settingsBorder;
         }
-        QDialog#settingsDialog QToolButton#navigationToggle {
+        QToolButton#navigationToggle {
             background: transparent; border: 1px solid transparent; border-radius: 6px; padding: 0;
         }
-        QDialog#settingsDialog QToolButton#navigationToggle:hover { background: @settingsHover; }
-        QDialog#settingsDialog QToolButton#navigationToggle:pressed {
+        QToolButton#navigationToggle:hover { background: @settingsHover; }
+        QToolButton#navigationToggle:pressed {
             background: @settingsBorder; color: @text;
         }
-        QDialog#settingsDialog QToolButton#navigationToggle:focus { border-color: @accent; }
-        QDialog#settingsDialog QToolButton#navigationToggle:disabled { color: @disabled; }
-        QDialog#settingsDialog QCheckBox { font-size: 14px; spacing: 8px; }
-        QDialog#settingsDialog QCheckBox::indicator {
+        QToolButton#navigationToggle:focus { border-color: @accent; }
+        QToolButton#navigationToggle:disabled { color: @disabled; }
+        QWidget[workspaceSurface="true"] QCheckBox { font-size: 14px; spacing: 8px; }
+        QWidget[workspaceSurface="true"] QCheckBox::indicator {
             width: 16px; height: 16px; background: @settingsWindow;
             border: 1px solid @settingsBorder; border-radius: 3px;
         }
-        QDialog#settingsDialog QCheckBox::indicator:hover,
-        QDialog#settingsDialog QCheckBox::indicator:focus { border-color: @accent; }
-        QDialog#settingsDialog QCheckBox::indicator:checked {
+        QWidget[workspaceSurface="true"] QCheckBox::indicator:hover,
+        QWidget[workspaceSurface="true"] QCheckBox::indicator:focus { border-color: @accent; }
+        QWidget[workspaceSurface="true"] QCheckBox::indicator:checked {
             background: @accent; border-color: @accent; image: url(:/icons/check-@checkVariant.svg);
         }
-        QDialog#settingsDialog QCheckBox::indicator:disabled {
+        QWidget[workspaceSurface="true"] QCheckBox::indicator:disabled {
             background: @settingsSidebar; border-color: @settingsBorder;
         }
-        QDialog#settingsDialog QCheckBox::indicator:checked:disabled {
+        QWidget[workspaceSurface="true"] QCheckBox::indicator:checked:disabled {
             background: @disabled; border-color: @disabled;
         }
-        QDialog#settingsDialog QScrollBar:vertical {
+        QWidget[workspaceSurface="true"] QScrollBar:vertical {
             background: transparent; width: 10px; margin: 0;
         }
-        QDialog#settingsDialog QScrollBar:horizontal {
+        QWidget[workspaceSurface="true"] QScrollBar:horizontal {
             background: transparent; height: 10px; margin: 0;
         }
-        QDialog#settingsDialog QScrollBar::handle {
+        QWidget[workspaceSurface="true"] QScrollBar::handle {
             background: @settingsBorder; border-radius: 5px; min-width: 0; min-height: 0;
         }
-        QDialog#settingsDialog QScrollBar::handle:vertical { min-height: 32px; }
-        QDialog#settingsDialog QScrollBar::handle:horizontal { min-width: 32px; }
-        QDialog#settingsDialog QScrollBar::handle:hover { background: @settingsScrollHover; }
-        QDialog#settingsDialog QScrollBar::add-line,
-        QDialog#settingsDialog QScrollBar::sub-line {
+        QWidget[workspaceSurface="true"] QScrollBar::handle:vertical { min-height: 32px; }
+        QWidget[workspaceSurface="true"] QScrollBar::handle:horizontal { min-width: 32px; }
+        QWidget[workspaceSurface="true"] QScrollBar::handle:hover { background: @settingsScrollHover; }
+        QWidget[workspaceSurface="true"] QScrollBar::add-line,
+        QWidget[workspaceSurface="true"] QScrollBar::sub-line {
             background: transparent; border: 0; width: 0; height: 0;
         }
-        QDialog#settingsDialog QScrollBar::up-arrow, QDialog#settingsDialog QScrollBar::down-arrow,
-        QDialog#settingsDialog QScrollBar::left-arrow, QDialog#settingsDialog QScrollBar::right-arrow {
+        QWidget[workspaceSurface="true"] QScrollBar::up-arrow, QWidget[workspaceSurface="true"] QScrollBar::down-arrow,
+        QWidget[workspaceSurface="true"] QScrollBar::left-arrow, QWidget[workspaceSurface="true"] QScrollBar::right-arrow {
             image: none; width: 0; height: 0;
         }
     )");
     const auto color = [&](const char *token, const char *darkColor, const char *lightColor) {
         css.replace(QString::fromLatin1(token), QString::fromLatin1(dark ? darkColor : lightColor));
     };
-    color("@window", "#171d28", "#f3f5f8");
-    color("@text", "#dae2ef", "#243247");
-    color("@muted", "#a0aec2", "#596b82");
+    color("@window", "#18191c", "#f6f7f9");
+    color("@text", "#e7e8eb", "#23272f");
+    color("@muted", "#a6abb4", "#656e7b");
     color("@warning", "#e9c881", "#93620b");
     color("@success", "#66d3b4", "#127656");
     color("@error", "#ff939e", "#b72f43");
-    color("@disabled", "#69778c", "#8995a5");
-    color("@border", "#3e4b61", "#cbd3df");
-    color("@control", "#253044", "#ffffff");
-    color("@hover", "#35455e", "#e3ebf4");
+    color("@disabled", "#696f7a", "#8b929d");
+    color("@border", "#36393f", "#dce0e6");
+    color("@control", "#232529", "#ffffff");
+    color("@hover", "#2d3035", "#e5e8ee");
     // Longer tokens must be replaced before their prefix.
     color("@selectedText", "#ffffff", "#ffffff");
-    color("@selected", "#355d88", "#3d6f9f");
+    color("@selected", "#244c46", "#168578");
     color("@accent", "#42d3bd", "#168578");
-    color("@base", "#121925", "#ffffff");
-    color("@panel", "#202937", "#e8edf4");
+    color("@base", "#141518", "#ffffff");
+    color("@panel", "#111214", "#eef0f3");
     color("@settingsWindow", "#18191c", "#f6f7f9");
     color("@settingsSidebar", "#111214", "#eef0f3");
     color("@settingsCard", "#232529", "#ffffff");
@@ -265,25 +283,25 @@ QPalette palette(bool dark) {
     const auto color = [&](QPalette::ColorRole role, const char *darkColor, const char *lightColor) {
         result.setColor(role, QColor(QString::fromLatin1(dark ? darkColor : lightColor)));
     };
-    color(QPalette::Window, "#171d28", "#f3f5f8");
-    color(QPalette::WindowText, "#dae2ef", "#243247");
-    color(QPalette::Base, "#121925", "#ffffff");
-    color(QPalette::AlternateBase, "#253044", "#e8edf4");
-    color(QPalette::Text, "#dae2ef", "#243247");
-    color(QPalette::Button, "#253044", "#ffffff");
-    color(QPalette::ButtonText, "#dae2ef", "#243247");
-    color(QPalette::ToolTipBase, "#253044", "#ffffff");
-    color(QPalette::ToolTipText, "#dae2ef", "#243247");
-    color(QPalette::Highlight, "#355d88", "#3d6f9f");
+    color(QPalette::Window, "#18191c", "#f6f7f9");
+    color(QPalette::WindowText, "#e7e8eb", "#23272f");
+    color(QPalette::Base, "#141518", "#ffffff");
+    color(QPalette::AlternateBase, "#232529", "#eef0f3");
+    color(QPalette::Text, "#e7e8eb", "#23272f");
+    color(QPalette::Button, "#232529", "#ffffff");
+    color(QPalette::ButtonText, "#e7e8eb", "#23272f");
+    color(QPalette::ToolTipBase, "#232529", "#ffffff");
+    color(QPalette::ToolTipText, "#e7e8eb", "#23272f");
+    color(QPalette::Highlight, "#244c46", "#168578");
     result.setColor(QPalette::HighlightedText, Qt::white);
     color(QPalette::Link, "#42d3bd", "#168578");
     color(QPalette::LinkVisited, "#c3abeb", "#725795");
     color(QPalette::Light, "#53637d", "#ffffff");
-    color(QPalette::Midlight, "#3e4b61", "#e8edf4");
-    color(QPalette::Mid, "#3e4b61", "#cbd3df");
+    color(QPalette::Midlight, "#36393f", "#eef0f3");
+    color(QPalette::Mid, "#36393f", "#dce0e6");
     color(QPalette::Dark, "#101620", "#a8b4c4");
     color(QPalette::Shadow, "#090d13", "#8290a3");
-    const QColor disabled(QString::fromLatin1(dark ? "#69778c" : "#8995a5"));
+    const QColor disabled(QString::fromLatin1(dark ? "#696f7a" : "#8b929d"));
     result.setColor(QPalette::Disabled, QPalette::WindowText, disabled);
     result.setColor(QPalette::Disabled, QPalette::Text, disabled);
     result.setColor(QPalette::Disabled, QPalette::ButtonText, disabled);

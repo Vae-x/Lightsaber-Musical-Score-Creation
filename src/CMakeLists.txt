@@ -32,6 +32,7 @@ add_library(lmsc_core STATIC
         core/RhythmAnalyzer.cpp
         core/RhythmAnalyzer.h
         core/AppSettings.cpp core/AppSettings.h
+        core/AiRecognitionService.cpp core/AiRecognitionService.h
         core/ApiModelClient.cpp core/ApiModelClient.h
         core/WinHttpModelTransport.cpp core/WinHttpModelTransport.h
         core/CodexAccountClient.cpp core/CodexAccountClient.h
@@ -51,6 +52,8 @@ add_executable(src WIN32
         gui/EditorViews.cpp
         gui/EditorViews.h
         gui/SettingsDialog.cpp gui/SettingsDialog.h
+        gui/SettingsPanel.cpp gui/SettingsPanel.h
+        gui/AiRecognitionPage.cpp gui/AiRecognitionPage.h
         gui/NavigationSidebar.cpp gui/NavigationSidebar.h
         gui/ThemeManager.cpp gui/ThemeManager.h
         ../resources/app.qrc)
@@ -164,6 +167,13 @@ if (BUILD_TESTING)
     set_target_properties(ai_settings_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
     add_test(NAME ai_settings COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:ai_settings_tests>")
     set_tests_properties(ai_settings PROPERTIES TIMEOUT 60 LABELS "settings;network")
+    add_executable(ai_recognition_tests
+            "${LMSC_REPOSITORY_DIR}/tests/AiRecognitionTest.cpp"
+            gui/AiRecognitionPage.cpp gui/AiRecognitionPage.h)
+    target_link_libraries(ai_recognition_tests PRIVATE lmsc_core Qt5::Widgets Qt5::Test)
+    set_target_properties(ai_recognition_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_test(NAME ai_recognition COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:ai_recognition_tests>")
+    set_tests_properties(ai_recognition PROPERTIES TIMEOUT 60 LABELS "gui;ai")
     add_executable(codex_account_tests "${LMSC_REPOSITORY_DIR}/tests/CodexAccountTest.cpp")
     target_link_libraries(codex_account_tests PRIVATE lmsc_core Qt5::Test)
     set_target_properties(codex_account_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
@@ -172,6 +182,7 @@ if (BUILD_TESTING)
     add_executable(settings_dialog_tests
             "${LMSC_REPOSITORY_DIR}/tests/SettingsDialogTest.cpp"
             gui/SettingsDialog.cpp gui/SettingsDialog.h
+            gui/SettingsPanel.cpp gui/SettingsPanel.h
             gui/NavigationSidebar.cpp gui/NavigationSidebar.h
             gui/ThemeManager.cpp gui/ThemeManager.h
             gui/EditorViews.cpp gui/EditorViews.h)
@@ -231,6 +242,8 @@ if (BUILD_TESTING)
                 gui/EditorViews.cpp gui/EditorViews.h)
         target_sources(main_window_tests PRIVATE
                 gui/SettingsDialog.cpp gui/SettingsDialog.h
+                gui/SettingsPanel.cpp gui/SettingsPanel.h
+                gui/AiRecognitionPage.cpp gui/AiRecognitionPage.h
                 gui/NavigationSidebar.cpp gui/NavigationSidebar.h
                 gui/ThemeManager.cpp gui/ThemeManager.h)
         target_sources(main_window_tests PRIVATE ../resources/app.qrc)

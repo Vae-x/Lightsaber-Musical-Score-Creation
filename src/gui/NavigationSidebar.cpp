@@ -16,6 +16,7 @@
 #include <QStyledItemDelegate>
 #include <QToolButton>
 #include <QVBoxLayout>
+#include <cstdlib>
 
 namespace lmsc {
 namespace {
@@ -203,6 +204,24 @@ void drawNavigationIcon(QPainter &painter, NavigationIcon icon,
         painter.drawEllipse(QPointF(12, 7.5), 1.1, 1.1);
         break;
     }
+    case NavigationIcon::Editor: {
+        painter.drawRoundedRect(QRectF(3, 3, 18, 18), 3, 3);
+        painter.drawLine(QPointF(9, 3), QPointF(9, 21));
+        painter.drawLine(QPointF(15, 3), QPointF(15, 21));
+        painter.drawLine(QPointF(3, 9), QPointF(21, 9));
+        painter.drawLine(QPointF(3, 15), QPointF(21, 15));
+        painter.fillRect(QRectF(10, 10, 4, 4), color);
+        break;
+    }
+    case NavigationIcon::Recognition: {
+        painter.drawRoundedRect(QRectF(2, 3, 20, 18), 4, 4);
+        for (int bar = 0; bar < 5; ++bar) {
+            const int height = 4 + (2 - std::abs(2 - bar)) * 3;
+            painter.drawLine(QPointF(6 + bar * 3, 12 - height / 2.0),
+                             QPointF(6 + bar * 3, 12 + height / 2.0));
+        }
+        break;
+    }
     }
     painter.restore();
 }
@@ -263,5 +282,7 @@ void NavigationSidebar::setCollapsed(bool collapsed) {
     m_list->viewport()->update();
     emit collapsedChanged(collapsed);
 }
+
+void NavigationSidebar::setHeadingText(const QString &text) { m_heading->setText(text); }
 
 } // namespace lmsc
