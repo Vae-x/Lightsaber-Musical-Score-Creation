@@ -20,6 +20,7 @@ struct MusicSegment {
     double energy = 0.0, activeSeconds = 0.0, repeatConfidence = 0.0;
     QVector<int> anchors;
     QVector<double> fingerprint;
+    int repeatReference = -1;
 };
 struct MusicAnalysis {
     QString audioFingerprint;
@@ -31,6 +32,7 @@ struct MusicAnalysis {
     const MusicAnchor *anchor(const QString &id) const;
     QJsonObject planningEvidence() const;
     QJsonObject segmentEvidence(int index) const;
+    void identifyRepeats();
 };
 
 class MusicFeatureAnalyzer {

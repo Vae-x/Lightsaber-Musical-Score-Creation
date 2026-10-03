@@ -55,7 +55,8 @@ QJsonObject MusicAnalysis::planningEvidence() const {
                       {"endBeat", segment.endBeat}, {"startSeconds", segment.startSeconds},
                       {"endSeconds", segment.endSeconds}, {"energy", segment.energy},
                       {"activeSeconds", segment.activeSeconds}, {"hitCandidates", hits},
-                      {"repeatGroup", segment.repeatGroup}, {"repeatConfidence", segment.repeatConfidence}});
+                      {"repeatGroup", segment.repeatGroup}, {"repeatConfidence", segment.repeatConfidence},
+                      {"repeatReferenceSegment", segment.repeatReference < 0 ? 0 : segment.repeatReference+1}});
     }
     return {{"durationSeconds", durationSeconds}, {"activeSeconds", activeSeconds}, {"blocks", blocks}};
 }
@@ -67,7 +68,29 @@ QJsonObject MusicAnalysis::segmentEvidence(int index) const {
     for (int anchorIndex : segment.anchors) candidates.append(anchorJson(anchors[anchorIndex]));
     return {{"segmentId", segment.id}, {"startBeat", segment.startBeat}, {"endBeat", segment.endBeat},
             {"startSeconds", segment.startSeconds}, {"endSeconds", segment.endSeconds},
-            {"energy", segment.energy}, {"repeatGroup", segment.repeatGroup}, {"anchors", candidates}};
+            {"energy", segment.energy}, {"repeatGroup", segment.repeatGroup},
+            {"repeatConfidence", segment.repeatConfidence},
+            {"repeatReferenceSegment", segment.repeatReference < 0 ? 0 : segment.repeatReference+1}, {"anchors", candidates}};
+}
+
+void MusicAnalysis::identifyRepeats() {
+    QVector<int> representatives;
+    for (int i=0; i<segments.size(); ++i) {
+        auto &segment=segments[i];
+        segment.repeatGroup=QStringLiteral("r%1").arg(i);
+        segment.repeatReference=-1; segment.repeatConfidence=0;
+        for (int priorIndex : representatives) {
+            const auto &prior=segments[priorIndex];
+            if (std::abs((prior.endBeat-prior.startBeat)-(segment.endBeat-segment.startBeat))>0.5
+                    || std::abs(segment.energy-prior.energy)>0.2) continue;
+            const double score=similarity(segment.fingerprint, prior.fingerprint);
+            if (score>=0.94 && score>segment.repeatConfidence+1e-12) {
+                segment.repeatGroup=prior.repeatGroup;
+                segment.repeatReference=priorIndex; segment.repeatConfidence=score;
+            }
+        }
+        if (segment.repeatReference<0) representatives.append(i);
+    }
 }
 
 bool MusicFeatureAnalyzer::analyze(const GenerationRequest &request, MusicAnalysis *analysis,
@@ -277,17 +300,10 @@ bool MusicFeatureAnalyzer::analyze(const GenerationRequest &request, MusicAnalys
         for (int i=0;i<16;++i) segment.fingerprint[i]/=qMax(1e-12,std::sqrt(fluxNorm));
         for (int i=16;i<19;++i) segment.fingerprint[i]=segment.fingerprint[i]/qMax(1e-12,std::sqrt(bandNorm))*.5;
         segment.fingerprint[19]=segment.energy*.25;
-        segment.repeatGroup = QStringLiteral("r%1").arg(analysis->segments.size());
-        for (const auto &prior : analysis->segments) {
-            if (std::abs((prior.endBeat-prior.startBeat) - (next-cursor)) > 0.5) continue;
-            const double score = similarity(segment.fingerprint, prior.fingerprint);
-            if (score >= 0.94 && std::abs(segment.energy-prior.energy) <= 0.2) {
-                segment.repeatGroup = prior.repeatGroup; segment.repeatConfidence = score; break;
-            }
-        }
         analysis->segments.append(segment);
         cursor = next;
     }
+    analysis->identifyRepeats();
     if (hitFrames.isEmpty()) analysis->warnings.append(QStringLiteral("未找到可绑定当前拍格的可靠起音，请检查节拍对齐。"));
     if (progress) progress(100);
     return !stopped();

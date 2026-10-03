@@ -29,9 +29,11 @@ QString DiagnosticLog::directory() const { QMutexLocker lock(&m_mutex); return m
 QString DiagnosticLog::lastError() const { QMutexLocker lock(&m_mutex); return m_error; }
 QJsonObject DiagnosticLog::sanitize(const QString &event, const QJsonObject &fields) const {
     static const QSet<QString> strings{"jobId", "requestId", "connection", "provider", "model", "proxyMode",
-        "host", "stage", "category", "reason", "method", "cliVersion", "build", "code"};
+        "host", "stage", "category", "reason", "method", "cliVersion", "build", "code", "decision"};
     static const QSet<QString> numbers{"port", "elapsedMs", "timeoutMs", "httpStatus", "rpcCode", "nativeCode",
-        "exitCode", "segment", "segments", "percent", "objects", "repairs", "inputTokens", "outputTokens", "maxOutputTokens"};
+        "exitCode", "segment", "segments", "percent", "objects", "repairs", "inputTokens", "outputTokens", "maxOutputTokens",
+        "referenceSegment", "repeatConfidence", "referenceNotes", "currentNotes", "matchedActions", "actionDifference",
+        "rhythmCoverage", "positionDifference", "countDifference", "targetVariation"};
     QJsonObject row{{"time", QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)},
                     {"version", AppInfo::version()},
                     {"build", QString::fromLatin1(__DATE__).replace(' ', '-')+'/'+QString::fromLatin1(__TIME__)}};

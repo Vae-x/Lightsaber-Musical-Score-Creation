@@ -322,7 +322,9 @@ void AiRecognitionPage::setGenerationService(AiGenerationService *service, AiGen
                 }
                 if (!draft.warnings.isEmpty()) output += QStringLiteral("\n\n") + draft.warnings.join(QStringLiteral("\n"));
                 m_result->setPlainText(output.isEmpty() ? tr("分析完成，未返回可展示的建议。") : output);
-                setStatus(draft.source.analysisOnly ? tr("分析完成，曲谱未改变。") : tr("候选谱已生成，请试听预览后应用。"), "success");
+                setStatus(draft.source.analysisOnly ? tr("分析完成，曲谱未改变。")
+                    : draft.hasThemeWarnings ? tr("候选谱已生成，部分乐句建议试听") : tr("候选谱已生成，请试听预览后应用。"),
+                    draft.hasThemeWarnings ? "warning" : "success");
                 refreshControls();
                 if (!draft.source.analysisOnly) emit generationDraftReady(draft);
             }));

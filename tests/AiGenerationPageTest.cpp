@@ -30,11 +30,13 @@ public:
     void cancel(const QString &jobId) override { cancelledJobs.append(jobId); current.state=Status::Paused; current.resumable=true; emit cancelled(jobId); }
     void discard(const QString &jobId) override { cancelledJobs.append(jobId); current={}; }
     void resume(const QString &jobId) override { resumedJobs.append(jobId); current.state=Status::Running; current.resumable=false; emit progress(jobId,50,QStringLiteral("继续乐句")); }
-    void finish(const lmsc::GenerationRequest &source, const QString &summary = QStringLiteral("测试规划")) {
+    void finish(const lmsc::GenerationRequest &source, const QString &summary = QStringLiteral("测试规划"), bool themeWarning = false) {
         current.state=Status::Completed; current.resumable=false;
         lmsc::GenerationDraft draft;
         draft.source = source;
         draft.summary = summary;
+        draft.hasThemeWarnings=themeWarning;
+        if (themeWarning) draft.warnings.append(QStringLiteral("乐句 7（48.0–56.0 秒）动作主题差异 0.25，目标 0.10；建议试听。"));
         if (!source.analysisOnly) {
             lmsc::BeatObject note;
             note.beat = 2.0; note.x = 0; note.y = 1; note.direction = 1;
@@ -60,6 +62,7 @@ private slots:
     void previewHasReadOnlyTimelineAndExplicitApplication();
     void busyAndNavigationPreserveProgressAndReusableDraft();
     void pausedJobCanResumeWithoutStartingOver();
+    void themeWarningsSurviveNavigationAndPreview();
 private:
     lmsc::GenerationRequest context() const;
     void setup(lmsc::AiRecognitionPage &page, FakeGenerationService &service, bool newSong = true);
@@ -414,6 +417,34 @@ void AiGenerationPageTest::pausedJobCanResumeWithoutStartingOver() {
     }
     resume->click(); QCOMPARE(service.resumedJobs,QStringList{source.jobId}); QCOMPARE(service.requests.size(),1);
     QVERIFY(page.isRecognizing()); service.finish(source); QVERIFY(!page.isRecognizing());
+}
+void AiGenerationPageTest::themeWarningsSurviveNavigationAndPreview() {
+    FakeGenerationService service; lmsc::AiRecognitionPage page; setup(page,service);
+    page.findChild<QPushButton *>("aiGenerateButton")->click(); const auto source=service.requests.last();
+    page.hide(); service.finish(source,QStringLiteral("测试规划"),true);
+    page.show(); page.setGenerationContext(context(),true,false);
+    auto status=page.findChild<QLabel *>("aiRecognitionStatus");
+    QCOMPARE(status->text(),QStringLiteral("候选谱已生成，部分乐句建议试听"));
+    QCOMPARE(status->property("role").toString(),QString("warning"));
+    QVERIFY(page.findChild<QPlainTextEdit *>("aiRecognitionResult")->toPlainText().contains(QStringLiteral("乐句 7")));
+    QSignalSpy drafts(&page,&lmsc::AiRecognitionPage::generationDraftReady);
+    page.findChild<QPushButton *>("aiViewCandidate")->click(); QCOMPARE(drafts.count(),1);
+    const auto draft=qvariant_cast<lmsc::GenerationDraft>(drafts.first().first()); QVERIFY(draft.hasThemeWarnings);
+    QPointer<lmsc::GenerationPreviewDialog> preview=new lmsc::GenerationPreviewDialog(draft,0,nullptr);
+    preview->show(); auto warnings=preview->findChild<QLabel *>("generationPreviewWarnings");
+    QVERIFY(warnings && warnings->text().contains(QStringLiteral("乐句 7")));
+    const QString captures=qEnvironmentVariable("LMSC_AI_THEME_CAPTURE_DIRECTORY");
+    if (!captures.isEmpty()) {
+        QVERIFY(QDir().mkpath(captures)); const QString original=lmsc::ThemeManager::mode();
+        page.resize(1050,660); preview->resize(1080,760);
+        for (const QString mode : {QString("dark"),QString("light")}) {
+            lmsc::ThemeManager::apply(mode); QTest::qWait(80);
+            QVERIFY(page.grab().save(QDir(captures).filePath("ai-theme-warning-"+mode+".png")));
+            QVERIFY(preview->grab().save(QDir(captures).filePath("ai-preview-warning-"+mode+".png")));
+        }
+        lmsc::ThemeManager::apply(original);
+    }
+    preview->close(); QTRY_VERIFY(preview.isNull());
 }
 QTEST_MAIN(AiGenerationPageTest)
 #include "AiGenerationPageTest.moc"

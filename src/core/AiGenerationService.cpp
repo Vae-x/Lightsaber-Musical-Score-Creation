@@ -123,7 +123,8 @@ DifficultyProfile DifficultyProfile::forName(const QString &name) {
 
 struct LlmAiGenerationService::Impl {
     struct WorkerResult { MusicAnalysis analysis; QString error; bool success=false; std::atomic<int> percent{0}; };
-    struct Motif { QVector<BeatObject> objects; double startBeat=0; };
+    struct Motif { QVector<BeatObject> objects; double startBeat=0; int segment=0; };
+    struct Candidate { bool valid=false; QJsonObject json; MotifComparison comparison; };
     LlmAiGenerationService *owner;
     QPointer<AiTextTransport> transport;
     QMap<QThread *, std::shared_ptr<WorkerResult>> workers;
@@ -142,6 +143,9 @@ struct LlmAiGenerationService::Impl {
     bool analysisReady=false, lastRetryable=true;
     QString connectionKey;
     QStringList pendingErrors;
+    Candidate bestCandidate;
+    QJsonObject repairCandidate, qualityFeedback;
+    QStringList themeWarnings;
     AiGenerationService::Status status;
     explicit Impl(LlmAiGenerationService *parent, AiTextTransport *textTransport)
         : owner(parent), transport(textTransport) {
@@ -174,6 +178,7 @@ struct LlmAiGenerationService::Impl {
         if (transport && !pending.isEmpty()) transport->cancel(pending);
         request={}; analysis={}; plan={}; sections.clear(); objects.clear(); motifs.clear();
         analysisReady=false; status={}; pendingErrors.clear();
+        bestCandidate={}; repairCandidate={}; qualityFeedback={}; themeWarnings.clear();
         if (announce && wasActive) emit owner->cancelled(job);
     }
     void publish(int percent, const QString &stage) {
@@ -288,7 +293,8 @@ struct LlmAiGenerationService::Impl {
             if (motifs.contains(motifKey)) {
                 const auto &reference=motifs[motifKey];
                 input.insert("motifReference", BeatmapPlayabilityValidator::motifReference(reference.objects, reference.startBeat));
-                input.insert("instructions", QStringLiteral("沿用reference相对节奏、手、位置和方向，仅在plan.variation额度内变化；锚点必须使用当前段ID，不复制旧ID。"));
+                input.insert("motifReferenceSegment", reference.segment+1);
+                input.insert("instructions", QStringLiteral("沿用reference的左右手和切向顺序，plan.variation是动作主题变化的质量目标；节奏、数量和安全格位应适应当前音乐及两手衔接。仅用当前段有效锚点，不复制旧ID，不制造起音。优先保证硬性动作与密度约束。"));
             }
             input.insert("remainingHitBudget", qMax(0, static_cast<int>(std::floor(analysis.activeSeconds*request.profile.targetMaxNps))
                 - BeatmapPlayabilityValidator::metrics(objects, request.timeMap, analysis.activeSeconds).directional
@@ -296,6 +302,8 @@ struct LlmAiGenerationService::Impl {
             message.outputSchema=segmentSchema(request, analysis, index, motif);
         }
         if (!errors.isEmpty()) input.insert("validationErrors", QJsonArray::fromStringList(errors));
+        if (!planning && !errors.isEmpty() && !repairCandidate.isEmpty()) input.insert("previousCandidate", repairCandidate);
+        if (!planning && !errors.isEmpty() && !qualityFeedback.isEmpty()) input.insert("qualityFeedback", qualityFeedback);
         message.userPrompt=QString::fromUtf8(QJsonDocument(input).toJson(QJsonDocument::Compact));
         pendingId=message.requestId;
         lastRetryable=true;
@@ -304,7 +312,7 @@ struct LlmAiGenerationService::Impl {
             if (active && generation==epoch && pendingId==message.requestId && transport) transport->complete(message);
         });
     }
-    void logValidation(const QStringList &errors, const QString &stage) {
+    void logValidation(const QStringList &errors, const QString &stage, const QString &category="validation") {
         QSet<QString> reasons;
         for (const auto &error : errors) {
             QString reason="constraint";
@@ -319,14 +327,15 @@ struct LlmAiGenerationService::Impl {
             reasons.insert(reason);
         }
         for (const auto &reason : reasons) DiagnosticLog::instance().record("generation.validationFailed",
-            {{"jobId",request.jobId},{"stage",stage},{"category","validation"},{"reason",reason},
+            {{"jobId",request.jobId},{"stage",stage},{"category",category},{"reason",reason},
              {"segment",index+1},{"repairs",repairs}});
     }
-    void repairOrFail(const QStringList &errors) {
-        logValidation(errors,planning ? QString("plan") : QString("segment"));
+    void repairOrFail(const QStringList &errors, bool quality=false) {
+        logValidation(errors,planning ? QString("plan") : QString("segment"),quality ? "quality" : "validation");
         int &attempt=planning ? planRepairs : segmentRepairs;
         const int limit=planning ? 1 : 2;
         if (attempt>=limit || repairs>=maximumRepairs) {
+            if (!planning && acceptBestCandidate()) return;
             fail(QStringLiteral("%1校验未通过，已达到有限返修上限，未补规则谱：\n%2")
                  .arg(planning ? QStringLiteral("整曲规划") : QStringLiteral("乐句 %1").arg(index+1), errors.join('\n')));
             return;
@@ -335,6 +344,45 @@ struct LlmAiGenerationService::Impl {
         publish(planning ? 18 : 20+index*75/qMax(1,analysis.segments.size()),
                              QStringLiteral("AI 正在定向返修%1").arg(planning ? QStringLiteral("规划") : QStringLiteral("乐句 %1").arg(index+1)));
         send(errors);
+    }
+    void logQuality(const MotifComparison &comparison, const QString &decision) {
+        const auto &segment=analysis.segments[index];
+        const QString key=sections[index].value("motifId").toString()+QLatin1Char(':')+segment.repeatGroup;
+        DiagnosticLog::instance().record("generation.motifQuality", {{"jobId",request.jobId},
+            {"segment",index+1},{"referenceSegment",motifs.contains(key) ? motifs[key].segment+1 : 0},
+            {"repeatConfidence",segment.repeatConfidence},{"referenceNotes",comparison.referenceNotes},
+            {"currentNotes",comparison.currentNotes},{"matchedActions",comparison.matchedActions},
+            {"actionDifference",comparison.actionDifference},{"rhythmCoverage",comparison.rhythmCoverage},
+            {"positionDifference",comparison.positionDifference},{"countDifference",comparison.countDifference},
+            {"targetVariation",sections[index].value("variation")},{"repairs",repairs},{"decision",decision}});
+    }
+    void acceptSegment(const QVector<BeatObject> &fresh, const MotifComparison &comparison, bool warning) {
+        const auto &segment=analysis.segments[index];
+        const QString key=sections[index].value("motifId").toString()+QLatin1Char(':')+segment.repeatGroup;
+        if (!motifs.contains(key)) for (const auto &object : fresh) {
+            if (object.kind == ObjectKind::Note) { motifs.insert(key,{fresh,segment.startBeat,index}); break; }
+        }
+        if (warning) themeWarnings.append(QStringLiteral("乐句 %1（%2–%3 秒）动作主题差异 %4，目标 %5；已保留通过动作校验的最佳候选，建议试听。")
+            .arg(index+1).arg(segment.startSeconds,0,'f',1).arg(segment.endSeconds,0,'f',1)
+            .arg(comparison.actionDifference,0,'f',2).arg(sections[index].value("variation").toDouble(),0,'f',2));
+        objects+=fresh; ++index; segmentRepairs=0;
+        bestCandidate={}; repairCandidate={}; qualityFeedback={}; pendingErrors.clear();
+    }
+    bool acceptBestCandidate() {
+        if (!bestCandidate.valid) return false;
+        QVector<BeatObject> fresh; QStringList errors;
+        const QString motif=sections[index].value("motifId").toString();
+        if (!BeatmapPlayabilityValidator::parseAndValidate(bestCandidate.json,request,analysis,index,motif,objects,&fresh,&errors)
+                || (sections[index].value("intent").toString()=="rest" && !fresh.isEmpty())) return false;
+        const auto comparison=bestCandidate.comparison;
+        logQuality(comparison,"acceptedWithWarning");
+        acceptSegment(fresh,comparison,true); advance(); return true;
+    }
+    void advance() {
+        if (index>=analysis.segments.size()) { finish(); return; }
+        publish(20+index*75/qMax(1,analysis.segments.size()),
+                             QStringLiteral("AI 正在编排乐句 %1/%2").arg(index+1).arg(analysis.segments.size()));
+        send();
     }
     void finish() {
         if (!active) return;
@@ -347,6 +395,7 @@ struct LlmAiGenerationService::Impl {
         GenerationDraft draft;
         draft.source=request; draft.objects=objects; draft.summary=plan.value("summary").toString();
         draft.warnings=analysis.warnings;
+        draft.warnings+=themeWarnings; draft.hasThemeWarnings=!themeWarnings.isEmpty();
         draft.warnings.append(QStringLiteral("动作校验是桌面近似，实际顺手程度仍需头显游玩确认。"));
         draft.metrics=BeatmapPlayabilityValidator::metrics(objects, request.timeMap, analysis.activeSeconds);
         const QString job=request.jobId;
@@ -371,6 +420,9 @@ struct LlmAiGenerationService::Impl {
             const auto &segment=analysis.segments[index];
             const auto &section=sections[index];
             const QString motif=section.value("motifId").toString();
+            // Bound repair context independently of the parser's response cap.
+            repairCandidate=QJsonDocument(json).toJson(QJsonDocument::Compact).size()<=64*1024 ? json : QJsonObject{};
+            qualityFeedback={};
             QVector<BeatObject> fresh;
             if (!BeatmapPlayabilityValidator::parseAndValidate(json, request, analysis, index, motif, objects, &fresh, &errors)) {
                 repairOrFail(errors); return;
@@ -379,21 +431,26 @@ struct LlmAiGenerationService::Impl {
                 errors.append(QStringLiteral("规划为休息的乐句必须返回空物件。")); repairOrFail(errors); return;
             }
             const QString key=motif+QLatin1Char(':')+segment.repeatGroup;
+            MotifComparison comparison;
             if (motifs.contains(key)) {
                 const auto &reference=motifs[key];
-                const double difference=BeatmapPlayabilityValidator::motifDifference(reference.objects, reference.startBeat, fresh, segment.startBeat);
-                if (difference>section.value("variation").toDouble()+1e-7) {
-                    errors.append(QStringLiteral("重复乐句动作变化比例 %1 超过规划额度，请沿用动作主题。 ").arg(difference,0,'f',2).trimmed());
-                    repairOrFail(errors); return;
+                comparison=BeatmapPlayabilityValidator::compareMotifs(reference.objects, reference.startBeat, fresh, segment.startBeat);
+                if (comparison.comparable && comparison.actionDifference>section.value("variation").toDouble()+1e-7) {
+                    repairCandidate=json; qualityFeedback=comparison.feedback();
+                    qualityFeedback.insert("currentActions",BeatmapPlayabilityValidator::motifReference(fresh,segment.startBeat));
+                    qualityFeedback.insert("targetVariation",section.value("variation"));
+                    if (!bestCandidate.valid || comparison.actionDifference<bestCandidate.comparison.actionDifference-1e-7)
+                        bestCandidate={true,json,comparison};
+                    logQuality(comparison,"repair");
+                    errors.append(QStringLiteral("重复乐句动作变化比例 %1 超过质量目标 %2，请沿用左右手与切向顺序并适应当前起音。")
+                        .arg(comparison.actionDifference,0,'f',2).arg(section.value("variation").toDouble(),0,'f',2));
+                    repairOrFail(errors,true); return;
                 }
-            } else if (!fresh.isEmpty()) motifs.insert(key, {fresh,segment.startBeat});
-            objects+=fresh;
-            ++index; segmentRepairs=0;
+                logQuality(comparison,comparison.comparable ? "accepted" : "skipped");
+            }
+            acceptSegment(fresh,comparison,false);
         }
-        if (index>=analysis.segments.size()) { finish(); return; }
-        publish(20+index*75/qMax(1,analysis.segments.size()),
-                             QStringLiteral("AI 正在编排乐句 %1/%2").arg(index+1).arg(analysis.segments.size()));
-        send();
+        advance();
     }
     void analyzed(const std::shared_ptr<WorkerResult> &result) {
         analysisTimer.stop();

@@ -10,6 +10,22 @@
 class DiagnosticLogTest : public QObject {
     Q_OBJECT
 private slots:
+    void motifQualityFieldsSurviveExportWithoutCandidateText() {
+        QTemporaryDir directory; lmsc::DiagnosticLog log(directory.path());
+        log.record("generation.motifQuality",{{"jobId","quality-job"},{"segment",7},{"referenceSegment",2},
+            {"referenceNotes",14},{"currentNotes",8},{"matchedActions",8},{"actionDifference",0.0},
+            {"rhythmCoverage",8.0/14},{"positionDifference",0.25},{"countDifference",6.0/14},
+            {"repeatConfidence",0.96},{"targetVariation",0.1},{"decision","acceptedWithWarning"},
+            {"previousCandidate","private-candidate"},{"qualityFeedback","private-feedback"},{"prompt","private-prompt"}});
+        const auto content=log.read("quality-job"); const auto row=QJsonDocument::fromJson(content.trimmed()).object();
+        QCOMPARE(row.value("segment").toInt(),7); QCOMPARE(row.value("referenceSegment").toInt(),2);
+        QCOMPARE(row.value("referenceNotes").toInt(),14); QCOMPARE(row.value("currentNotes").toInt(),8);
+        QCOMPARE(row.value("matchedActions").toInt(),8); QCOMPARE(row.value("decision").toString(),QString("acceptedWithWarning"));
+        QCOMPARE(row.value("targetVariation").toDouble(),0.1); QCOMPARE(row.value("repeatConfidence").toDouble(),0.96);
+        QCOMPARE(row.value("rhythmCoverage").toDouble(),8.0/14); QCOMPARE(row.value("countDifference").toDouble(),6.0/14);
+        QCOMPARE(row.value("actionDifference").toDouble(),0.0); QCOMPARE(row.value("positionDifference").toDouble(),0.25);
+        QVERIFY(!content.contains("private"));
+    }
     void controlledFieldsAndFiltering() {
         QTemporaryDir directory; lmsc::DiagnosticLog log(directory.path());
         log.addSecret("real-test-api-key");

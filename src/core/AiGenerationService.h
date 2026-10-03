@@ -36,6 +36,7 @@ struct GenerationDraft {
     QVector<BeatObject> objects;
     QString summary;
     QStringList warnings;
+    bool hasThemeWarnings = false;
     GenerationMetrics metrics;
 };
 class AiGenerationService : public QObject {

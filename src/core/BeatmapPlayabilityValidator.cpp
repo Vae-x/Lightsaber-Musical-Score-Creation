@@ -45,14 +45,19 @@ double pointToCut(const QPointF &point, const BeatObject &note) {
     const QPointF vector = cutVector(note.direction) * 0.35;
     return pointToSegment(point, centre(note)-vector, centre(note)+vector);
 }
-QString objectKey(const BeatObject &object, double startBeat) {
-    return QStringLiteral("%1:%2:%3:%4:%5:%6:%7:%8")
-            .arg(qRound64((object.beat-startBeat)*1000)).arg(static_cast<int>(object.kind))
-            .arg(object.x).arg(object.y).arg(object.color).arg(object.direction)
-            .arg(object.kind == ObjectKind::Wall ? qRound64(object.duration*1000) : 0)
-            .arg(object.kind == ObjectKind::Wall ? object.width : 0);
-}
 void addError(QStringList *errors, const QString &error) { if (errors && errors->size() < 20) errors->append(error); }
+QVector<BeatObject> orderedNotes(const QVector<BeatObject> &source) {
+    QVector<BeatObject> result;
+    for (const auto &object : source) if (object.kind == ObjectKind::Note) result.append(object);
+    std::sort(result.begin(), result.end(), [](const BeatObject &a, const BeatObject &b) {
+        if (a.beat != b.beat) return a.beat < b.beat;
+        if (a.color != b.color) return a.color < b.color;
+        if (a.direction != b.direction) return a.direction < b.direction;
+        if (a.x != b.x) return a.x < b.x;
+        return a.y < b.y;
+    });
+    return result;
+}
 }
 
 GenerationMetrics BeatmapPlayabilityValidator::metrics(const QVector<BeatObject> &objects,
@@ -303,7 +308,7 @@ QJsonObject BeatmapPlayabilityValidator::handContext(const QVector<BeatObject> &
 
 QJsonArray BeatmapPlayabilityValidator::motifReference(const QVector<BeatObject> &objects, double startBeat) {
     QJsonArray result;
-    for (const auto &object : objects) {
+    for (const auto &object : orderedNotes(objects)) {
         // Hazards have independent spacing/safety requirements. The recurring
         // two-hand movement theme describes hits, not a repeated obstacle quota.
         if (object.kind != ObjectKind::Note) continue;
@@ -314,22 +319,52 @@ QJsonArray BeatmapPlayabilityValidator::motifReference(const QVector<BeatObject>
     return result;
 }
 
-double BeatmapPlayabilityValidator::motifDifference(const QVector<BeatObject> &reference, double referenceStart,
-                                                   const QVector<BeatObject> &objects, double startBeat) {
-    QMap<QString, int> counts;
-    int referenceCount = 0, currentCount = 0;
-    for (const auto &object : reference) if (object.kind == ObjectKind::Note) {
-        ++counts[objectKey(object, referenceStart)]; ++referenceCount;
+QJsonObject MotifComparison::feedback() const {
+    return {{"comparable", comparable}, {"referenceNotes", referenceNotes}, {"currentNotes", currentNotes},
+            {"matchedActions", matchedActions}, {"actionDifference", actionDifference},
+            {"rhythmCoverage", rhythmCoverage}, {"positionDifference", positionDifference},
+            {"countDifference", countDifference}, {"differences", differences}};
+}
+
+MotifComparison BeatmapPlayabilityValidator::compareMotifs(const QVector<BeatObject> &reference, double referenceStart,
+                                                           const QVector<BeatObject> &objects, double startBeat) {
+    const auto prior = orderedNotes(reference), current = orderedNotes(objects);
+    MotifComparison result;
+    result.referenceNotes = prior.size(); result.currentNotes = current.size();
+    result.countDifference = qMax(prior.size(), current.size())
+        ? std::abs(prior.size()-current.size())/double(qMax(prior.size(), current.size())) : 0;
+    if (prior.isEmpty() || current.isEmpty()) return result;
+    result.comparable = true;
+    // Theme is the ordered hand/cut sequence. Timing and safe grid movement
+    // are musical adaptations, measured separately from the action sequence.
+    auto sameAction = [](const BeatObject &a, const BeatObject &b) {
+        return a.color == b.color && a.direction == b.direction;
+    };
+    QVector<QVector<int>> lcs(prior.size()+1, QVector<int>(current.size()+1));
+    for (int i=prior.size()-1; i>=0; --i)
+        for (int j=current.size()-1; j>=0; --j)
+            lcs[i][j] = sameAction(prior[i], current[j]) ? 1+lcs[i+1][j+1] : qMax(lcs[i+1][j], lcs[i][j+1]);
+    result.matchedActions = lcs[0][0];
+    result.actionDifference = 1-result.matchedActions/double(qMin(prior.size(), current.size()));
+    int moved=0, i=0, j=0;
+    while (i<prior.size() || j<current.size()) {
+        if (i<prior.size() && j<current.size() && sameAction(prior[i], current[j])) {
+            if (prior[i].x!=current[j].x || prior[i].y!=current[j].y) {
+                ++moved;
+                result.differences.append(QJsonObject{{"kind","position"},{"referenceIndex",i},{"currentIndex",j}});
+            }
+            ++i; ++j;
+        } else if (i<prior.size() && (j==current.size() || lcs[i+1][j]>=lcs[i][j+1])) {
+            result.differences.append(QJsonObject{{"kind","referenceAction"},{"referenceIndex",i++}});
+        } else result.differences.append(QJsonObject{{"kind","currentAction"},{"currentIndex",j++}});
     }
-    int matched = 0;
-    for (const auto &object : objects) {
-        if (object.kind != ObjectKind::Note) continue;
-        ++currentCount;
-        const QString key = objectKey(object, startBeat);
-        if (counts.value(key) > 0) { ++matched; --counts[key]; }
-    }
-    const int size = qMax(referenceCount, currentCount);
-    return size ? (size-matched)/double(size) : 0.0;
+    result.positionDifference = result.matchedActions ? moved/double(result.matchedActions) : 0;
+    QSet<qint64> beats;
+    for (const auto &note : current) beats.insert(qRound64((note.beat-startBeat)*1000));
+    int covered=0;
+    for (const auto &note : prior) if (beats.contains(qRound64((note.beat-referenceStart)*1000))) ++covered;
+    result.rhythmCoverage = covered/double(prior.size());
+    return result;
 }
 
 } // namespace lmsc

@@ -83,6 +83,20 @@ QJsonObject validSegment(const QJsonObject &input) {
             {"motifId",input.value("plan").toObject().value("motifId")},{"objects",objects}};
 }
 
+QJsonObject fourNoteSegment(const QJsonObject &input) {
+    auto response=validSegment(input); QJsonArray notes;
+    for (const auto &value : input.value("music").toObject().value("anchors").toArray()) {
+        const auto anchor=value.toObject();
+        if (anchor.value("kind").toString()!="hit") continue;
+        const double relative=anchor.value("beat").toDouble()-input.value("music").toObject().value("startBeat").toDouble();
+        if (relative<2-1e-6) continue;
+        notes.append(QJsonObject{{"kind","directional"},{"anchorId",anchor.value("id")},
+            {"hand","left"},{"x",1},{"y",1},{"direction",1}});
+        if (notes.size()==4) break;
+    }
+    response.insert("objects",notes); return response;
+}
+
 class FakeTransport final : public lmsc::AiTextTransport {
 public:
     using AiTextTransport::AiTextTransport;
@@ -126,7 +140,15 @@ private slots:
     void bombsAvoidShortHandConnectionsButAllowLongRests();
     void repeatedMotifAndHandContextAreSupplied();
     void changedRepeatedMotifIsRepaired();
+    void motifComparisonSeparatesMusicalAdaptations();
+    void repeatsUseFixedBestRepresentatives();
+    void seventhOf21SegmentsKeepsBestSafeCandidate_data();
+    void seventhOf21SegmentsKeepsBestSafeCandidate();
+    void qualityRepairsRespectWholeTaskBudget();
+    void qualityCandidateSurvivesNetworkPause();
+    void hazardOnlySegmentDoesNotBecomeActionReference();
     void planJsonIsRepairedOnce();
+    void segmentRepairIsBoundedWithoutFallback_data();
     void segmentRepairIsBoundedWithoutFallback();
     void cancellationAndStaleResponses();
     void destroyedTransportAndServiceAreSafe();
@@ -138,7 +160,7 @@ private slots:
     void completedAndCancelledTasksReleaseAudioLease();
 private:
     QTemporaryDir temporary;
-    QString shortPcm,longPcm;
+    QString shortPcm,longPcm,twentyOnePcm;
     lmsc::GenerationRequest request(double duration=24.0) const;
 };
 
@@ -147,7 +169,7 @@ lmsc::GenerationRequest AiGenerationTest::request(double duration) const {
     result.jobId="job-1"; result.documentId="new-song"; result.documentRevision=1; result.audioRevision=1;
     result.difficultyId="difficulty-1";
     result.profile=lmsc::DifficultyProfile::forName("Expert");
-    result.audio.path=duration>30 ? longPcm : shortPcm;
+    result.audio.path=duration==168 ? twentyOnePcm : duration>30 ? longPcm : shortPcm;
     result.audio.sourcePath="test-only-local-song.ogg";
     result.audio.revision=1; result.audio.sampleRate=2000; result.audio.channels=2; result.audio.durationSeconds=duration;
     result.timeMap.configure(120,0);
@@ -157,6 +179,7 @@ void AiGenerationTest::initTestCase() {
     QVERIFY(temporary.isValid());
     shortPcm=temporary.filePath("short.pcm"); longPcm=temporary.filePath("long.pcm");
     QVERIFY(makePcm(shortPcm,24)); QVERIFY(makePcm(longPcm,188));
+    twentyOnePcm=temporary.filePath("21-segments.pcm"); QVERIFY(makePcm(twentyOnePcm,168));
     qRegisterMetaType<lmsc::GenerationDraft>(); qRegisterMetaType<lmsc::AiTextResult>();
 }
 void AiGenerationTest::fiveConservativeProfiles() {
@@ -380,6 +403,166 @@ void AiGenerationTest::changedRepeatedMotifIsRepaired() {
     QVERIFY2(failed.isEmpty(),failed.isEmpty() ? "" : qPrintable(failed.first().at(1).toString()));
     QVERIFY(changed); QVERIFY(repaired);
 }
+void AiGenerationTest::motifComparisonSeparatesMusicalAdaptations() {
+    QVector<lmsc::BeatObject> reference;
+    for (int i=0;i<14;++i) {
+        lmsc::BeatObject note; note.beat=i; note.color=i%2; note.x=note.color ? 2 : 1;
+        note.y=1; note.direction=(i/2)%2; reference.append(note);
+    }
+    auto shifted=reference;
+    for (auto &note:shifted) note.beat+=33;
+    auto comparison=lmsc::BeatmapPlayabilityValidator::compareMotifs(reference,0,shifted,32);
+    QVERIFY(comparison.comparable); QCOMPARE(comparison.actionDifference,0.0);
+    QVERIFY(comparison.rhythmCoverage<1); QCOMPARE(comparison.positionDifference,0.0);
+    const auto reduced=reference.mid(0,8);
+    comparison=lmsc::BeatmapPlayabilityValidator::compareMotifs(reference,0,reduced,0);
+    QCOMPARE(comparison.actionDifference,0.0); QCOMPARE(comparison.referenceNotes,14); QCOMPARE(comparison.currentNotes,8);
+    QVERIFY(std::abs(comparison.countDifference-6.0/14)<1e-9);
+    auto moved=reference;
+    for (int i=0;i<6;++i) moved[i].x=moved[i].color ? 3 : 0;
+    comparison=lmsc::BeatmapPlayabilityValidator::compareMotifs(reference,0,moved,0);
+    QCOMPARE(comparison.actionDifference,0.0); QCOMPARE(comparison.rhythmCoverage,1.0);
+    QVERIFY(std::abs(comparison.positionDifference-6.0/14)<1e-9);
+    auto changed=reference;
+    for (auto &note:changed) note.direction=2;
+    comparison=lmsc::BeatmapPlayabilityValidator::compareMotifs(reference,0,changed,0);
+    QCOMPARE(comparison.actionDifference,1.0); QVERIFY(!comparison.differences.isEmpty());
+    changed=reference; for (auto &note:changed) note.color=1-note.color;
+    QVERIFY(lmsc::BeatmapPlayabilityValidator::compareMotifs(reference,0,changed,0).actionDifference>0);
+    // JSON order of simultaneous hands must not alter the theme.
+    auto a=reference[0],b=reference[1]; b.beat=a.beat;
+    QCOMPARE(lmsc::BeatmapPlayabilityValidator::compareMotifs({a,b},0,{b,a},0).actionDifference,0.0);
+    b.direction=3;
+    QCOMPARE(lmsc::BeatmapPlayabilityValidator::compareMotifs({a},0,{b},0).actionDifference,1.0);
+    QVERIFY(!lmsc::BeatmapPlayabilityValidator::compareMotifs({},0,reference,0).comparable);
+    a.kind=lmsc::ObjectKind::Bomb; b.kind=lmsc::ObjectKind::Wall;
+    QVERIFY(!lmsc::BeatmapPlayabilityValidator::compareMotifs({a,b},0,{a},0).comparable);
+}
+void AiGenerationTest::repeatsUseFixedBestRepresentatives() {
+    auto segment=[](double angle) {
+        lmsc::MusicSegment result; result.endBeat=16; result.energy=.5;
+        result.fingerprint={std::cos(angle*pi/180),std::sin(angle*pi/180)}; return result;
+    };
+    lmsc::MusicAnalysis analysis; analysis.segments={segment(0),segment(18),segment(36)};
+    analysis.identifyRepeats();
+    QCOMPARE(analysis.segments[1].repeatReference,0);
+    QCOMPARE(analysis.segments[2].repeatReference,-1); // Close to B, but not the fixed A reference.
+    analysis.segments={segment(0),segment(30),segment(17)}; analysis.identifyRepeats();
+    QCOMPARE(analysis.segments[2].repeatReference,1); // The best eligible group, not the first.
+    QCOMPARE(analysis.segmentEvidence(2).value("repeatReferenceSegment").toInt(),2);
+    QCOMPARE(analysis.segmentEvidence(2).value("repeatConfidence").toDouble(),analysis.segments[2].repeatConfidence);
+    analysis.segments[2].energy=1; analysis.identifyRepeats(); QCOMPARE(analysis.segments[2].repeatReference,-1);
+    analysis.segments[2]=segment(17); analysis.segments[2].endBeat=15; analysis.identifyRepeats();
+    QCOMPARE(analysis.segments[2].repeatReference,-1);
+}
+void AiGenerationTest::seventhOf21SegmentsKeepsBestSafeCandidate_data() {
+    QTest::addColumn<bool>("worse"); QTest::addColumn<bool>("invalidJson");
+    QTest::newRow("worse-then-invalid-anchor") << true << false;
+    QTest::newRow("tie-then-invalid-json") << false << true;
+}
+void AiGenerationTest::seventhOf21SegmentsKeepsBestSafeCandidate() {
+    QFETCH(bool,worse); QFETCH(bool,invalidJson);
+    FakeTransport transport; int seventhCalls=0; bool feedback=false,referenceSupplied=true;
+    transport.responder=[&](const lmsc::AiTextRequest &,const QJsonObject &input) {
+        auto response=input.value("stage").toString()=="plan" ? validPlan(input) : fourNoteSegment(input);
+        if (input.value("music").toObject().value("segmentId").toString()=="s6") {
+            ++seventhCalls;
+            referenceSupplied &= input.contains("motifReference");
+            auto rows=response.value("objects").toArray();
+            if (seventhCalls==1) { auto row=rows[0].toObject(); row["direction"]=0; row["x"]=0; rows[0]=row; }
+            else if (seventhCalls==2) {
+                feedback=input.contains("previousCandidate") && input.value("qualityFeedback").toObject().value("differences").isArray();
+                for (int i=0;i<(worse ? rows.size() : 1);++i) { auto row=rows[i].toObject(); row["direction"]=0; rows[i]=row; }
+            } else {
+                if (invalidJson) return QStringLiteral("invalid JSON");
+                auto row=rows[0].toObject(); row["anchorId"]="hallucinated"; rows[0]=row;
+            }
+            response["objects"]=rows;
+        }
+        return QString::fromUtf8(QJsonDocument(response).toJson(QJsonDocument::Compact));
+    };
+    lmsc::LlmAiGenerationService service(&transport); QSignalSpy ready(&service,&lmsc::AiGenerationService::draftReady),failed(&service,&lmsc::AiGenerationService::requestFailed);
+    auto source=request(168); source.profile=lmsc::DifficultyProfile::forName("Easy");
+    service.generate(source); QTRY_VERIFY(ready.count() || failed.count());
+    QVERIFY2(failed.isEmpty(),failed.isEmpty()? "" : qPrintable(failed.first().at(1).toString()));
+    QCOMPARE(service.status().totalSegments,21); QCOMPARE(service.status().completedSegments,21);
+    QCOMPARE(seventhCalls,3); QVERIFY(feedback); QVERIFY(referenceSupplied);
+    const auto draft=qvariant_cast<lmsc::GenerationDraft>(ready.first().first());
+    QVERIFY(draft.hasThemeWarnings); QVERIFY(draft.warnings.join(' ').contains(QStringLiteral("乐句 7")));
+    QCOMPARE(draft.objects.size(),84);
+    for (int i=0;i<24;++i) { QCOMPARE(draft.objects[i].direction,1); QCOMPARE(draft.objects[i].x,1); }
+    QCOMPARE(draft.objects[24].direction,0); QCOMPARE(draft.objects[24].x,0);
+    QCOMPARE(draft.objects[25].direction,1); QCOMPARE(service.status().percent,100);
+}
+void AiGenerationTest::qualityRepairsRespectWholeTaskBudget() {
+    FakeTransport transport; int repeatCalls=0;
+    transport.responder=[&](const lmsc::AiTextRequest &,const QJsonObject &input) {
+        auto response=input.value("stage").toString()=="plan" ? validPlan(input) : fourNoteSegment(input);
+        if (input.contains("motifReference")) {
+            ++repeatCalls; auto rows=response.value("objects").toArray(); auto row=rows[0].toObject(); row["direction"]=0; rows[0]=row; response["objects"]=rows;
+        }
+        return QString::fromUtf8(QJsonDocument(response).toJson(QJsonDocument::Compact));
+    };
+    lmsc::LlmAiGenerationService service(&transport); QSignalSpy ready(&service,&lmsc::AiGenerationService::draftReady);
+    auto source=request(168); source.profile=lmsc::DifficultyProfile::forName("Easy"); service.generate(source); QTRY_COMPARE(ready.count(),1);
+    QCOMPARE(transport.requests.size(),32); // One plan + 21 segments + the task's ten repairs.
+    QVERIFY(repeatCalls>10); QVERIFY(qvariant_cast<lmsc::GenerationDraft>(ready.first().first()).hasThemeWarnings);
+}
+void AiGenerationTest::qualityCandidateSurvivesNetworkPause() {
+    FakeTransport transport; bool injectNetwork=false; int badCalls=0;
+    transport.responder=[&](const lmsc::AiTextRequest &,const QJsonObject &input) {
+        auto response=input.value("stage").toString()=="plan" ? validPlan(input) : fourNoteSegment(input);
+        if (input.contains("motifReference") && input.value("music").toObject().value("segmentId").toString()=="s2") {
+            ++badCalls; auto rows=response.value("objects").toArray(); auto row=rows[0].toObject(); row["direction"]=0; rows[0]=row; response["objects"]=rows;
+            if (badCalls==2) { transport.networkFailure=true; injectNetwork=true; }
+            if (badCalls>=3) { row=rows[0].toObject(); row["anchorId"]="invalid"; rows[0]=row; response["objects"]=rows; }
+        }
+        return QString::fromUtf8(QJsonDocument(response).toJson(QJsonDocument::Compact));
+    };
+    lmsc::LlmAiGenerationService service(&transport); QSignalSpy ready(&service,&lmsc::AiGenerationService::draftReady),failed(&service,&lmsc::AiGenerationService::requestFailed);
+    service.generate(request()); QTRY_COMPARE(failed.count(),1); QVERIFY(injectNetwork); QVERIFY(service.status().resumable);
+    const int pendingIndex=transport.requests.size()-1;
+    const auto pending=transport.requests.last(); const auto input=QJsonDocument::fromJson(pending.userPrompt.toUtf8()).object();
+    QCOMPARE(service.status().completedSegments,2); transport.networkFailure=false; service.resume("job-1");
+    QTRY_COMPARE(ready.count(),1); QCOMPARE(badCalls,4);
+    const auto retryInput=QJsonDocument::fromJson(transport.requests[pendingIndex+1].userPrompt.toUtf8()).object();
+    QCOMPARE(retryInput.value("previousCandidate"),input.value("previousCandidate"));
+    QCOMPARE(retryInput.value("qualityFeedback"),input.value("qualityFeedback"));
+    const auto draft=qvariant_cast<lmsc::GenerationDraft>(ready.first().first()); QVERIFY(draft.hasThemeWarnings);
+    QCOMPARE(draft.objects[8].direction,0); QCOMPARE(draft.objects[0].direction,1);
+}
+void AiGenerationTest::hazardOnlySegmentDoesNotBecomeActionReference() {
+    FakeTransport transport; bool sawHazard=false,sawFollowing=false,hadFalseReference=false;
+    QString hazardGroup,followingGroup;
+    transport.responder=[&](const lmsc::AiTextRequest &,const QJsonObject &input) {
+        auto response=input.value("stage").toString()=="plan" ? validPlan(input) : validSegment(input);
+        if (input.value("stage").toString()=="plan") {
+            auto motifs=response.value("motifs").toArray();
+            motifs.append(QJsonObject{{"id","m2"},{"description","障碍后进入击打主题"}}); response["motifs"]=motifs;
+            auto sections=response.value("sections").toArray();
+            for (int i=1;i<sections.size();++i) { auto row=sections[i].toObject(); row["motifId"]="m2"; sections[i]=row; }
+            response["sections"]=sections;
+        }
+        const auto music=input.value("music").toObject();
+        if (music.value("segmentId").toString()=="s1") {
+            QJsonArray hazards;
+            for (const auto &row : response.value("objects").toArray())
+                if (row.toObject().value("kind").toString()=="bomb") hazards.append(row);
+            sawHazard=!hazards.isEmpty(); response["objects"]=hazards;
+            hazardGroup=music.value("repeatGroup").toString();
+        }
+        if (music.value("segmentId").toString()=="s2") {
+            sawFollowing=true; hadFalseReference=input.contains("motifReference");
+            followingGroup=music.value("repeatGroup").toString();
+        }
+        return QString::fromUtf8(QJsonDocument(response).toJson(QJsonDocument::Compact));
+    };
+    lmsc::LlmAiGenerationService service(&transport); QSignalSpy ready(&service,&lmsc::AiGenerationService::draftReady);
+    auto source=request(); source.allowedTypes=lmsc::DirectionalType|lmsc::BombType; service.generate(source);
+    QTRY_COMPARE(ready.count(),1); QVERIFY(sawHazard && sawFollowing); QCOMPARE(hazardGroup,followingGroup);
+    QVERIFY(!hadFalseReference);
+    QVERIFY(!qvariant_cast<lmsc::GenerationDraft>(ready.first().first()).hasThemeWarnings);
+}
 void AiGenerationTest::planJsonIsRepairedOnce() {
     FakeTransport transport; int calls=0;
     transport.responder=[&](const lmsc::AiTextRequest &,const QJsonObject &input) {
@@ -390,12 +573,20 @@ void AiGenerationTest::planJsonIsRepairedOnce() {
     service.generate(request()); QTRY_COMPARE(ready.count(),1);
     QVERIFY(QJsonDocument::fromJson(transport.requests[1].userPrompt.toUtf8()).object().contains("validationErrors"));
 }
+void AiGenerationTest::segmentRepairIsBoundedWithoutFallback_data() {
+    QTest::addColumn<bool>("wrongSide");
+    QTest::newRow("unknown-anchor") << false;
+    QTest::newRow("unsafe-hand-side") << true;
+}
 void AiGenerationTest::segmentRepairIsBoundedWithoutFallback() {
+    QFETCH(bool,wrongSide);
     FakeTransport transport;
-    transport.responder=[](const lmsc::AiTextRequest &,const QJsonObject &input) {
+    transport.responder=[wrongSide](const lmsc::AiTextRequest &,const QJsonObject &input) {
         QJsonObject response=input.value("stage").toString()=="plan" ? validPlan(input) : validSegment(input);
         if (input.value("stage").toString()=="segment") {
-            auto rows=response.value("objects").toArray(); auto row=rows[0].toObject(); row.insert("anchorId","hallucinated"); rows[0]=row; response.insert("objects",rows);
+            auto rows=response.value("objects").toArray(); auto row=rows[0].toObject();
+            if (wrongSide) row.insert("x",2); else row.insert("anchorId","hallucinated");
+            rows[0]=row; response.insert("objects",rows);
         }
         return QString::fromUtf8(QJsonDocument(response).toJson(QJsonDocument::Compact));
     };
