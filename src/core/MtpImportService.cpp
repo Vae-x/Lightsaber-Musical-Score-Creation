@@ -8,10 +8,36 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcessEnvironment>
+#include <QRegularExpression>
 #include <QUuid>
 #ifdef Q_OS_WIN
 #include <qt_windows.h>
 #endif
+
+namespace {
+bool safeSegment(const QJsonValue &value) {
+    if (!value.isString()) return false;
+    const QString name = value.toString();
+    static const QRegularExpression invalid(QStringLiteral("[<>:\"/\\\\|?*\\x00-\\x1f]"));
+    static const QRegularExpression reserved(QStringLiteral("^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])($|\\.)"), QRegularExpression::CaseInsensitiveOption);
+    return !name.trimmed().isEmpty() && name != "." && name != ".." && !name.endsWith('.')
+        && !name.endsWith(' ') && !invalid.match(name).hasMatch() && !reserved.match(name).hasMatch();
+}
+bool supportedLocator(const QJsonObject &locator) {
+    if (!locator.value("device").isString() || locator.value("device").toString().trimmed().isEmpty()) return false;
+    const auto segments = locator.value("segments").toArray();
+    for (const auto &value : segments) if (!safeSegment(value)) return false;
+    const QVector<QStringList> roots{{"SoulTopia", "BeatNote", "Custom"},
+        {"Android", "data", "com.StarRiverVR.LightBand", "files", "CustomMusic"}};
+    for (const auto &root : roots) {
+        if (segments.size() < root.size() + 2 || segments.size() > root.size() + 21) continue;
+        bool matches = true;
+        for (int i = 0; i < root.size(); ++i) if (segments.at(i + 1).toString() != root.at(i)) matches = false;
+        if (matches) return true;
+    }
+    return false;
+}
+}
 
 MtpImportService::MtpImportService(QObject *parent) : QObject(parent) {
     qRegisterMetaType<MtpSongEntry>();
@@ -81,9 +107,12 @@ bool MtpImportService::isBusy() const { return m_operation != Operation::None; }
 void MtpImportService::listSongs() { start(Operation::List); }
 
 void MtpImportService::importSong(const MtpSongEntry &entry) {
+    if (!entry.isSong) {
+        emit errorOccurred(QStringLiteral("请选择含 Info.dat 的歌曲节点，分类目录不能直接导入。"));
+        return;
+    }
     const QJsonDocument locator = QJsonDocument::fromJson(entry.locator.toUtf8());
-    if (!locator.isObject() || locator.object().value(QStringLiteral("device")).toString().isEmpty()
-            || locator.object().value(QStringLiteral("segments")).toArray().isEmpty()) {
+    if (!locator.isObject() || !supportedLocator(locator.object())) {
         emit errorOccurred(QStringLiteral("歌曲的设备定位信息无效，请重新刷新头显歌曲列表。"));
         return;
     }
@@ -168,7 +197,7 @@ void MtpImportService::readOutput() {
         m_stdout.remove(0, newline + 1);
         consumeLine(line);
     }
-    if (m_stdout.size() > 2 * 1024 * 1024) {
+    if (m_stdout.size() > 32 * 1024 * 1024) {
         m_error = QStringLiteral("设备返回的数据超过限制，已中止读取。");
         m_process.kill();
     }
@@ -196,9 +225,18 @@ void MtpImportService::consumeLine(const QByteArray &line) {
             entry.deviceName = song.value(QStringLiteral("deviceName")).toString();
             entry.location = song.value(QStringLiteral("location")).toString();
             entry.gameName = song.value(QStringLiteral("gameName")).toString();
+            entry.gameId = song.value(QStringLiteral("gameId")).toString();
+            entry.storageName = song.value(QStringLiteral("storageName")).toString();
+            entry.isSong = song.value(QStringLiteral("isSong")).toBool(true);
+            for (const auto &segment : song.value(QStringLiteral("categorySegments")).toArray())
+                entry.categorySegments.append(segment.toString());
             entry.locator = QString::fromUtf8(QJsonDocument(song.value(QStringLiteral("locator")).toObject()).toJson(QJsonDocument::Compact));
             if (entry.name.isEmpty() || entry.locator.isEmpty()) {
                 m_error = QStringLiteral("设备歌曲列表不完整，请刷新后重试。");
+                return;
+            }
+            if (m_songs.size() >= 4100) {
+                m_error = QStringLiteral("设备列表超过限制，无法作为完整扫描结果使用。");
                 return;
             }
             m_songs.append(entry);

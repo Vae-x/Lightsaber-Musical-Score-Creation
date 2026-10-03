@@ -129,6 +129,37 @@ void sameNameDoesNotOverwrite(const QString &root) {
           QStringLiteral("显式工程根不是目录时返回失败，不覆盖文件"));
     check(readFile(blockedRoot) == occupied, QStringLiteral("不可用工程根的原文件保留"));
 }
+
+void songExportNames(const QString &root) {
+    check(QDir().mkpath(root), QStringLiteral("创建歌曲导出测试根"));
+    QString error;
+    const QString first = lmsc::WorkspacePaths::suggestedSongExportFolder(QStringLiteral("诀别书"), root, &error);
+    check(samePath(first, QDir(root).filePath(QStringLiteral("光剑曲谱制作/诀别书-by光剑曲谱"))),
+          QStringLiteral("歌曲导出使用分类目录与指定命名"));
+    check(!QFileInfo::exists(first), QStringLiteral("只建议歌曲路径，保留原子导出创建目标的机会"));
+    const QByteArray sentinel("original export remains intact");
+    check(writeFile(QDir(first).filePath("Info.dat"), sentinel), QStringLiteral("创建已有导出哨兵"));
+    const QString second = lmsc::WorkspacePaths::suggestedSongExportFolder(QStringLiteral("诀别书"), root, &error);
+    check(second == first + "-2" && readFile(QDir(first).filePath("Info.dat")) == sentinel,
+          QStringLiteral("重名使用编号并保留既有导出"));
+    check(writeFile(second, sentinel), QStringLiteral("普通文件占用同名输出"));
+    check(lmsc::WorkspacePaths::suggestedSongExportFolder(QStringLiteral("诀别书"), root, &error) == first + "-3",
+          QStringLiteral("被普通文件占用的名称同样跳过"));
+    for (const QString &title : {QString(), QStringLiteral("CON"), QStringLiteral("../坏\\路径<>:*? ."), QString(200, QChar(0x6b4c))}) {
+        const QString path = lmsc::WorkspacePaths::suggestedSongExportFolder(title, root, &error);
+        const QString filename = QFileInfo(path).fileName();
+        check(!path.isEmpty() && filename.endsWith(QStringLiteral("-by光剑曲谱"))
+              && QFileInfo(path).absolutePath() == QFileInfo(first).absolutePath()
+              && !filename.contains('/') && !filename.contains('\\') && filename.size() <= 89,
+              QStringLiteral("异常歌名安全处理且保留导出后缀"));
+    }
+    const QString blocked = QDir(root).filePath("blocked");
+    check(QDir().mkpath(blocked) && writeFile(QDir(blocked).filePath(QStringLiteral("光剑曲谱制作")), sentinel),
+          QStringLiteral("分类目录被文件占用"));
+    check(lmsc::WorkspacePaths::suggestedSongExportFolder("test", blocked, &error).isEmpty()
+          && !error.isEmpty() && readFile(QDir(blocked).filePath(QStringLiteral("光剑曲谱制作"))) == sentinel,
+          QStringLiteral("分类占用清晰失败且不覆盖"));
+}
 } // namespace
 
 int main(int argc, char **argv) {
@@ -139,6 +170,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     sourceAndPortableLocations(temporary.path());
+    songExportNames(QDir(temporary.path()).filePath("export"));
     safeNamesAndContainment(QDir(temporary.path()).filePath("safe-names"));
     sameNameDoesNotOverwrite(QDir(temporary.path()).filePath("same-name"));
     printLine(stdout, failures ? QStringLiteral("工程路径验证失败：") + QString::number(failures)

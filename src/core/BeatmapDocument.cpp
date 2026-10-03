@@ -69,17 +69,29 @@ QString normalizedManifest(const QString &path) {
     if (QFileInfo(path).isDir() || QFileInfo(path).suffix().isEmpty()) return QDir(path).filePath("project.lmsc");
     return QFileInfo(path).absoluteFilePath();
 }
-bool timingExtension(const QJsonObject &json) {
+QString timingExtension(const QJsonObject &json, const QString &path, bool editorCustomData = false) {
     for (auto it = json.begin(); it != json.end(); ++it) {
         const QString key = it.key().toLower();
+        if (editorCustomData && it.key() == QStringLiteral("bookmarksUseOfficialBpmEvents")) {
+            if (!it.value().isBool())
+                return QStringLiteral("%1.%2 应为布尔类型，实际类型无法可靠解释。")
+                        .arg(path, it.key());
+            continue;
+        }
         if ((key.contains("bpm") || key.contains("timescale") || key.contains("timeoffset") ||
              key.contains("tempo")) && !it.value().isNull()) {
-            if (!it.value().isArray() || !it.value().toArray().isEmpty()) return true;
+            if (!it.value().isArray() || !it.value().toArray().isEmpty())
+                return QStringLiteral("%1.%2 含尚未支持的时间扩展，无法可靠换算秒与拍。")
+                        .arg(path, it.key());
         }
     }
-    return false;
+    return {};
 }
 QJsonObject recognizedEditorTiming(QJsonObject custom, double baseBpm) {
+    // ChroMapper uses this boolean only to choose the BPM source for its editor
+    // bookmarks. It does not retime gameplay objects; keep the original JSON.
+    if (custom.value("bookmarksUseOfficialBpmEvents").isBool())
+        custom.remove("bookmarksUseOfficialBpmEvents");
     // Old MMA editor grid markers do not retime the map when every marker uses
     // the unchanged base BPM. Keep the original JSON, but do not lock this case.
     for (const auto &key : {QStringLiteral("_BPMChanges"), QStringLiteral("_bpmChanges")}) {
@@ -299,15 +311,19 @@ bool BeatmapDocument::Impl::parseTrack(Track *selected, QString *error) {
         selected->time.configure(120, 0);
     }
     const double baseBpm = info.value("_beatsPerMinute").toDouble();
-    if (timingExtension(recognizedEditorTiming(raw.value("_customData").toObject(), baseBpm)) ||
-        timingExtension(recognizedEditorTiming(raw.value("customData").toObject(), baseBpm)) ||
-        !raw.value("_BPMChanges").toArray().isEmpty() || !raw.value("_bpmChanges").toArray().isEmpty() ||
-        !raw.value("bpmChanges").toArray().isEmpty())
-        selected->readOnly = QStringLiteral("谱面含未解释的时间扩展，首版保留原数据并设为只读。" );
     QJsonObject otherTiming = raw;
     if (selected->v3) otherTiming.remove("bpmEvents");
-    if (timingExtension(otherTiming) || timingExtension(recognizedEditorTiming(info.value("_customData").toObject(), baseBpm)))
-        selected->readOnly = QStringLiteral("谱面或歌曲含未解释的时间扩展，首版保留原数据并设为只读。" );
+    QString timingReason;
+    const QString mapPath = selected->descriptor.filename;
+    const auto inspectTiming = [&timingReason](const QJsonObject &json, const QString &path, bool custom = false) {
+        if (timingReason.isEmpty()) timingReason = timingExtension(json, path, custom);
+    };
+    inspectTiming(recognizedEditorTiming(raw.value("_customData").toObject(), baseBpm), mapPath + "._customData", true);
+    inspectTiming(recognizedEditorTiming(raw.value("customData").toObject(), baseBpm), mapPath + ".customData", true);
+    inspectTiming(otherTiming, mapPath);
+    inspectTiming(recognizedEditorTiming(info.value("_customData").toObject(), baseBpm), infoRelative + "._customData", true);
+    if (!timingReason.isEmpty())
+        selected->readOnly = timingReason + QStringLiteral(" 为保护原数据，此难度设为只读；另存工程会原样保留该字段，不会解除保护。");
     if (!raw.value("rotationEvents").toArray().isEmpty())
         selected->readOnly = QStringLiteral("谱面含旋转轨道事件，首版按原样保留并禁止基础编辑。" );
 

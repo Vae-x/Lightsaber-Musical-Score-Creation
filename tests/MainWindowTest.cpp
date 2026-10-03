@@ -5,6 +5,8 @@
 #include "gui/NavigationSidebar.h"
 #include "gui/ThemeManager.h"
 #include "gui/SettingsPanel.h"
+#include "gui/SongImportDialog.h"
+#include "gui/SongExportDialog.h"
 #include "core/AiTextTransport.h"
 #include "core/AppInfo.h"
 #include "core/AppSettings.h"
@@ -44,6 +46,13 @@
 #include <QTimer>
 #include <QToolButton>
 #include <QUrl>
+#include <QTreeWidget>
+#include <QTreeWidgetItemIterator>
+#include <QTabWidget>
+#include <QMimeData>
+#include <QDragEnterEvent>
+#include <QDropEvent>
+#include <QProgressDialog>
 #include <cmath>
 
 class HomepageUrlReceiver : public QObject {
@@ -85,6 +94,11 @@ public:
         QDesktopServices::setUrlHandler(QStringLiteral("https"), receiver, "openUrl");
     }
     ~ScopedHttpsUrlHandler() { QDesktopServices::unsetUrlHandler(QStringLiteral("https")); }
+};
+class ScopedFileUrlHandler {
+public:
+    explicit ScopedFileUrlHandler(QObject *receiver) { QDesktopServices::setUrlHandler(QStringLiteral("file"), receiver, "openUrl"); }
+    ~ScopedFileUrlHandler() { QDesktopServices::unsetUrlHandler(QStringLiteral("file")); }
 };
 
 template<typename T> T *field(QWidget &root, const QString &labelText) {
@@ -146,6 +160,9 @@ private slots:
     void importMp3AndCropThroughDialogs();
     void importDryHands();
     void importHeadsetThroughDialog();
+    void unifiedImportAndExportDialogs();
+    void deviceExportThroughDialog_data();
+    void deviceExportThroughDialog();
     void trackFramebufferUsesLoadedObjects();
     void captureWorkspace();
 private:
@@ -679,12 +696,12 @@ void MainWindowTest::importHeadsetThroughDialog() {
         QTimer::singleShot(0, &window, [&] {
             auto dialog = window.findChild<QDialog *>("songImportDialog");
             if (!dialog) return;
-            auto list = dialog->findChild<QListWidget *>("mtpSongList");
+            auto list = dialog->findChild<QTreeWidget *>("mtpSongTree");
             auto import = dialog->findChild<QPushButton *>("importHeadsetSong");
             if (list && import) {
-                for (int row = 0; row < list->count(); ++row) {
-                    if (!list->item(row)->text().contains("Dry Hands", Qt::CaseInsensitive)) continue;
-                    list->setCurrentRow(row);
+                for (QTreeWidgetItemIterator iterator(list); *iterator; ++iterator) {
+                    if (!(*iterator)->data(0, Qt::UserRole).isValid() || !(*iterator)->text(0).contains("Dry Hands", Qt::CaseInsensitive)) continue;
+                    list->setCurrentItem(*iterator);
                     found = true;
                     dialog->grab().save(QString::fromUtf8(LMSC_AUDIO_FIXTURES_DIR) + "/pico-import.png");
                     import->click();
@@ -700,7 +717,8 @@ void MainWindowTest::importHeadsetThroughDialog() {
         if (auto dialog = window.findChild<QDialog *>("songImportDialog")) dialog->reject();
     });
     timeout.start(60000);
-    auto import = button(window, QStringLiteral("导入歌曲文件夹"));
+    QTimer::singleShot(0, &window, [&] { if (auto dialog = window.findChild<SongImportDialog *>("songImportDialog")) dialog->findChild<QTabWidget *>("songImportTabs")->setCurrentIndex(1); });
+    auto import = button(window, QStringLiteral("导入歌曲"));
     QVERIFY(import);
     import->click();
     timeout.stop();
@@ -711,6 +729,174 @@ void MainWindowTest::importHeadsetThroughDialog() {
     QVERIFY(window.windowTitle().contains("Dry Hands", Qt::CaseInsensitive));
     QVERIFY(objectCount(window) > 0);
     window.grab().save(QString::fromUtf8(LMSC_AUDIO_FIXTURES_DIR) + "/pico-editor.png");
+    window.close();
+}
+
+void MainWindowTest::unifiedImportAndExportDialogs() {
+    MainWindow window(nullptr, settingsFile()); window.setTestMode(true);
+    QAction *importAction = nullptr, *projectAction = nullptr;
+    int importActions = 0;
+    for (auto action : window.findChildren<QAction *>()) {
+        if (action->text() == QStringLiteral("导入歌曲")) { importAction = action; ++importActions; }
+        if (action->text() == QStringLiteral("打开编辑工程")) projectAction = action;
+        QVERIFY(action->text() != QStringLiteral("打开曲谱 ZIP"));
+    }
+    QCOMPARE(importActions, 1); QVERIFY(importAction && projectAction);
+    QCOMPARE(importAction->shortcut(), QKeySequence(QKeySequence::Open));
+    MtpImportService importer;
+    importer.setScriptPath(m_temp.filePath("missing-import.ps1"));
+    SongImportDialog dialog(&importer);
+    dialog.show();
+    auto localButton = dialog.findChild<QPushButton *>("importComputerSong");
+    auto deviceButton = dialog.findChild<QPushButton *>("importHeadsetSong");
+    auto tabs = dialog.findChild<QTabWidget *>("songImportTabs");
+    auto tree = dialog.findChild<QTreeWidget *>("mtpSongTree");
+    QVERIFY(localButton && deviceButton && tabs && tree);
+    dialog.setLocalPath(m_song);
+    QVERIFY(localButton->isEnabled());
+    dialog.setLocalPath(m_temp.path());
+    QVERIFY(!localButton->isEnabled());
+    const QString zip = m_temp.filePath("SyntheticChart.zip");
+    QFile zipFile(zip); QVERIFY(zipFile.open(QIODevice::WriteOnly)); zipFile.write("PK"); zipFile.close();
+    QMimeData mime; mime.setUrls({QUrl::fromLocalFile(zip)});
+    QDragEnterEvent drag(QPoint(12, 12), Qt::CopyAction, &mime, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(&dialog, &drag); QVERIFY(drag.isAccepted());
+    QDropEvent drop(QPointF(12, 12), Qt::CopyAction, &mime, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(&dialog, &drop);
+    QVERIFY(localButton->isEnabled()); QCOMPARE(dialog.findChild<QLineEdit *>("localSongPath")->text(), QDir::toNativeSeparators(zip));
+    tabs->setCurrentIndex(1);
+    MtpSongEntry root; root.name = QStringLiteral("星穹绿洲"); root.gameName = root.name; root.gameId = "oasis";
+    root.deviceName = "PICO Neo 3"; root.storageName = QStringLiteral("内部共享存储空间"); root.isSong = false;
+    root.location = QStringLiteral("内部共享存储空间/SoulTopia/BeatNote/Custom");
+    MtpSongEntry song = root; song.name = QStringLiteral("霓虹节拍（示例）"); song.isSong = true;
+    song.categorySegments = QStringList{QStringLiteral("光剑曲谱制作"), QStringLiteral("电子音乐")};
+    MtpSongEntry other = song; other.gameName = QStringLiteral("光之乐团"); other.gameId = "lightband";
+    other.categorySegments = QStringList{QStringLiteral("练习曲")};
+    MtpSongEntry empty = root; empty.gameName = QStringLiteral("光之乐团"); empty.gameId = "lightband";
+    dialog.populateSongs({root, song, empty, other});
+    QCOMPARE(tree->topLevelItemCount(), 1); QCOMPARE(tree->topLevelItem(0)->childCount(), 2);
+    tree->setCurrentItem(tree->topLevelItem(0)); QVERIFY(!deviceButton->isEnabled());
+    QTreeWidgetItem *leaf = nullptr;
+    for (QTreeWidgetItemIterator iterator(tree); *iterator; ++iterator)
+        if ((*iterator)->data(0, Qt::UserRole).isValid()) { leaf = *iterator; break; }
+    QVERIFY(leaf); tree->setCurrentItem(leaf); QVERIFY(deviceButton->isEnabled());
+    auto search = dialog.findChild<QLineEdit *>("mtpSongSearch");
+    search->setText(QStringLiteral("不存在的歌曲")); QVERIFY(tree->topLevelItem(0)->isHidden()); QVERIFY(!deviceButton->isEnabled());
+    search->setText(QStringLiteral("电子音乐")); QVERIFY(!tree->topLevelItem(0)->isHidden());
+    search->clear();
+
+    MtpExportService exporter; exporter.setHelperPath(m_temp.filePath("missing-export.exe"));
+    SongExportDialog exportDialog(&exporter, QStringLiteral("霓虹节拍（示例）"));
+    exportDialog.show(); QTest::qWait(30);
+    exportDialog.findChild<QLineEdit *>("songExportParentDirectory")->setText(m_temp.path());
+    auto mode = exportDialog.findChild<QComboBox *>("songExportMode");
+    auto exportButton = exportDialog.findChild<QPushButton *>("confirmSongExport");
+    QVERIFY(exportButton->isEnabled()); mode->setCurrentIndex(1); QVERIFY(!exportButton->isEnabled());
+    MtpExportDestination destination; destination.deviceId = "synthetic-device"; destination.storageId = "synthetic-storage"; destination.rootId = "synthetic-root";
+    destination.deviceName = "PICO Neo 3"; destination.storageName = QStringLiteral("内部共享存储空间"); destination.gameName = QStringLiteral("星穹绿洲"); destination.gameId = "oasis";
+    auto destination2 = destination; destination2.rootId = "synthetic-root-2"; destination2.gameName = QStringLiteral("光之乐团"); destination2.gameId = "lightband";
+    exportDialog.populateDestinations({destination, destination2});
+    QVERIFY(exportButton->isEnabled()); exportDialog.findChild<QComboBox *>("songExportDestinations")->setCurrentIndex(1);
+    QCOMPARE(exportDialog.destination().gameId, QString("lightband"));
+    QCOMPARE(exportDialog.parentDirectory(), QFileInfo(m_temp.path()).absoluteFilePath());
+    exportDialog.findChild<QLineEdit *>("songExportParentDirectory")->setText(m_temp.filePath("missing-folder")); QVERIFY(!exportButton->isEnabled());
+    exportDialog.findChild<QLineEdit *>("songExportParentDirectory")->setText(m_temp.path());
+    const QString captureDirectory = qEnvironmentVariable("LMSC_CAPTURE_IMPORT_EXPORT");
+    if (!captureDirectory.isEmpty()) {
+        QVERIFY(QDir().mkpath(captureDirectory));
+        for (const auto &theme : {QStringLiteral("dark"), QStringLiteral("light")}) {
+            lmsc::ThemeManager::apply(theme); dialog.resize(880, 610); exportDialog.resize(760, 560); QTest::qWait(100);
+            QVERIFY(dialog.grab().save(QDir(captureDirectory).filePath("import-" + theme + ".png")));
+            // A drive root illustrates the selection without exposing a user directory.
+            exportDialog.findChild<QLineEdit *>("songExportParentDirectory")->setText(QDir::drives().first().absoluteFilePath());
+            QVERIFY(exportDialog.grab().save(QDir(captureDirectory).filePath("export-" + theme + ".png")));
+        }
+    }
+    dialog.resize(600, 430); exportDialog.resize(540, 400); QTest::qWait(10);
+    QVERIFY(dialog.findChild<QPushButton *>("importHeadsetSong")->isVisible());
+    QVERIFY(exportDialog.findChild<QPushButton *>("confirmSongExport")->isVisible());
+    exportDialog.close(); dialog.close(); lmsc::ThemeManager::apply(QStringLiteral("dark"));
+    SongImportDialog localSelection(&importer);
+    localSelection.setLocalPath(zip);
+    localSelection.findChild<QPushButton *>("importComputerSong")->click();
+    QCOMPARE(localSelection.result(), int(QDialog::Accepted)); QCOMPARE(localSelection.localPath(), zip);
+    QVERIFY(!localSelection.fromDevice());
+}
+
+void MainWindowTest::deviceExportThroughDialog_data() {
+    QTest::addColumn<QString>("resultMode");
+    QTest::newRow("verified-upload") << QStringLiteral("success");
+    QTest::newRow("checksum-failure") << QStringLiteral("failure");
+    QTest::newRow("cancel-retains-copy") << QStringLiteral("cancel");
+}
+
+void MainWindowTest::deviceExportThroughDialog() {
+    QFETCH(QString, resultMode);
+    MainWindow window(nullptr, settingsFile()); window.setTestMode(true); window.show();
+    QSignalSpy ready(&window, &MainWindow::documentReady);
+    window.openPath(m_song); QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 20000);
+    QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
+    const QString originalTitle = window.windowTitle();
+    QFile originalInfo(m_song + "/Info.dat"); QVERIFY(originalInfo.open(QIODevice::ReadOnly));
+    const QByteArray infoHash = QCryptographicHash::hash(originalInfo.readAll(), QCryptographicHash::Sha256); originalInfo.close();
+    HomepageUrlReceiver folderReceiver; ScopedFileUrlHandler folderHandler(&folderReceiver);
+    auto exporter = window.findChild<MtpExportService *>(); QVERIFY(exporter);
+    const QString parent = m_temp.filePath("device-export-" + resultMode); QVERIFY(QDir().mkpath(parent));
+    const QString helper = QDir(parent).filePath("mock-device.ps1");
+    QFile script(helper); QVERIFY(script.open(QIODevice::WriteOnly));
+    QString body = QStringLiteral(
+        "param([string]$JobPath)\n$ErrorActionPreference='Stop'\n[Console]::OutputEncoding=New-Object Text.UTF8Encoding($false)\n"
+        "$job=[IO.File]::ReadAllText($JobPath)|ConvertFrom-Json\n"
+        "function Send($v){[Console]::WriteLine(($v|ConvertTo-Json -Depth 12 -Compress))}\n"
+        "if($job.mode -eq 'list'){Send @{type='destinations';destinations=@(@{deviceId='synthetic';storageId='storage';rootId='root';deviceName='PICO Neo 3';storageName='内部共享存储空间';gameId='lightband';gameName='光之乐团'})};exit 0}\n"
+        "Send @{type='created';location='PICO Neo 3/光之乐团/光剑曲谱制作/本次新歌曲'}\n"
+        "Send @{type='progress';message='校验模拟设备歌曲';percent=0}\n");
+    if (resultMode == "success") body += QStringLiteral("Send @{type='uploaded';localFolder=$job.localFolder;location='PICO Neo 3/光之乐团/光剑曲谱制作/本次新歌曲';verified=$true}\n");
+    else if (resultMode == "failure") body += QStringLiteral("Send @{type='error';message='SHA256 回读校验不一致'}\nexit 1\n");
+    else body += QStringLiteral("while(-not [IO.File]::Exists($job.cancelFile)){Start-Sleep -Milliseconds 30};Send @{type='cancelled';location='PICO Neo 3/光之乐团/光剑曲谱制作/本次新歌曲'};exit 2\n");
+    script.write(QByteArray::fromHex("efbbbf") + body.toUtf8()); script.close(); exporter->setHelperPath(helper);
+    QSignalSpy uploaded(exporter, &MtpExportService::songUploaded);
+    QSignalSpy failed(exporter, &MtpExportService::errorOccurred);
+    QSignalSpy cancelled(exporter, &MtpExportService::cancelled);
+    if (resultMode == "cancel") connect(exporter, &MtpExportService::taskProgress, &window, [&](const QString &, int percent) {
+        if (percent != 0) return;
+        QTimer::singleShot(0, &window, [&] {
+            if (auto progress = window.findChild<QProgressDialog *>())
+                for (auto button : progress->findChildren<QPushButton *>()) if (button->text() == QStringLiteral("取消上传")) button->click();
+        });
+    });
+    int phase = 0; QTimer driver;
+    connect(&driver, &QTimer::timeout, &window, [&] {
+        if (phase == 0) {
+            auto dialog = qobject_cast<SongExportDialog *>(QApplication::activeModalWidget());
+            if (!dialog || exporter->isBusy() || dialog->findChild<QComboBox *>("songExportDestinations")->count() == 0) return;
+            dialog->findChild<QComboBox *>("songExportMode")->setCurrentIndex(1);
+            dialog->findChild<QLineEdit *>("songExportParentDirectory")->setText(parent);
+            phase = 1; dialog->findChild<QPushButton *>("confirmSongExport")->click();
+        } else if (phase == 1 && resultMode == "success") {
+            auto message = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+            if (!message || message->windowTitle() != QStringLiteral("导出完成")) return;
+            QVERIFY(message->text().contains(QStringLiteral("设备传输与回读校验已完成")));
+            QVERIFY(message->text().contains(QStringLiteral("本次新歌曲"))); phase = 2;
+            auto open = button(*message, QStringLiteral("打开歌曲目录")); QVERIFY(open); open->click();
+        }
+    });
+    QAction *action = nullptr; for (auto candidate : window.findChildren<QAction *>()) if (candidate->text() == QStringLiteral("导出歌曲")) action = candidate;
+    QVERIFY(action); driver.start(20); action->trigger(); driver.stop();
+    QVERIFY(phase >= 1); QVERIFY(action->isEnabled()); QVERIFY(!exporter->isBusy());
+    const QString localFolder = QDir(parent).filePath(QStringLiteral("光剑曲谱制作/GUI Fixture-by光剑曲谱"));
+    QVERIFY(QFileInfo::exists(localFolder + "/Info.dat"));
+    lmsc::BeatmapDocument copy; QString error; QVERIFY2(copy.loadSong(localFolder, &error), qPrintable(error));
+    QCOMPARE(copy.difficulties().size(), 2); QCOMPARE(window.windowTitle(), originalTitle);
+    QVERIFY(originalInfo.open(QIODevice::ReadOnly)); QCOMPARE(QCryptographicHash::hash(originalInfo.readAll(), QCryptographicHash::Sha256), infoHash); originalInfo.close();
+    if (resultMode == "success") { QCOMPARE(phase, 2); QCOMPARE(uploaded.count(), 1); QCOMPARE(failed.count(), 0); QCOMPARE(folderReceiver.openedCount, 1); QCOMPARE(folderReceiver.openedUrl, QUrl::fromLocalFile(localFolder)); }
+    else {
+        QCOMPARE(uploaded.count(), 0); QCOMPARE(failed.count(), 1);
+        QVERIFY(window.statusBar()->currentMessage().contains(QStringLiteral("完整电脑副本仍保留")));
+        QVERIFY(window.statusBar()->currentMessage().contains(QStringLiteral("本次新歌曲")));
+        if (resultMode == "cancel") QCOMPARE(cancelled.count(), 1);
+        else QVERIFY(window.statusBar()->currentMessage().contains("SHA256"));
+    }
     window.close();
 }
 
@@ -783,7 +969,7 @@ void MainWindowTest::chineseBrandIconAndAboutLicense() {
     QCOMPARE(nav->currentRow(), 6);
     QCOMPARE(workspace->currentIndex(), 2);
     QCOMPARE(pages->currentIndex(), 4);
-    QCOMPARE(version->text(), QStringLiteral("0.3.0"));
+    QCOMPARE(version->text(), QStringLiteral("0.4.0"));
     QCOMPARE(author->text(), QStringLiteral("Vae-x"));
     QVERIFY(hasText(*pages->currentWidget(), QStringLiteral("GNU GPL 第 3 版")));
     QVERIFY(hasText(*pages->currentWidget(), QStringLiteral("第三方组件")));
@@ -1203,11 +1389,11 @@ void MainWindowTest::importMp3AndCropThroughDialogs() {
         connect(&exportDriver, &QTimer::timeout, &window, [&] {
             auto *modal = QApplication::activeModalWidget();
             if (exportPhase == 0) {
-                auto *file = qobject_cast<QFileDialog *>(modal);
-                if (!file) return;
-                file->setDirectory(exportParent);
+                auto *dialog = qobject_cast<SongExportDialog *>(modal);
+                if (!dialog) return;
+                dialog->findChild<QLineEdit *>("songExportParentDirectory")->setText(exportParent);
                 exportPhase = 1;
-                QMetaObject::invokeMethod(file, "accept", Qt::QueuedConnection);
+                dialog->findChild<QPushButton *>("confirmSongExport")->click();
             } else if (exportPhase == 1) {
                 auto *message = qobject_cast<QMessageBox *>(modal);
                 if (!message || message->windowTitle() != QStringLiteral("导出完成")) return;
@@ -1221,14 +1407,15 @@ void MainWindowTest::importMp3AndCropThroughDialogs() {
         });
         QAction *exportAction = nullptr;
         for (auto *action : window.findChildren<QAction *>())
-            if (action->text() == QStringLiteral("导出歌曲目录")) exportAction = action;
+            if (action->text() == QStringLiteral("导出歌曲")) exportAction = action;
         QVERIFY(exportAction && exportAction->isEnabled());
         exportDriver.start(20);
         exportAction->trigger();
         exportDriver.stop();
         QCOMPARE(exportPhase, 2);
         QVERIFY(bufferMessage);
-        QCOMPARE(QFileInfo(guiExportPath).absolutePath(), QFileInfo(exportParent).absoluteFilePath());
+        QCOMPARE(QFileInfo(guiExportPath).absolutePath(), QDir(exportParent).filePath(QStringLiteral("光剑曲谱制作")));
+        QVERIFY(QFileInfo(guiExportPath).fileName().endsWith(QStringLiteral("-by光剑曲谱")));
         lmsc::BeatmapDocument guiExport;
         QVERIFY2(guiExport.loadSong(guiExportPath, &error), qPrintable(error));
         QCOMPARE(guiExport.objects().size(), 1);

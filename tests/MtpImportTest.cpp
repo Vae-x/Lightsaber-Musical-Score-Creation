@@ -88,7 +88,8 @@ int main(int argc, char **argv) {
 
     const QString locator = QString::fromUtf8(QJsonDocument(QJsonObject{
         {QStringLiteral("device"), QStringLiteral("Pico Neo 3")},
-        {QStringLiteral("segments"), QJsonArray{QStringLiteral("内部共享存储空间"), QStringLiteral("歌曲 $(abc) ' 空格")}}
+        {QStringLiteral("segments"), QJsonArray{QStringLiteral("内部共享存储空间"), QStringLiteral("SoulTopia"),
+            QStringLiteral("BeatNote"), QStringLiteral("Custom"), QStringLiteral("歌曲 $(abc) ' 空格")}}
     }).toJson(QJsonDocument::Compact));
     const QString escapedLocator = QString(locator).replace(QLatin1Char('\''), QStringLiteral("''"));
     const QString lightBandLocator = QString::fromUtf8(QJsonDocument(QJsonObject{
@@ -101,7 +102,7 @@ int main(int argc, char **argv) {
     const QString listScript = QStringLiteral(
         "$locator='%1' | ConvertFrom-Json\n"
         "$lightBandLocator='%2' | ConvertFrom-Json\n"
-        "$song=@{name='中文歌曲 $(abc)';deviceName='Pico Neo 3';location='内部共享存储空间';locator=$locator}\n"
+        "$song=@{name='中文歌曲 $(abc)';deviceName='Pico Neo 3';gameId='oasis';storageName='内部共享存储空间';categorySegments=@('分类','电子音乐');location='内部共享存储空间';locator=$locator}\n"
         "$lightBandSong=@{name='中文歌曲 $(abc)';deviceName='Pico Neo 3';gameName='光之乐团';location='内部共享存储空间\\Android\\data\\com.StarRiverVR.LightBand\\files\\CustomMusic';locator=$lightBandLocator}\n"
         "[Console]::WriteLine((@{type='songs';songs=@($song,$lightBandSong)}|ConvertTo-Json -Depth 8 -Compress))\n").arg(escapedLocator, escapedLightBandLocator);
     service.setScriptPath(makeScript(scripts, listScript));
@@ -112,6 +113,10 @@ int main(int argc, char **argv) {
             && result.songs[1].locator == lightBandLocator,
           QStringLiteral("同名歌曲保留独立来源与光之乐团深层定位，兼容未提供游戏名称的列表"));
     check(!service.isBusy(), QStringLiteral("列表完成后释放忙碌状态"));
+    check(result.songs.size() == 2 && result.songs[0].gameId == QStringLiteral("oasis")
+            && result.songs[0].storageName == QStringLiteral("内部共享存储空间")
+            && result.songs[0].categorySegments == QStringList{QStringLiteral("分类"), QStringLiteral("电子音乐")},
+          QStringLiteral("分类路径、游戏标识和存储空间元数据完整保留"));
 
     MtpSongEntry entry;
     entry.name = QStringLiteral("中文歌曲 $(abc)");
@@ -119,7 +124,7 @@ int main(int argc, char **argv) {
     entry.locator = locator;
     const QString importScript = QStringLiteral(
         "$locator=$env:LMSC_MTP_LOCATOR|ConvertFrom-Json\n"
-        "if($locator.segments[1] -cne '歌曲 $(abc) '' 空格'){throw '定位信息变形'}\n"
+        "if($locator.segments[4] -cne '歌曲 $(abc) '' 空格'){throw '定位信息变形'}\n"
         "if([IO.File]::ReadAllText((Join-Path $env:LMSC_MTP_SESSION '.lmsc-mtp-session')) -ne $env:LMSC_MTP_TOKEN){throw '临时目录令牌错误'}\n"
         "[IO.File]::WriteAllText((Join-Path $env:LMSC_MTP_TARGET 'Info.dat'),'{}')\n"
         "[Console]::WriteLine((@{type='imported';path=$env:LMSC_MTP_TARGET}|ConvertTo-Json -Compress))\n");
@@ -143,28 +148,63 @@ int main(int argc, char **argv) {
         "$tokens=$null; $parseErrors=$null\n"
         "$ast=[Management.Automation.Language.Parser]::ParseFile('%1',[ref]$tokens,[ref]$parseErrors)\n"
         "if($parseErrors.Count){throw '设备导入脚本语法错误'}\n"
-        "foreach($functionName in @('Get-SongSources','Test-SupportedLocator')){\n"
+        "foreach($functionName in @('Assert-SafeName','Get-SongSources','Test-SupportedLocator','Find-CategorizedSongs')){\n"
         "  $definition=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName},$true)\n"
         "  if(-not $definition){throw '缺少设备目录校验函数'}\n"
         "  Invoke-Expression $definition.Extent.Text\n"
         "}\n"
         "$lightBand='%2'|ConvertFrom-Json\n"
         "$oasis=@{device='Pico Neo 3';segments=@('内部共享存储空间','SoulTopia','BeatNote','Custom','歌曲')}\n"
-        "if(-not (Test-SupportedLocator $lightBand) -or -not (Test-SupportedLocator $oasis)){throw '已支持的游戏目录遭拒绝'}\n"
+        "$categorized=@{device='Pico Neo 3';segments=@('内部共享存储空间','SoulTopia','BeatNote','Custom','光剑曲谱制作','电子音乐','歌曲')}\n"
+        "if(-not (Test-SupportedLocator $lightBand) -or -not (Test-SupportedLocator $oasis) -or -not (Test-SupportedLocator $categorized)){throw '已支持的游戏目录遭拒绝'}\n"
         "$invalid=@(\n"
         "  @{device='Pico Neo 3';segments=@('内部共享存储空间','Android','data','com.other.game','files','CustomMusic','歌曲')},\n"
         "  @{device='Pico Neo 3';segments=@('内部共享存储空间','Android','data','com.StarRiverVR.LightBand','files','CustomMusic')},\n"
         "  @{device='Pico Neo 3';segments=@('内部共享存储空间','SoulTopia','BeatNote','Custom','')},\n"
         "  @{device='';segments=@('内部共享存储空间','SoulTopia','BeatNote','Custom','歌曲')},\n"
-        "  @{device='Pico Neo 3';segments=@('内部共享存储空间','SoulTopia','BeatNote','Custom','歌曲','附加目录')}\n"
+        "  @{device='Pico Neo 3';segments=@('内部共享存储空间','SoulTopia','BeatNote','Custom','..','歌曲')},\n"
+        "  @{device='Pico Neo 3';segments=@('内部共享存储空间','SoulTopia','BeatNote','Custom','分类/逃逸','歌曲')},\n"
+        "  @{device='Pico Neo 3';segments=@('内部共享存储空间','SoulTopia','BeatNote','Custom','CON','歌曲')},\n"
+        "  @{device='Pico Neo 3';segments=@('内部共享存储空间','SoulTopia','BeatNote','Custom')+(@('层')*21)+@('歌曲')}\n"
         ")\n"
         "foreach($item in $invalid){if(Test-SupportedLocator $item){throw '未支持的路径通过了校验'}}\n"
+        "function Mock-Folder($name,$children){\n"
+        "  $folder=[pscustomobject]@{Children=@($children)}; $folder|Add-Member ScriptMethod Items {return $this.Children}\n"
+        "  $item=[pscustomobject]@{Name=$name;IsFolder=$true;Folder=$folder}; $item|Add-Member ScriptProperty GetFolder {return $this.Folder}; return $item\n"
+        "}\n"
+        "$info=[pscustomobject]@{Name='Info.dat';IsFolder=$false}\n"
+        "$resource=Mock-Folder '资源' @($info)\n"
+        "$song=Mock-Folder '歌曲' @($info,$resource)\n"
+        "$category=Mock-Folder '电子音乐' @($song)\n"
+        "$root=Mock-Folder 'Custom' @($category)\n"
+        "$source=@(Get-SongSources)[0]; $device=@{Name='Pico Neo 3'}; $storage=@{Name='内部共享存储空间'}\n"
+        "$songs=New-Object 'Collections.Generic.List[object]'; $counters=@{Songs=0;Directories=0}\n"
+        "Find-CategorizedSongs $root.GetFolder @() 0 $source $device $storage $songs $counters\n"
+        "if($songs.Count -ne 1 -or $songs[0].categorySegments[0] -cne '电子音乐' -or @($songs[0].locator.segments).Count -ne 6 -or $counters.Directories -ne 3){throw '递归分类或歌曲资源止步错误'}\n"
+        "$empty=Mock-Folder '空目录' @(); $emptySongs=New-Object 'Collections.Generic.List[object]'\n"
+        "Find-CategorizedSongs $empty.GetFolder @() 0 $source $device $storage $emptySongs @{Songs=0;Directories=0}\n"
+        "if($emptySongs.Count -ne 0){throw '空目录误识别为歌曲'}\n"
+        "foreach($limit in @('depth','songs','directories')){\n"
+        "  $rejected=$false; try {\n"
+        "    if($limit -eq 'depth'){Find-CategorizedSongs $empty.GetFolder @('歌曲') 21 $source $device $storage $emptySongs @{Songs=0;Directories=0}}\n"
+        "    if($limit -eq 'songs'){Find-CategorizedSongs $song.GetFolder @('歌曲') 1 $source $device $storage $emptySongs @{Songs=4000;Directories=0}}\n"
+        "    if($limit -eq 'directories'){Find-CategorizedSongs $empty.GetFolder @() 0 $source $device $storage $emptySongs @{Songs=0;Directories=10000}}\n"
+        "  }catch{$rejected=$true}; if(-not $rejected){throw ('扫描上限未拒绝：'+$limit)}\n"
+        "}\n"
         "[Console]::WriteLine('{\"type\":\"songs\",\"songs\":[]}')\n")
         .arg(QString(productionScript).replace(QLatin1Char('\''), QStringLiteral("''")), escapedLightBandLocator);
     service.setScriptPath(makeScript(scripts, locatorValidationScript));
     result = waitFor(service, [&] { service.listSongs(); });
     check(result.completed && result.error.isEmpty(),
-          QStringLiteral("真实导入脚本只接受两处游戏歌曲目录，拒绝其他包、缺失歌曲名和额外子目录"));
+          QStringLiteral("真实脚本递归分类、歌曲资源止步、三种扫描上限和安全目录白名单通过"));
+
+    MtpSongEntry gameRoot = entry; gameRoot.isSong = false;
+    result = waitFor(service, [&] { service.importSong(gameRoot); });
+    check(!result.completed && !result.error.isEmpty(), QStringLiteral("空游戏根与分类节点不能作为歌曲导入"));
+    service.setScriptPath(makeScript(scripts, QStringLiteral("[Console]::WriteLine('{\"type\":\"songs\",\"songs\":[{\"name\":\"星穹绿洲\",\"deviceName\":\"Pico Neo 3\",\"gameId\":\"oasis\",\"isSong\":false,\"locator\":{\"device\":\"Pico Neo 3\",\"segments\":[\"内部共享存储空间\",\"SoulTopia\",\"BeatNote\",\"Custom\"]}}]}')\n")));
+    result = waitFor(service, [&] { service.listSongs(); });
+    check(result.completed && result.songs.size() == 1 && !result.songs.first().isSong,
+          QStringLiteral("空游戏歌曲根作为浏览节点保留，完整扫描正常成功"));
 
     service.setScriptPath(makeScript(scripts, QStringLiteral("[Console]::WriteLine('{\"type\":\"imported\",\"path\":\"C:/unexpected\"}')\n")));
     result = waitFor(service, [&] { service.importSong(entry); });

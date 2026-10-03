@@ -55,4 +55,30 @@ QString WorkspacePaths::suggestedProjectFile(const QString &title, const QString
     if (!QDir().mkpath(directory)) return {};
     return QDir(directory).filePath("project.lmsc");
 }
+
+QString WorkspacePaths::suggestedSongExportFolder(const QString &title, const QString &parent,
+                                                  QString *error) {
+    auto fail = [error](const QString &message) {
+        if (error) *error = message;
+        return QString();
+    };
+    const QFileInfo parentInfo(parent);
+    if (!parentInfo.isDir() || parentInfo.isSymLink() || parentInfo.canonicalFilePath().isEmpty())
+        return fail(QStringLiteral("请选择可用的电脑导出目录。"));
+    const QString root = QDir(parentInfo.canonicalFilePath()).filePath(QStringLiteral("光剑曲谱制作"));
+    const QFileInfo rootInfo(root);
+    if (rootInfo.exists() && (!rootInfo.isDir() || rootInfo.isSymLink()))
+        return fail(QStringLiteral("导出分类路径已被文件或链接占用，未覆盖已有内容。"));
+    if (!ensureWritable(root)) return fail(QStringLiteral("导出分类目录不可写，请选择其他位置。"));
+    const QString rootCanonical = QFileInfo(root).canonicalFilePath();
+    if (QFileInfo(rootCanonical).absolutePath().compare(parentInfo.canonicalFilePath(), Qt::CaseInsensitive) != 0)
+        return fail(QStringLiteral("导出分类目录越出所选位置。"));
+    const QString name = projectName(title.trimmed().isEmpty() ? QStringLiteral("无题歌曲") : title)
+        + QStringLiteral("-by光剑曲谱");
+    QString candidate = QDir(rootCanonical).filePath(name);
+    int suffix = 2;
+    while (QFileInfo::exists(candidate))
+        candidate = QDir(rootCanonical).filePath(name + "-" + QString::number(suffix++));
+    return candidate;
+}
 } // namespace lmsc

@@ -5,6 +5,7 @@
 #include <QTemporaryDir>
 #include <QTimer>
 #include <QVector>
+#include <QStringList>
 #include <memory>
 #include <vector>
 
@@ -15,6 +16,11 @@ struct MtpSongEntry {
     QString location;
     QString locator;
     QString gameName;
+    QString gameId;
+    QString storageName;
+    QStringList categorySegments;
+    // Empty game roots are also returned for browsing, but cannot be imported.
+    bool isSong = true;
 };
 Q_DECLARE_METATYPE(MtpSongEntry)
 Q_DECLARE_METATYPE(QVector<MtpSongEntry>)

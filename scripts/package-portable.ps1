@@ -22,12 +22,13 @@ $deployTool = Join-Path $QtDirectory 'bin/windeployqt.exe'
 $audioPlugin = Join-Path $QtDirectory 'plugins/audio/qtaudio_windows.dll'
 $ffmpeg = Join-Path $workspace 'third_party/ffmpeg'
 $mtpScript = Join-Path $workspace 'scripts/windows/mtp-import.ps1'
+$wpdHelper = Join-Path $buildRoot 'src/tools/mtp/WpdTransfer.exe'
 $projectLicense = Join-Path $workspace 'LICENSE'
 $projectChangelog = Join-Path $workspace 'CHANGELOG.md'
 $appInfoHeader = Join-Path $workspace 'src/core/AppInfo.h'
 foreach ($required in @($sourceExe, $deployTool, $audioPlugin,
                        (Join-Path $ffmpeg 'bin/ffmpeg.exe'), (Join-Path $ffmpeg 'bin/ffprobe.exe'),
-                       $mtpScript, $projectLicense, $projectChangelog, $appInfoHeader)) {
+                       $mtpScript, $wpdHelper, $projectLicense, $projectChangelog, $appInfoHeader)) {
     if (!(Test-Path -LiteralPath $required -PathType Leaf)) { throw "Missing required runtime: $required" }
 }
 $buildCache = Get-Content -LiteralPath (Join-Path $buildRoot 'CMakeCache.txt') -Raw
@@ -84,6 +85,7 @@ Copy-Item -LiteralPath (Join-Path $ffmpeg 'LICENSE.txt'), (Join-Path $ffmpeg 'RE
 $mtpDirectory = Join-Path $package 'tools/mtp'
 [IO.Directory]::CreateDirectory($mtpDirectory) | Out-Null
 Copy-Item -LiteralPath $mtpScript -Destination $mtpDirectory
+Copy-Item -LiteralPath $wpdHelper -Destination $mtpDirectory
 
 # License texts come from the exact locally installed Qt 5.12.12 source tree.
 $qtSources = [IO.Path]::GetFullPath((Join-Path $QtDirectory '../Src'))
@@ -113,31 +115,31 @@ foreach ($module in @('qtbase', 'qtmultimedia', 'qtsvg', 'qtimageformats')) {
 $readme = @'
 # 光剑曲谱制作 {{APP_VERSION}}
 
-双击 LightsaberMusicalScoreCreation.exe 启动。请保留同目录的 DLL、audio、platforms、imageformats 和 tools 等资源；无需安装 Qt、FFmpeg 或 Python。基础编辑可离线运行，AI 连接需要联网；Codex 账号方式需要本机安装官方 Codex CLI。
+完整解压后双击 LightsaberMusicalScoreCreation.exe。保留所有 DLL、audio、platforms、imageformats 和 tools；基础编辑与音频处理无需安装 Qt、Python 或 FFmpeg，可以离线使用。发行包面向 Windows 64 位电脑；Qt 编辑器为 32 位，随包 FFmpeg 与 Windows WPD 传输工具为 64 位，设备工具使用系统 .NET Framework。Windows 10 兼容性仍须独立验证。
 
-当前包面向 Windows 64 位电脑。Qt 编辑器为 32 位，随包音频工具为独立的 64 位进程。Windows 10 兼容性仍需独立验证。
+1. “导入歌曲”统一选择电脑文件夹或 ZIP，自动识别；“打开编辑工程”继续打开 .lmsc。连接并解锁 PICO、允许 USB 文件传输后，可在 PICO 页按设备、游戏、分类、歌曲展开或搜索。只读复制选中歌曲到电脑，不修改头显原文件。
+2. “新歌 · MP3 / MP4”选择音轨、裁剪、难度并转换 Ogg。可选 Easy、Normal、Hard、Expert、ExpertPlus；手动编辑支持普通红蓝方块、方向、炸弹、墙、多选、复制粘贴、镜像、撤销重做与试听控制。
+3. “AI 分析与制谱”先本地提取音乐特征，通过已配置 API 或本机 Codex / ChatGPT 授权请求模型规划整曲、分乐句生成；候选谱校验后可试听，再应用到所选难度。其他难度保留，支持有限自动恢复、诊断与手动继续。原音频不上传；模型请求可能产生服务费用。账号模式需本机官方 Codex CLI。
+4. “保存工程”默认使用程序旁 projects/<歌名>/project.lmsc；程序目录不可写时回退到用户文档“光剑曲谱制作/工程”。工程与 assets-*、source-* 和恢复快照一起保留和移动。assets-* 是原始快照，直接复制它不会包含后续编辑。
+5. “导出歌曲”先生成完整电脑副本，位置为所选目录/光剑曲谱制作/歌曲名-by光剑曲谱/，同名追加编号，不覆盖。完成后可打开歌曲目录，手动复制整个目录到设备。
+6. 连接 PICO 后也可选择直接导出到目标游戏。仅在游戏既有歌曲根目录的“光剑曲谱制作”分类中新建歌曲目录，逐文件上传并回读 SHA256，Info.dat 最后上传并验证引用。不修改原歌曲、成绩、收藏或配置，不创建缺失的游戏根。取消或断连保留电脑副本，提示可能残留的新设备目录，不自动删除。
 
-1. “导入歌曲文件夹”的“电脑文件夹”页选择含 Info.dat 的本地歌曲；“导入曲谱 ZIP”打开本地 ZIP。连接并解锁 PICO、允许 USB 文件传输后，可在“PICO 头显”页刷新歌曲、选择并点击“导入选中歌曲”。歌曲先只读复制到电脑，不写入头显原文件。
-2. “新歌 · MP3 / MP4”选择声音、裁剪片段与难度；自动转为 Ogg，建立一张空谱。可选简单（Easy）、普通（Normal）、困难（Hard）、专家（Expert）、专家+（ExpertPlus），创建后也能在“新歌难度”调整并保留已放置的物件。导出文件名分别为 Easy.dat、Normal.dat、Hard.dat、Expert.dat、ExpertPlus.dat。估拍后可校准 BPM 和第一拍。
-3. 在 4×3 面板放置音符、炸弹或墙；支持多选、复制、粘贴、镜像、撤销/重做。受保护物件显示原因。
-4. “保存工程”默认建议程序旁的 projects/<歌名>/project.lmsc；同名目录使用编号。程序目录无写权限时回退到用户文档的 光剑曲谱制作/工程。工程文件旁的 assets-*、source-* 目录与工程一起保存和移动；首次保存后自动保存恢复快照。
-5. “导出歌曲目录”创建独立的新目录。新歌默认添加 2 秒开场缓冲，音频、音符、炸弹与墙同步后移，工程内编辑时间保持原样；可在导出时改为 0 秒关闭。导入的原歌曲不自动添加缓冲。导出后再手动复制整份歌曲到 PICO Neo 3 对应游戏的目录：
-   《星穹绿洲》：此电脑\Pico Neo 3\内部共享存储空间\SoulTopia\BeatNote\Custom
-   《光之乐团》：此电脑\Pico Neo 3\内部共享存储空间\Android\data\com.StarRiverVR.LightBand\files\CustomMusic
+内部共享存储空间的歌曲根目录：
+- 星穹绿洲：SoulTopia/BeatNote/Custom
+- 光之乐团：Android/data/com.StarRiverVR.LightBand/files/CustomMusic
 
-头显导入页会读取上述两个目录并标明游戏来源。新谱使用基础 v2.2 格式，已有 v2/v3 原数据和音频保留；新歌导出的第一拍偏移已写入物件拍数。
+两处新增歌曲都放入 光剑曲谱制作/歌曲名-by光剑曲谱/。光之乐团分类依据用户反馈提供；星穹绿洲分类读取未有可靠公开说明，需在游戏内验证。以前导出歌曲两游戏可用的用户反馈、电脑格式检查、设备传输和新增功能的实际游玩分别记录。
 
-Ctrl+O 选择电脑或头显歌曲来源；Ctrl+S 保存；Ctrl+E 导出；Ctrl+Z 撤销；Ctrl+Shift+Z 重做；Ctrl+C/Ctrl+V 复制粘贴；Delete 删除。其余操作使用界面菜单和控制区。
+新歌导出每张谱分别命名 Easy.dat、Normal.dat、Hard.dat、Expert.dat、ExpertPlus.dat。开场缓冲默认 2 秒，0～10 秒可调，0 关闭；所有新歌难度的基础物件同步后移，音频只添加一次静音，工程原时间保持不变。已有导入歌曲不自动加缓冲，原谱面文件名和音频保留。缓冲效果与 AI 生成手感仍待两游戏实测。
 
-用户已反馈此前版本导出的歌曲可在 PICO Neo 3 的《星穹绿洲》和《光之乐团》正常游玩。此次新增开场缓冲用于处理开头方块不显示的问题，其在两款游戏中的实际效果仍需重新导出后戴头显复测。不同难度标签在游戏中的具体映射也需分别核验。自动制谱、模组效果的完整预览与 APK 在后续阶段。
+布尔型 ChroMapper 书签设置不会再误判为未知变速。真正未知的时间扩展或高级关联仍保护；提示提供具体字段，另存工程保留原数据所以不会解除保护。弧线、链条、灯光及模组效果侧重保留，尚无完整预览。APK 留在后续阶段。
 
-主窗口左侧导航可切换曲谱编辑、AI 识别和设置。设置包括浅色、深色、跟随系统主题，DeepSeek、Kimi、MiMo、OpenAI、通义千问和自定义 API 预设，以及系统代理或手动 HTTP 代理；“设置 → 外观设置”（Ctrl+,）也可进入。填入 API Key 后可自动获取模型，也可手动填模型名。各提供商配置分别保存，Windows 密钥使用当前账户 DPAPI 加密；设置不进入歌曲工程与导出。Codex / ChatGPT 模式通过本机官方 CLI 检查已有授权、启动浏览器登录及获取账号模型。当前只完成设置与连接，AI 识别页面尚未接入分析或自动制谱。
+主窗口导航提供编辑、AI 和设置；账号授权位于大语言模型子菜单。支持浅色、深色、跟随系统，以及 API 提供商、自定义接口、代理和关于。API 密钥由当前 Windows 账户 DPAPI 加密，不进入工程或歌曲导出；便携包不含用户歌曲、工程、设置或账号凭据。
 
-项目采用 GNU GPL 第 3 版，官方条款全文在根目录 LICENSE；更新记录见 CHANGELOG.md。帮助菜单的“关于光剑曲谱制作”可查看版本，再点击“查看 GPLv3 许可”阅读原文。第三方组件遵循各自许可。
+Ctrl+O 导入歌曲；Ctrl+S 保存工程；Ctrl+E 导出歌曲；Ctrl+Z / Ctrl+Shift+Z 撤销重做。其余操作使用菜单和界面控制区。
 
-Qt 5.12.12 以动态库部署，许可证和第三方声明位于 licenses/Qt。对应源码版本：
+本项目采用 GNU GPL 第 3 版，官方许可全文见根目录 LICENSE，更新与验证范围见 CHANGELOG.md。Windows WPD helper 的对应源码随本版本源码发布。Qt 与 FFmpeg 及依赖各自保留原协议：licenses/Qt、tools/ffmpeg/README.md 和 LICENSE.txt。Qt 5.12.12 通过可替换动态库部署，对应源码：
 https://download.qt.io/archive/qt/5.12/5.12.12/single/qt-everywhere-src-5.12.12.zip
-FFmpeg 版本、来源、构建配置和对应源码入口见 tools/ffmpeg/README.md 与 LICENSE.txt。
 '@
 $readme = $readme.Replace('{{APP_VERSION}}', $applicationVersion)
 [IO.File]::WriteAllText((Join-Path $package '使用说明.md'), $readme, [Text.UTF8Encoding]::new($true))

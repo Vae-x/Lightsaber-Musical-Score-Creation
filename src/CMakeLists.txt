@@ -45,9 +45,10 @@ add_library(lmsc_core STATIC
         core/WinHttpModelTransport.cpp core/WinHttpModelTransport.h
         core/CodexAccountClient.cpp core/CodexAccountClient.h
         core/WorkspacePaths.cpp core/WorkspacePaths.h
-        core/MtpImportService.cpp core/MtpImportService.h)
+        core/MtpImportService.cpp core/MtpImportService.h
+        core/MtpExportService.cpp core/MtpExportService.h)
 target_include_directories(lmsc_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(lmsc_core PUBLIC Qt5::Core Qt5::Multimedia Qt5::Network)
+target_link_libraries(lmsc_core PUBLIC Qt5::Core Qt5::Multimedia Qt5::Network Qt5::Concurrent)
 if (WIN32)
     target_link_libraries(lmsc_core PRIVATE crypt32 winhttp)
 endif ()
@@ -57,6 +58,8 @@ add_executable(src WIN32
         gui/MainWindow.cpp
         gui/MainWindow.h
         gui/MainWindow.ui
+        gui/SongImportDialog.cpp gui/SongImportDialog.h
+        gui/SongExportDialog.cpp gui/SongExportDialog.h
         gui/EditorViews.cpp
         gui/EditorViews.h
         gui/SettingsDialog.cpp gui/SettingsDialog.h
@@ -97,6 +100,17 @@ set(LMSC_AUDIO_TOOLS_DIR "${LMSC_REPOSITORY_DIR}/third_party/ffmpeg" CACHE PATH
 option(LMSC_DEPLOY_AUDIO_TOOLS "Deploy the bundled offline audio tools with the application" ON)
 
 if (WIN32 AND NOT CMAKE_CROSSCOMPILING)
+    set(LMSC_WPD_HELPER "${CMAKE_CURRENT_BINARY_DIR}/tools/mtp/WpdTransfer.exe")
+    set(LMSC_WPD_POWERSHELL "$ENV{SystemRoot}/System32/WindowsPowerShell/v1.0/powershell.exe")
+    add_custom_command(OUTPUT "${LMSC_WPD_HELPER}"
+            COMMAND "${LMSC_WPD_POWERSHELL}" -NoProfile -NonInteractive -ExecutionPolicy Bypass
+            -File "${LMSC_REPOSITORY_DIR}/scripts/build-wpd-helper.ps1"
+            -BuildDirectory "${CMAKE_CURRENT_BINARY_DIR}/tools/mtp"
+            DEPENDS "${LMSC_REPOSITORY_DIR}/scripts/build-wpd-helper.ps1"
+            "${LMSC_REPOSITORY_DIR}/scripts/windows/WpdTransfer.cs"
+            COMMENT "构建 64 位 WPD 传输辅助程序" VERBATIM)
+    add_custom_target(lmsc_wpd_helper ALL DEPENDS "${LMSC_WPD_HELPER}")
+    add_dependencies(src lmsc_wpd_helper)
     add_custom_command(TARGET src POST_BUILD
             COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:src>/tools/mtp"
             COMMAND "${CMAKE_COMMAND}" -E copy_if_different
@@ -236,6 +250,22 @@ if (BUILD_TESTING)
     add_test(NAME mtp_import_service COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:mtp_import_tests>")
     set_tests_properties(mtp_import_service PROPERTIES TIMEOUT 60 LABELS "mtp"
             WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    if (WIN32 AND NOT CMAKE_CROSSCOMPILING)
+        add_test(NAME mtp_category_scan COMMAND "${LMSC_WPD_POWERSHELL}"
+                -NoProfile -NonInteractive -ExecutionPolicy Bypass -File
+                "${LMSC_REPOSITORY_DIR}/tests/MtpScanTest.ps1"
+                -SourcePath "${LMSC_REPOSITORY_DIR}/scripts/windows/mtp-import.ps1")
+        set_tests_properties(mtp_category_scan PROPERTIES TIMEOUT 60 LABELS "mtp")
+    endif ()
+    add_executable(mtp_export_tests "${LMSC_REPOSITORY_DIR}/tests/MtpExportTest.cpp")
+    target_link_libraries(mtp_export_tests PRIVATE lmsc_core)
+    if (TARGET lmsc_wpd_helper)
+        add_dependencies(mtp_export_tests lmsc_wpd_helper)
+    endif ()
+    set_target_properties(mtp_export_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_test(NAME mtp_export_service COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:mtp_export_tests>")
+    set_tests_properties(mtp_export_service PROPERTIES TIMEOUT 90 LABELS "mtp"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
     add_executable(workspace_paths_tests "${LMSC_REPOSITORY_DIR}/tests/WorkspacePathsTest.cpp")
     target_link_libraries(workspace_paths_tests PRIVATE lmsc_core)
     set_target_properties(workspace_paths_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
@@ -289,6 +319,8 @@ if (BUILD_TESTING)
                 gui/MainWindow.cpp gui/MainWindow.h gui/MainWindow.ui
                 gui/EditorViews.cpp gui/EditorViews.h)
         target_sources(main_window_tests PRIVATE
+                gui/SongImportDialog.cpp gui/SongImportDialog.h
+                gui/SongExportDialog.cpp gui/SongExportDialog.h
                 gui/SettingsDialog.cpp gui/SettingsDialog.h
                 gui/SettingsPanel.cpp gui/SettingsPanel.h
                 gui/AiRecognitionPage.cpp gui/AiRecognitionPage.h

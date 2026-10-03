@@ -13,6 +13,7 @@ namespace Ui { class MainWindow; }
 class AudioService;
 class RhythmAnalyzer;
 class MtpImportService;
+class MtpExportService;
 struct MediaInfo;
 struct RhythmEstimate;
 class TrackView;
@@ -129,6 +130,7 @@ private:
     AudioService *m_audio;
     RhythmAnalyzer *m_analyzer;
     MtpImportService *m_mtp;
+    MtpExportService *m_mtpExport;
     QFutureWatcher<DocumentLoadResult> *m_loader;
     TrackView *m_track;
     GridEditor *m_grid;

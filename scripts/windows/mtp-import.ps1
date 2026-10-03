@@ -19,8 +19,8 @@ function Find-UniqueItem {
 
 function Get-SongSources {
     @(
-        [pscustomobject]@{ GameName = '星穹绿洲'; Segments = @('SoulTopia', 'BeatNote', 'Custom') }
-        [pscustomobject]@{ GameName = '光之乐团'; Segments = @('Android', 'data', 'com.StarRiverVR.LightBand', 'files', 'CustomMusic') }
+        [pscustomobject]@{ GameId = 'oasis'; GameName = '星穹绿洲'; Segments = @('SoulTopia', 'BeatNote', 'Custom') }
+        [pscustomobject]@{ GameId = 'lightband'; GameName = '光之乐团'; Segments = @('Android', 'data', 'com.StarRiverVR.LightBand', 'files', 'CustomMusic') }
     )
 }
 
@@ -29,10 +29,12 @@ function Test-SupportedLocator {
     if ([string]::IsNullOrWhiteSpace([string]$Locator.device)) { return $false }
     $segments = @($Locator.segments)
     foreach ($segment in $segments) {
-        if ($segment -isnot [string] -or [string]::IsNullOrWhiteSpace($segment)) { return $false }
+        if ($segment -isnot [string]) { return $false }
+        try { Assert-SafeName $segment } catch { return $false }
     }
     foreach ($source in Get-SongSources) {
-        if ($segments.Count -ne $source.Segments.Count + 2) { continue }
+        if ($segments.Count -lt $source.Segments.Count + 2 -or
+            $segments.Count -gt $source.Segments.Count + 21) { continue }
         $matches = $true
         for ($index = 0; $index -lt $source.Segments.Count; $index++) {
             if ($segments[$index + 1] -cne $source.Segments[$index]) { $matches = $false; break }
@@ -60,6 +62,34 @@ function Assert-SafeName {
         $Name.EndsWith('.') -or $Name.EndsWith(' ') -or
         $Name -match '^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])($|\.)') {
         throw "头显中存在无法安全复制到 Windows 的文件名：$Name"
+    }
+}
+
+function Find-CategorizedSongs {
+    param($Folder, [string[]]$Categories, [int]$Depth, $Source, $Device, $Storage, $Songs, $Counters)
+    if ($Depth -gt 20) { throw '分类目录层级超过限制（20 层）；未完成完整扫描。' }
+    $Counters.Directories++
+    if ($Counters.Directories -gt 10000) { throw '分类目录数量超过限制（10000 个）；未完成完整扫描。' }
+    $items = @($Folder.Items())
+    $info = @($items | Where-Object { -not $_.IsFolder -and [string]::Equals([string]$_.Name, 'Info.dat', [StringComparison]::OrdinalIgnoreCase) })
+    if ($info.Count -gt 1) { throw '歌曲目录含多个 Info.dat，不能安全定位。' }
+    if ($info.Count -eq 1) {
+        if ($Categories.Count -eq 0) { throw '游戏根目录直接含 Info.dat，请把歌曲放入独立歌曲目录。' }
+        if ($Counters.Songs -ge 4000) { throw '头显歌曲数量超过限制（4000 首）；未完成完整扫描。' }
+        $Counters.Songs++
+        $root = @([string]$Storage.Name) + $Source.Segments
+        $segments = $root + $Categories
+        $category = if ($Categories.Count -gt 1) { @($Categories[0..($Categories.Count - 2)]) } else { @() }
+        [void]$Songs.Add(@{ name = $Categories[-1]; deviceName = [string]$Device.Name;
+            gameId = $Source.GameId; gameName = $Source.GameName; storageName = [string]$Storage.Name;
+            categorySegments = @($category); isSong = $true; location = ($segments -join '\');
+            locator = @{ device = [string]$Device.Name; segments = $segments } })
+        return
+    }
+    foreach ($item in $items) {
+        if (-not $item.IsFolder) { continue }
+        Assert-SafeName ([string]$item.Name)
+        Find-CategorizedSongs $item.GetFolder (@($Categories) + @([string]$item.Name)) ($Depth + 1) $Source $Device $Storage $Songs $Counters
     }
 }
 
@@ -143,6 +173,7 @@ try {
     if ($null -eq $computer) { throw 'Windows 无法访问“此电脑”。' }
     if ($env:LMSC_MTP_MODE -eq 'list') {
         $songs = New-Object 'System.Collections.Generic.List[object]'
+        $counters = @{ Songs = 0; Directories = 0 }
         $devices = @($computer.Items() | Where-Object { $_.IsFolder -and $_.Name -match '(?i)pico' })
         if ($devices.Count -eq 0) { throw '未找到 Pico 头显。请连接 USB，解锁头显，并允许文件传输；设备应出现在 Windows 的“此电脑”中。' }
         foreach ($device in $devices) {
@@ -152,17 +183,16 @@ try {
                 foreach ($source in Get-SongSources) {
                     $custom = Find-SongRootFolder $storage $source.Segments
                     if ($null -eq $custom) { continue }
-                    foreach ($song in $custom.Items()) {
-                        if (-not $song.IsFolder) { continue }
-                        if ($songs.Count -ge 4000) { throw '头显歌曲数量超过本次读取限制（4000 首）。' }
-                        $root = @([string]$storage.Name) + $source.Segments
-                        $segments = $root + @([string]$song.Name)
-                        [void]$songs.Add(@{ name = [string]$song.Name; deviceName = [string]$device.Name; gameName = $source.GameName; location = ($root -join '\'); locator = @{ device = [string]$device.Name; segments = $segments } })
-                    }
+                    $root = @([string]$storage.Name) + $source.Segments
+                    [void]$songs.Add(@{ name = $source.GameName; deviceName = [string]$device.Name;
+                        gameId = $source.GameId; gameName = $source.GameName; storageName = [string]$storage.Name;
+                        categorySegments = @(); isSong = $false; location = ($root -join '\');
+                        locator = @{ device = [string]$device.Name; segments = $root } })
+                    Find-CategorizedSongs $custom @() 0 $source $device $storage $songs $counters
                 }
             }
         }
-        if ($songs.Count -eq 0) { throw '头显中未找到歌曲文件夹。星穹绿洲：SoulTopia\BeatNote\Custom；光之乐团：Android\data\com.StarRiverVR.LightBand\files\CustomMusic。请确认已导入歌曲，并允许读取内部共享存储空间。' }
+        if ($songs.Count -eq 0) { throw '头显中未找到游戏歌曲目录。星穹绿洲：SoulTopia\BeatNote\Custom；光之乐团：Android\data\com.StarRiverVR.LightBand\files\CustomMusic。请确认游戏已初始化歌曲目录，并允许读取内部共享存储空间。' }
         Send-Record @{ type = 'songs'; songs = @($songs.ToArray()) }
         exit 0
     }
@@ -178,6 +208,8 @@ try {
         if (-not $item.IsFolder) { throw "设备目录已变化：$segment" }
         $folder = $item.GetFolder
     }
+    $songInfo = @($folder.Items() | Where-Object { -not $_.IsFolder -and [string]::Equals([string]$_.Name, 'Info.dat', [StringComparison]::OrdinalIgnoreCase) })
+    if ($songInfo.Count -ne 1) { throw '选中的节点不是歌曲目录（缺少唯一 Info.dat），请重新刷新列表。' }
     Send-Record @{ type = 'progress'; message = '核对头显歌曲文件'; percent = -1 }
     $manifest = @(Get-Manifest $folder '' 0)
     if ($manifest.Count -eq 0 -or $manifest.Count -gt 10000) { throw '歌曲文件数量为空或超过限制（10000 个）。' }

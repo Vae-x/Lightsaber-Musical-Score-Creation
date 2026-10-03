@@ -63,6 +63,147 @@ QJsonObject map3() {
             {"burstSliders", QJsonArray{}}, {"customData", QJsonObject{{"customEvents", QJsonArray{QJsonObject{{"type", "AnimateTrack"}}}}}},
             {"unrecognized", QJsonObject{{"nested", QJsonArray{1, 2, 3}}}}};
 }
+void editorTimingTests(const QString &root) {
+    QString error;
+    for (const bool useOfficialBpm : {false, true}) {
+        const QString name = useOfficialBpm ? "official-bookmarks-true" : "official-bookmarks-false";
+        const QString original = QDir(root).filePath(name);
+        auto primary = map3(), secondary = map3();
+        auto custom = primary.value("customData").toObject();
+        custom.insert("bookmarksUseOfficialBpmEvents", useOfficialBpm);
+        custom.insert("time", 12.5);
+        custom.insert("bookmarks", QJsonArray{QJsonObject{{"b", 8}, {"n", "editor marker"}}});
+        primary.insert("customData", custom);
+        custom.insert("bookmarksUseOfficialBpmEvents", !useOfficialBpm);
+        secondary.insert("customData", custom);
+        song(original, primary);
+        require(ProjectStore::writeJson(QDir(original).filePath("Hard.dat"), secondary, &error), error);
+        auto metadata = info();
+        auto sets = metadata.value("_difficultyBeatmapSets").toArray();
+        auto set = sets[0].toObject();
+        auto charts = set.value("_difficultyBeatmaps").toArray();
+        charts.append(QJsonObject{{"_difficulty", "Hard"}, {"_difficultyRank", 5}, {"_beatmapFilename", "Hard.dat"}});
+        set.insert("_difficultyBeatmaps", charts); sets[0] = set;
+        metadata.insert("_difficultyBeatmapSets", sets);
+        require(ProjectStore::writeJson(QDir(original).filePath("Info.dat"), metadata, &error), error);
+        const auto originalAudio = hash(QDir(original).filePath("song.ogg"));
+        const auto originalPrimary = hash(QDir(original).filePath("Expert.dat"));
+        const auto originalSecondary = hash(QDir(original).filePath("Hard.dat"));
+        BeatmapDocument document;
+        require(document.loadSong(original, &error) && document.readOnlyReason().isEmpty(), "boolean bookmark setting is editable: " + error);
+        require(std::abs(document.timeMap().beatToSeconds(10) - 4.5) < 1e-10, "bookmark setting leaves official BPM events authoritative");
+        const auto baseline = document.objects();
+        require(!baseline[0].isProtected() && baseline[1].isProtected() && baseline[2].isProtected(), "bookmark exemption retains arc and mod object protection");
+        require(!document.mirrorObjects({baseline[0].id, baseline[1].id}, &error) && !document.canUndo() &&
+                document.objects()[0].x == baseline[0].x, "mixed mirror is rejected atomically");
+        auto endpointEdit = baseline[1]; endpointEdit.protectedReason.clear(); endpointEdit.direction = 8;
+        require(!document.updateObject(endpointEdit, &error) && !document.removeObjects({baseline[1].id}, &error) &&
+                document.copyObjects({baseline[1].id}, &error).isEmpty(), "arc endpoint remains protected through every basic edit entry");
+        auto edit = baseline[0]; edit.direction = 6;
+        require(document.updateObject(edit, &error) && document.undo() && !document.isModified(), "boolean setting supports basic edit and undo");
+        const QString undone = QDir(root).filePath(name + "-undo-export");
+        require(document.exportSong(undone, &error), error);
+        compareFolders(original, undone);
+        require(document.redo() && document.objects()[0].direction == 6, "boolean setting supports redo");
+        const QString firstExport = QDir(root).filePath(name + "-first-export");
+        require(document.exportSong(firstExport, &error), error);
+        require(hash(QDir(firstExport).filePath("Hard.dat")) == originalSecondary &&
+                hash(QDir(firstExport).filePath("song.ogg")) == originalAudio &&
+                hash(QDir(firstExport).filePath("Info.dat")) == hash(QDir(original).filePath("Info.dat")),
+                "editing primary preserves other difficulty, original audio and metadata bytes");
+        const QString project = QDir(root).filePath(name + "-project/project.lmsc");
+        require(document.saveProject(project, &error), error);
+        BeatmapDocument reopened;
+        require(reopened.loadProject(project, &error) && reopened.readOnlyReason().isEmpty() &&
+                reopened.objects()[0].direction == 6, "saved bookmark setting project reopens editable");
+        require(reopened.setDifficulty(reopened.difficulties()[1].id, &error) && reopened.readOnlyReason().isEmpty(),
+                "opposite boolean setting in second difficulty remains editable");
+        auto secondEdit = reopened.objects()[0]; secondEdit.direction = 7;
+        require(reopened.updateObject(secondEdit, &error) && reopened.saveProject(project, &error), error);
+        BeatmapDocument saved;
+        require(saved.loadProject(project, &error) && saved.objects()[0].direction == 7, "both difficulty edits persist");
+        const QString finalExport = QDir(root).filePath(name + "-final-export");
+        require(saved.exportSong(finalExport, &error), error);
+        for (int i = 0; i < 2; ++i) {
+            const QString filename = i ? "Hard.dat" : "Expert.dat";
+            const auto before = i ? secondary : primary;
+            QJsonObject after;
+            require(ProjectStore::readJson(QDir(finalExport).filePath(filename), &after, &error), error);
+            auto expected = before;
+            auto notes = expected.value("colorNotes").toArray();
+            auto note = notes[0].toObject(); note.insert("d", i ? 7 : 6); notes[0] = note;
+            expected.insert("colorNotes", notes);
+            require(after == expected, "export changes only chosen basic note direction, preserving custom boolean, unknown JSON and advanced arrays");
+        }
+        require(hash(QDir(original).filePath("Expert.dat")) == originalPrimary &&
+                hash(QDir(original).filePath("Hard.dat")) == originalSecondary &&
+                hash(QDir(original).filePath("song.ogg")) == originalAudio &&
+                hash(QDir(finalExport).filePath("song.ogg")) == originalAudio, "original maps and audio remain untouched");
+    }
+
+    const QVector<QJsonValue> invalidSettings{QStringLiteral("true"), QJsonObject{{"enabled", true}},
+                                            QJsonArray{}, QJsonValue(QJsonValue::Null), 1};
+    for (int i = 0; i < invalidSettings.size(); ++i) {
+        const QString original = QDir(root).filePath("invalid-bookmark-setting-" + QString::number(i));
+        auto map = map3();
+        map.insert("customData", QJsonObject{{"bookmarksUseOfficialBpmEvents", invalidSettings[i]}});
+        song(original, map);
+        BeatmapDocument document;
+        require(document.loadSong(original, &error), error);
+        const QString reason = document.readOnlyReason();
+        require(reason.contains("Expert.dat.customData.bookmarksUseOfficialBpmEvents") && reason.contains(QStringLiteral("布尔")) &&
+                reason.contains(QStringLiteral("另存工程")), "invalid boolean setting reason identifies field and persistent protection");
+        require(!document.updateObject(document.objects()[0], &error) && !document.addObject(BeatObject{}, &error), "invalid setting cannot edit");
+        const QString project = QDir(root).filePath("invalid-bookmark-project-" + QString::number(i));
+        require(document.saveProject(project, &error), error);
+        BeatmapDocument reopened;
+        require(reopened.loadProject(project, &error) && reopened.readOnlyReason() == reason &&
+                !reopened.mirrorObjects({reopened.objects()[0].id}, &error), "saving does not unlock malformed bookmark extension");
+        const QString output = QDir(root).filePath("invalid-bookmark-export-" + QString::number(i));
+        require(reopened.exportSong(output, &error), error);
+        compareFolders(original, output);
+    }
+    const QVector<QJsonObject> unknownSettings{
+        QJsonObject{{"tempo", 180}}, QJsonObject{{"timeScale", 2}},
+        QJsonObject{{"_BPMChanges", QJsonArray{QJsonObject{{"_time", 2}, {"_BPM", 180}}}}}};
+    for (int i = 0; i < unknownSettings.size(); ++i) {
+        const QString original = QDir(root).filePath("unknown-editor-timing-" + QString::number(i));
+        auto map = map3(); map.insert("customData", unknownSettings[i]); song(original, map);
+        BeatmapDocument document;
+        require(document.loadSong(original, &error) && !document.readOnlyReason().isEmpty() &&
+                document.readOnlyReason().contains("Expert.dat.customData.") &&
+                !document.addObject(BeatObject{}, &error), "unknown tempo, scale and actual BPM change remain protected with field path");
+    }
+    auto harmless = map3();
+    harmless.insert("_customData", QJsonObject{{"_BPMChanges", QJsonArray{QJsonObject{{"_time", 0}, {"_BPM", 120},
+                                                      {"_beatsPerBar", 4}, {"_metronomeOffset", 0}}}}});
+    const QString markerFolder = QDir(root).filePath("harmless-editor-bpm-marker");
+    song(markerFolder, harmless);
+    BeatmapDocument marker;
+    require(marker.loadSong(markerFolder, &error) && marker.readOnlyReason().isEmpty(), "unchanged legacy editor BPM grid marker exemption retained");
+    auto rootFlag = map3(); rootFlag.insert("bookmarksUseOfficialBpmEvents", true);
+    const QString rootFlagFolder = QDir(root).filePath("unknown-root-bookmark-setting");
+    song(rootFlagFolder, rootFlag);
+    BeatmapDocument rootFlagDocument;
+    require(rootFlagDocument.loadSong(rootFlagFolder, &error) && !rootFlagDocument.readOnlyReason().isEmpty(),
+            "known bookmark exception is scoped to editor custom data");
+    for (const int type : {10, 14, 15}) {
+        const QString original = QDir(root).filePath("legacy-protected-event-" + QString::number(type));
+        const QJsonObject map{{"_version", "2.5.0"}, {"_notes", QJsonArray{}}, {"_obstacles", QJsonArray{}},
+                              {"_events", QJsonArray{QJsonObject{{"_time", 4}, {"_type", type}, {"_value", 120}}}}};
+        song(original, map);
+        BeatmapDocument document;
+        require(document.loadSong(original, &error) && !document.readOnlyReason().isEmpty() &&
+                !document.addObject(BeatObject{}, &error), "legacy type 10 and rotation events remain protected");
+    }
+    const QString shuffleFolder = QDir(root).filePath("legacy-shuffle-protection");
+    song(shuffleFolder, map3());
+    auto shuffleInfo = info(); shuffleInfo.insert("_shuffle", .25);
+    require(ProjectStore::writeJson(QDir(shuffleFolder).filePath("Info.dat"), shuffleInfo, &error), error);
+    BeatmapDocument shuffle;
+    require(shuffle.loadSong(shuffleFolder, &error) && !shuffle.readOnlyReason().isEmpty() &&
+            !shuffle.addObject(BeatObject{}, &error), "legacy shuffle remains protected");
+}
 void unitTests(const QString &root) {
     TimeMap time;
     QString error;
@@ -153,6 +294,7 @@ void unitTests(const QString &root) {
     BeatmapDocument unknown;
     require(unknown.loadSong(unknownTiming, &error) && !unknown.readOnlyReason().isEmpty(), "unknown time protection");
     require(!unknown.addObject(BeatObject{}, &error), "unknown timing cannot edit");
+    editorTimingTests(root);
 
     BeatmapDocument fresh;
     require(fresh.createNew(QDir(original).filePath("song.ogg"), "New song", 135, 0.4, {}, &error), error);
@@ -362,6 +504,79 @@ void realSamples(const QString &sampleRoot, const QString &root) {
     require(charts == 20, "expected twenty difficulties");
     QTextStream(stdout) << "PASS ten ZIPs / twenty difficulties / all exported file SHA256 bytes identical\n";
 }
+// Optional local regression: copies the entire project first and never saves or
+// exports back into the source. No user fixture or identifying path is tracked.
+void existingProjectRegression(const QString &manifestPath, const QString &root) {
+    QString error;
+    const QString original = QFileInfo(manifestPath).absolutePath();
+    const auto sourceFiles = ProjectStore::files(original, &error);
+    require(error.isEmpty() && !sourceFiles.isEmpty(), "local source project files: " + error);
+    QHash<QString, QByteArray> before;
+    for (const auto &relative : sourceFiles) before.insert(relative, hash(QDir(original).filePath(relative)));
+    QJsonObject manifest;
+    require(ProjectStore::readJson(manifestPath, &manifest, &error), error);
+    const QString originalAssets = QDir(original).filePath(manifest.value("assets").toString());
+    const QString copy = QDir(root).filePath("existing-project-copy");
+    require(ProjectStore::copyTree(original, copy, &error), error);
+    const QString copiedManifest = QDir(copy).filePath(QFileInfo(manifestPath).fileName());
+    BeatmapDocument initial;
+    require(initial.loadProject(copiedManifest, &error), error);
+    const auto difficulties = initial.difficulties();
+    for (int index = 0; index < difficulties.size(); ++index) {
+        const auto &difficulty = difficulties[index];
+        BeatmapDocument document;
+        require(document.loadProject(copiedManifest, &error) && document.setDifficulty(difficulty.id, &error), error);
+        require(document.readOnlyReason().isEmpty(), "local difficulty remains locked: " + document.readOnlyReason());
+        require(difficulty.version.startsWith("3."), "local regression requires v3 chart");
+        BeatObject edit;
+        bool found = false;
+        for (const auto &object : document.objects()) if (object.kind == ObjectKind::Note && !object.isProtected()) {
+            edit = object; found = true; break;
+        }
+        require(found, "local chart has editable basic note");
+        edit.direction = (edit.direction + 1) % 9;
+        require(document.updateObject(edit, &error) && document.undo(), "local basic edit and undo: " + error);
+        const QString undone = QDir(root).filePath("existing-undo-" + QString::number(index));
+        require(document.exportSong(undone, &error), error);
+        compareFolders(originalAssets, undone);
+        require(document.redo(), "local basic edit redo");
+        const QString savedPath = QDir(root).filePath("existing-saved-" + QString::number(index) + "/project.lmsc");
+        require(document.saveProject(savedPath, &error), error);
+        BeatmapDocument reopened;
+        require(reopened.loadProject(savedPath, &error) && reopened.readOnlyReason().isEmpty(), "local saved project is editable: " + error);
+        bool restored = false;
+        for (const auto &object : reopened.objects())
+            if (object.id == edit.id && object.direction == edit.direction) restored = true;
+        require(restored, "local project saved basic edit survives reopen");
+        const QString output = QDir(root).filePath("existing-edited-" + QString::number(index));
+        require(reopened.exportSong(output, &error), error);
+        for (const auto &relative : ProjectStore::files(originalAssets)) if (relative != difficulty.filename)
+            require(hash(QDir(originalAssets).filePath(relative)) == hash(QDir(output).filePath(relative)),
+                    "local edit changed unrelated map/audio/cover/metadata: " + relative);
+        QJsonObject oldMap, newMap;
+        require(ProjectStore::readJson(QDir(originalAssets).filePath(difficulty.filename), &oldMap, &error) &&
+                ProjectStore::readJson(QDir(output).filePath(difficulty.filename), &newMap, &error), error);
+        const auto oldNotes = oldMap.value("colorNotes").toArray(), newNotes = newMap.value("colorNotes").toArray();
+        require(oldNotes.size() == newNotes.size(), "local edit note count unchanged");
+        int changed = 0;
+        for (int i = 0; i < oldNotes.size(); ++i) if (oldNotes[i] != newNotes[i]) {
+            ++changed;
+            auto a = oldNotes[i].toObject(), b = newNotes[i].toObject(); a.remove("d"); b.remove("d");
+            require(a == b, "local edit changed more than one direction field");
+        }
+        require(changed == 1, "local edit changes exactly one basic note");
+        oldMap.remove("colorNotes"); newMap.remove("colorNotes");
+        require(oldMap == newMap, "local edit altered custom timing, unknown JSON or advanced arrays");
+        QTextStream(stdout) << "PASS local chart " << difficulty.filename
+                            << ": editable, undo byte-identical, redo/save/reopen/export, only one direction changed\n";
+    }
+    require(ProjectStore::files(original) == sourceFiles, "local source project file set unchanged");
+    for (const auto &relative : sourceFiles) {
+        const auto after = hash(QDir(original).filePath(relative));
+        require(after == before.value(relative), "local source project was modified: " + relative);
+        QTextStream(stdout) << "PASS source SHA256 unchanged: " << relative << " " << after.toHex() << "\n";
+    }
+}
 }
 
 int main(int argc, char **argv) {
@@ -371,7 +586,10 @@ int main(int argc, char **argv) {
         require(temporary.isValid(), "test temporary directory");
         unitTests(temporary.path());
         QTextStream(stdout) << "PASS synthetic edit, preservation, protection, undo/redo, project/recovery, BPM tests\n";
-        if (application.arguments().size() > 1) realSamples(application.arguments()[1], temporary.path());
+        const auto arguments = application.arguments();
+        if (arguments.size() > 2 && arguments[1] == "--project-regression")
+            existingProjectRegression(arguments[2], temporary.path());
+        else if (arguments.size() > 1) realSamples(arguments[1], temporary.path());
         return 0;
     } catch (const std::exception &exception) {
         QTextStream(stderr) << "FAIL " << QString::fromUtf8(exception.what()) << "\n";

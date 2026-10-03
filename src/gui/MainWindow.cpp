@@ -6,11 +6,14 @@
 #include "AiRecognitionPage.h"
 #include "GenerationPreviewDialog.h"
 #include "ThemeManager.h"
+#include "SongImportDialog.h"
+#include "SongExportDialog.h"
 #include "core/AppInfo.h"
 #include "core/AppSettings.h"
 #include "core/AudioService.h"
 #include "core/RhythmAnalyzer.h"
 #include "core/MtpImportService.h"
+#include "core/MtpExportService.h"
 #include "core/WorkspacePaths.h"
 #include "core/SongExporter.h"
 #include "core/AiTextTransport.h"
@@ -40,6 +43,8 @@
 #include <QMessageBox>
 #include <QPainter>
 #include <QProgressBar>
+#include <QProgressDialog>
+#include <QDesktopServices>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QScreen>
@@ -80,11 +85,6 @@ void addNewSongDifficultyChoices(QComboBox *combo) {
         combo->setItemData(combo->count() - 1, choice.rank, Qt::UserRole + 1);
     }
     combo->setCurrentIndex(combo->findData(QStringLiteral("Expert")));
-}
-QString safeName(QString name) {
-    name.replace(QRegularExpression(QStringLiteral("[<>:\"/\\\\|?*\\x00-\\x1f]")), "_");
-    while (name.endsWith('.') || name.endsWith(' ')) name.chop(1);
-    return name.trimmed().isEmpty() ? QStringLiteral("MySong") : name.left(100);
 }
 struct StorageResult { bool ok = false; QString error; };
 bool sameGenerationTiming(const lmsc::TimeMap &a, const lmsc::TimeMap &b) {
@@ -133,6 +133,7 @@ MainWindow::MainWindow(QWidget *parent, const QString &settingsFile)
       m_document(std::make_shared<lmsc::BeatmapDocument>()),
       m_audio(new AudioService(this)), m_analyzer(new RhythmAnalyzer(this)),
       m_mtp(new MtpImportService(this)),
+      m_mtpExport(new MtpExportService(this)),
       m_loader(new QFutureWatcher<DocumentLoadResult>(this)) {
     ui->setupUi(this);
     const auto preferences = lmsc::AppSettings(m_settingsFile).load();
@@ -222,6 +223,7 @@ MainWindow::~MainWindow() {
     if (m_generationPreview) m_generationPreview->close();
     m_settingsPanel->discardChanges();
     m_mtp->cancel();
+    m_mtpExport->cancel();
     m_audio->cancel();
     m_analyzer->cancel();
     m_loader->waitForFinished();
@@ -255,12 +257,7 @@ void MainWindow::buildEditor() {
         connect(b, &QPushButton::clicked, this, callback);
     };
     button(tr("新歌 · MP3 / MP4"), [this] { newSong(); });
-    button(tr("导入歌曲文件夹"), [this] { importSongFolder(); });
-    button(tr("导入曲谱 ZIP"), [this] {
-        if (m_busy || !confirmDocumentChange()) return;
-        const QString path = QFileDialog::getOpenFileName(this, tr("导入曲谱 ZIP"), {}, tr("曲谱压缩包 (*.zip)"));
-        if (!path.isEmpty()) openPath(path);
-    });
+    button(tr("导入歌曲"), [this] { importSongFolder(); });
     button(tr("打开编辑工程"), [this] {
         if (m_busy || !confirmDocumentChange()) return;
         const QString path = QFileDialog::getOpenFileName(this, tr("打开编辑工程"),
@@ -681,16 +678,16 @@ void MainWindow::buildActions() {
         connect(a, &QAction::triggered, this, callback); return a;
     };
     action(file, tr("新歌"), QKeySequence::New, [this] { newSong(); });
-    action(file, tr("导入歌曲文件夹"), QKeySequence::Open, [this] { importSongFolder(); });
-    action(file, tr("打开曲谱 ZIP"), QKeySequence("Ctrl+Shift+O"), [this] {
+    action(file, tr("导入歌曲"), QKeySequence::Open, [this] { importSongFolder(); });
+    action(file, tr("打开编辑工程"), QKeySequence("Ctrl+Shift+O"), [this] {
         if (m_busy || !confirmDocumentChange()) return;
-        const auto path = QFileDialog::getOpenFileName(this, tr("打开曲谱 ZIP"), {}, "*.zip");
+        const auto path = QFileDialog::getOpenFileName(this, tr("打开编辑工程"), lmsc::WorkspacePaths::projectsDirectory(), tr("编辑工程 (*.lmsc)"));
         if (!path.isEmpty()) openPath(path);
     });
     file->addSeparator();
     m_saveAction = action(file, tr("保存工程"), QKeySequence::Save, [this] { saveProject(); });
     action(file, tr("工程另存为"), QKeySequence::SaveAs, [this] { saveProject(true); });
-    m_exportAction = action(file, tr("导出歌曲目录"), QKeySequence("Ctrl+E"), [this] { exportSong(); });
+    m_exportAction = action(file, tr("导出歌曲"), QKeySequence("Ctrl+E"), [this] { exportSong(); });
     file->addSeparator();
     action(file, tr("退出"), QKeySequence("Alt+F4"), [this] { close(); });
     m_undoAction = action(edit, tr("撤销"), QKeySequence::Undo, [this] {
@@ -739,102 +736,12 @@ void MainWindow::showSettings() {
 
 void MainWindow::importSongFolder() {
     if (m_busy || !confirmDocumentChange()) return;
-    QDialog dialog(this);
-    dialog.setObjectName(QStringLiteral("songImportDialog"));
-    dialog.setWindowTitle(tr("导入歌曲文件夹"));
-    dialog.resize(760, 500);
-    auto layout = new QVBoxLayout(&dialog);
-    auto tabs = new QTabWidget(&dialog);
-    layout->addWidget(tabs, 1);
-    auto computer = new QWidget(tabs);
-    auto computerLayout = new QVBoxLayout(computer);
-    auto localHint = new QLabel(tr("选择电脑中含 Info.dat 的歌曲目录。\n头显通过 USB 连接时，请使用“PICO 头显”页。"), computer);
-    localHint->setWordWrap(true);
-    computerLayout->addWidget(localHint);
-    auto chooseLocal = new QPushButton(tr("选择电脑文件夹"), computer);
-    chooseLocal->setObjectName(QStringLiteral("chooseComputerFolder"));
-    computerLayout->addWidget(chooseLocal);
-    computerLayout->addStretch();
-    tabs->addTab(computer, tr("电脑文件夹"));
-    auto headset = new QWidget(tabs);
-    auto headsetLayout = new QVBoxLayout(headset);
-    auto hint = new QLabel(tr("连接并解锁 PICO，允许 USB 文件传输。\n"
-                             "星穹绿洲：SoulTopia / BeatNote / Custom\n"
-                             "光之乐团：Android / data / com.StarRiverVR.LightBand / files / CustomMusic\n"
-                             "以上目录均位于内部共享存储空间。导入时复制到电脑，保留头显中的原歌曲。"), headset);
-    hint->setWordWrap(true);
-    headsetLayout->addWidget(hint);
-    auto songs = new QListWidget(headset);
-    songs->setObjectName(QStringLiteral("mtpSongList"));
-    headsetLayout->addWidget(songs, 1);
-    auto status = new QLabel(tr("正在查找头显歌曲…"), headset);
-    status->setWordWrap(true);
-    headsetLayout->addWidget(status);
-    auto controls = new QHBoxLayout;
-    auto refresh = new QPushButton(tr("刷新头显歌曲"), headset);
-    refresh->setObjectName(QStringLiteral("refreshHeadsetSongs"));
-    auto import = new QPushButton(tr("导入选中歌曲"), headset);
-    import->setObjectName(QStringLiteral("importHeadsetSong"));
-    import->setEnabled(false);
-    controls->addWidget(refresh);
-    controls->addWidget(import);
-    headsetLayout->addLayout(controls);
-    tabs->addTab(headset, tr("PICO 头显"));
-    auto buttons = new QDialogButtonBox(QDialogButtonBox::Cancel, &dialog);
-    buttons->button(QDialogButtonBox::Cancel)->setText(tr("取消"));
-    layout->addWidget(buttons);
-    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    QString localFolder;
-    MtpSongEntry selected;
-    bool importDevice = false;
-    connect(chooseLocal, &QPushButton::clicked, &dialog, [&] {
-        localFolder = QFileDialog::getExistingDirectory(&dialog, tr("选择含 Info.dat 的歌曲目录"));
-        if (!localFolder.isEmpty()) dialog.accept();
-    });
-    connect(songs, &QListWidget::currentRowChanged, &dialog, [=](int row) {
-        import->setEnabled(row >= 0 && !m_mtp->isBusy());
-    });
-    connect(m_mtp, &MtpImportService::songsListed, &dialog, [=](const QVector<MtpSongEntry> &entries) {
-        songs->clear();
-        for (const auto &entry : entries) {
-            const QString source = entry.gameName.isEmpty()
-                ? entry.deviceName : entry.gameName + QStringLiteral(" · ") + entry.deviceName;
-            auto item = new QListWidgetItem(entry.name + "\n" + source, songs);
-            item->setData(Qt::UserRole, QVariant::fromValue(entry));
-            item->setToolTip(entry.location);
-        }
-        refresh->setEnabled(true);
-        status->setText(entries.isEmpty()
-            ? tr("没有找到歌曲。请检查头显连接、USB 文件传输授权，以及 Custom / CustomMusic 目录。")
-            : tr("找到 %1 首歌曲，选择后导入。").arg(entries.size()));
-        if (!entries.isEmpty()) { tabs->setCurrentWidget(headset); songs->setCurrentRow(0); }
-    });
-    connect(m_mtp, &MtpImportService::errorOccurred, &dialog, [=](const QString &error) {
-        status->setText(error); refresh->setEnabled(true);
-    });
-    connect(m_mtp, &MtpImportService::cancelled, &dialog, [=] {
-        status->setText(tr("读取已取消，可重新刷新。")); refresh->setEnabled(true);
-    });
-    connect(m_mtp, &MtpImportService::taskProgress, &dialog, [=](const QString &task, int) {
-        status->setText(task);
-    });
-    auto requestList = [=] {
-        if (m_mtp->isBusy()) { status->setText(tr("正在结束上次读取，请稍后刷新。")); return; }
-        songs->clear(); import->setEnabled(false); refresh->setEnabled(false);
-        status->setText(tr("正在查找头显歌曲…")); m_mtp->listSongs();
-    };
-    connect(refresh, &QPushButton::clicked, &dialog, requestList);
-    connect(import, &QPushButton::clicked, &dialog, [&] {
-        if (m_mtp->isBusy() || !songs->currentItem()) return;
-        selected = songs->currentItem()->data(Qt::UserRole).value<MtpSongEntry>();
-        importDevice = true; dialog.accept();
-    });
-    QTimer::singleShot(0, &dialog, requestList);
-    if (dialog.exec() != QDialog::Accepted) { m_mtp->cancel(); return; }
-    if (!importDevice) { m_mtp->cancel(); openPath(localFolder); return; }
+    SongImportDialog dialog(m_mtp, this);
+    if (dialog.exec() != QDialog::Accepted) return;
+    if (!dialog.fromDevice()) { openPath(dialog.localPath()); return; }
     m_mtpImportPending = true;
     setBusy(true, tr("正在从头显复制歌曲到电脑…"));
-    m_mtp->importSong(selected);
+    m_mtp->importSong(dialog.selectedSong());
 }
 
 void MainWindow::showAbout() {
@@ -1349,11 +1256,11 @@ bool MainWindow::saveProject(bool saveAs) {
 
 void MainWindow::exportSong() {
     if (m_busy || !m_document->isLoaded()) return;
-    const auto parent = QFileDialog::getExistingDirectory(this, tr("选择导出位置（将新建歌曲子目录）"));
-    if (parent.isEmpty()) return;
-    const QString base = QDir(parent).filePath(safeName(m_document->title()));
-    QString path = base;
-    int suffix = 2; while (QFileInfo::exists(path)) path = base + "-" + QString::number(suffix++);
+    SongExportDialog dialog(m_mtpExport, m_document->title(), this);
+    if (dialog.exec() != QDialog::Accepted) return;
+    QString namingError;
+    const QString path = lmsc::WorkspacePaths::suggestedSongExportFolder(m_document->title(), dialog.parentDirectory(), &namingError);
+    if (path.isEmpty()) { showError(namingError); return; }
     const double leadIn = m_document->isNewSong() ? m_exportLeadIn->value() : 0;
     const QString toolsDirectory = m_audio->toolsDirectory();
     m_storageBusy = true;
@@ -1370,17 +1277,58 @@ void MainWindow::exportSong() {
     m_cancelButton->hide();
     loop.exec();
     const auto result = watcher.result();
-    m_storageBusy = false;
-    setBusy(false);
-    if (!result.ok) { showError(result.error); return; }
+    if (!result.ok) { m_storageBusy = false; setBusy(false); showError(result.error); return; }
+    QString deviceLocation;
+    if (dialog.toDevice()) {
+        QString transferError;
+        bool uploadComplete = false, uploadCancelled = false, cancelRequested = false;
+        QEventLoop transferLoop;
+        QProgressDialog progress(tr("正在向头显新增歌曲并校验…"), tr("取消上传"), 0, 100, this);
+        progress.setWindowTitle(tr("导出到 PICO")); progress.setWindowModality(Qt::WindowModal);
+        progress.setMinimumDuration(0); progress.setAutoClose(false); progress.setAutoReset(false);
+        const auto uploaded = connect(m_mtpExport, &MtpExportService::songUploaded, &transferLoop,
+            [&](const QString &, const QString &location) { uploadComplete = true; deviceLocation = location; transferLoop.quit(); });
+        const auto failed = connect(m_mtpExport, &MtpExportService::errorOccurred, &transferLoop,
+            [&](const QString &error) { transferError = error; transferLoop.quit(); });
+        const auto cancelled = connect(m_mtpExport, &MtpExportService::cancelled, &transferLoop,
+            [&] { uploadCancelled = true; transferLoop.quit(); });
+        const auto advanced = connect(m_mtpExport, &MtpExportService::taskProgress, &progress,
+            [&](const QString &task, int percent) { progress.setLabelText(task); progress.setRange(0, percent < 0 ? 0 : 100); if (percent >= 0) progress.setValue(percent); });
+        connect(&progress, &QProgressDialog::canceled, &transferLoop, [&] {
+            cancelRequested = true;
+            if (m_mtpExport->isBusy()) m_mtpExport->cancel();
+            else { uploadCancelled = true; transferLoop.quit(); }
+        });
+        progress.show();
+        QTimer::singleShot(0, &transferLoop, [&] {
+            if (cancelRequested) { transferLoop.quit(); return; }
+            m_mtpExport->uploadSong(path, dialog.destination());
+        });
+        transferLoop.exec();
+        disconnect(uploaded); disconnect(failed); disconnect(cancelled); disconnect(advanced);
+        progress.close();
+        if (!uploadComplete) {
+            m_storageBusy = false; setBusy(false);
+            QString reason = transferError;
+            if (reason.isEmpty()) reason = uploadCancelled ? tr("已取消头显上传。") : tr("头显上传未完成。");
+            showError(reason + tr("\n完整电脑副本仍保留在：\n%1").arg(QDir::toNativeSeparators(path)));
+            return;
+        }
+    }
+    m_storageBusy = false; setBusy(false);
     const QString bufferNote = leadIn > 0
         ? tr("\n已添加 %1 秒开场静音，音符、炸弹和墙同步后移。工程中的音频与拍点不变。\n").arg(leadIn, 0, 'f', 3)
         : QString();
-    QMessageBox::information(this, tr("导出完成"),
+    QMessageBox message(QMessageBox::Information, tr("导出完成"),
         tr("歌曲目录：\n%1\n%2\n手动复制整个歌曲目录到对应游戏的目录：\n"
-           "星穹绿洲：SoulTopia\\BeatNote\\Custom\n"
-           "光之乐团：Android\\data\\com.StarRiverVR.LightBand\\files\\CustomMusic\n\n"
-           "在目标游戏中检查声音、难度和开头物件。").arg(QDir::toNativeSeparators(path), bufferNote));
+           "星穹绿洲：SoulTopia\\BeatNote\\Custom\\光剑曲谱制作\n"
+           "光之乐团：Android\\data\\com.StarRiverVR.LightBand\\files\\CustomMusic\\光剑曲谱制作\n\n"
+           "在目标游戏中检查分类识别、声音、难度和开头物件。")
+            .arg(QDir::toNativeSeparators(path), bufferNote)
+            + (deviceLocation.isEmpty() ? QString() : tr("\n\n设备传输与回读校验已完成：\n%1").arg(deviceLocation)), QMessageBox::Ok, this);
+    auto open = message.addButton(tr("打开歌曲目录"), QMessageBox::ActionRole);
+    connect(open, &QPushButton::clicked, &message, [path] { QDesktopServices::openUrl(QUrl::fromLocalFile(path)); });
+    message.exec();
 }
 
 bool MainWindow::confirmDocumentChange() {

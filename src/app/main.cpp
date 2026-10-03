@@ -4,8 +4,11 @@
 #include <QFile>
 #include <QFont>
 #include <QIcon>
+#include <QTemporaryDir>
 #include <QTimer>
+#include <memory>
 #include "core/AppInfo.h"
+#include "core/AppSettings.h"
 #include "gui/MainWindow.h"
 #include "gui/EditorViews.h"
 
@@ -25,10 +28,21 @@ int main(int argc, char *argv[]) {
     parser.addOption({QStringList{"smoke-check"}, QStringLiteral("执行编辑与工程往返验证，并保存截图和报告。"), "directory"});
     parser.addOption({QStringList{"capture"}, QStringLiteral("加载完成后保存界面截图。"), "path"});
     parser.process(application);
-    MainWindow window;
     const QString check = parser.value("smoke-check");
     const QString capture = parser.value("capture");
     const bool automated = !check.isEmpty() || !capture.isEmpty();
+    std::unique_ptr<QTemporaryDir> isolatedSettings;
+    QString settingsFile;
+    if (automated) {
+        isolatedSettings.reset(new QTemporaryDir);
+        if (!isolatedSettings->isValid()) return 1;
+        settingsFile = isolatedSettings->filePath(QStringLiteral("settings.ini"));
+        lmsc::AppPreferences preferences;
+        preferences.diagnosticLogEnabled = false;
+        QString settingsError;
+        if (!lmsc::AppSettings(settingsFile).save(preferences, &settingsError)) return 1;
+    }
+    MainWindow window(nullptr, settingsFile);
     window.setTestMode(automated);
     auto report = [&](const QString &message, int code) {
         if (!check.isEmpty()) {
