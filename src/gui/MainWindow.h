@@ -41,6 +41,7 @@ class AiRecognitionService;
 class AiGenerationService;
 class ConfiguredAiTextTransport;
 class LlmAiGenerationService;
+class LocalAiGenerationService;
 class GenerationPreviewDialog;
 struct GenerationRequest;
 struct GenerationDraft;
@@ -62,8 +63,12 @@ public:
     // The caller owns the recognition backend and keeps it in the GUI thread.
     // A backend may dispatch its analysis to workers; none is connected by default.
     void setAiRecognitionService(lmsc::AiRecognitionService *service);
-    // Caller-owned override. nullptr restores the configured application backend.
+    // Caller-owned model override; selects model mode. nullptr restores the
+    // configured model backend. The local mode remains independently available.
     void setAiGenerationService(lmsc::AiGenerationService *service);
+    // Caller-owned local override; selects local mode. nullptr restores the
+    // application's offline backend.
+    void setAiLocalGenerationService(lmsc::AiGenerationService *service);
 signals:
     void documentReady();
     void loadFailed(const QString &error);
@@ -120,6 +125,7 @@ private:
     lmsc::AiRecognitionPage *m_aiPage = nullptr;
     lmsc::ConfiguredAiTextTransport *m_aiTransport = nullptr;
     lmsc::LlmAiGenerationService *m_defaultGenerationService = nullptr;
+    lmsc::LocalAiGenerationService *m_localGenerationService = nullptr;
     QPointer<lmsc::GenerationPreviewDialog> m_generationPreview;
     QString m_documentId;
     lmsc::AppPreferences m_generationPreferences;

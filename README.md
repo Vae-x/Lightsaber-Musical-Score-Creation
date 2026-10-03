@@ -2,6 +2,8 @@
 
 基于 **Qt5 / C++** 的 Windows 曲谱编辑器，支持手动编排、MP3/MP4 音频处理和 AI 整曲制谱。用户已反馈此前导出歌曲可用于 PICO Neo 3 的《星穹绿洲》和《光之乐团》。APK 留在后续阶段。
 
+源码开发版新增默认的 **本地快速制谱**：无需模型连接、Python 或独立显卡，使用音乐起音、动作模式和有限搜索生成候选谱；原有大语言模型方式仍可选择。该功能尚未更新到下方的 v0.4.0 下载包，本地速度与头显手感的验证范围见 [更新记录](CHANGELOG.md)。
+
 ## 下载与快速开始
 
 **[下载 v0.4.0 Windows 便携版](https://github.com/Vae-x/Lightsaber-Musical-Score-Creation/releases/tag/v0.4.0)** · [全部版本](https://github.com/Vae-x/Lightsaber-Musical-Score-Creation/releases)

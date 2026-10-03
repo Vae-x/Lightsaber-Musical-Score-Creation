@@ -83,7 +83,16 @@ AiRecognitionPage::AiRecognitionPage(QWidget *parent)
     m_serviceStatus = label({}, service);
     m_serviceStatus->setObjectName(QStringLiteral("aiServiceStatus"));
     serviceLayout->addWidget(m_serviceStatus);
-    serviceLayout->addWidget(label(tr("音频在本机提取节拍与段落特征，再交给已配置的模型规划。分析可用于已有歌曲；自动制谱首版仅支持新建歌曲。"), service));
+    serviceLayout->addWidget(label(tr("本地快速制谱在电脑上分析音乐并编排动作，无需模型连接或独立显卡。也可选择大语言模型制谱。分析可用于已有歌曲；自动制谱仅支持新建歌曲。"), service));
+    auto modes = new QHBoxLayout;
+    modes->addWidget(label(tr("生成方式"), service));
+    m_mode = new QComboBox(service);
+    m_mode->setObjectName(QStringLiteral("aiGenerationMode"));
+    m_mode->addItem(tr("本地快速制谱"), LocalQuick);
+    m_mode->addItem(tr("大语言模型制谱"), LanguageModel);
+    modes->addWidget(m_mode);
+    modes->addStretch();
+    serviceLayout->addLayout(modes);
     auto options = new QHBoxLayout;
     options->addWidget(label(tr("生成难度"), service));
     m_difficulty = new QComboBox(service);
@@ -169,6 +178,12 @@ AiRecognitionPage::AiRecognitionPage(QWidget *parent)
     connect(m_preview, &QPushButton::clicked, this, [this] { if (m_hasDraft) emit generationDraftReady(m_cachedDraft); });
     connect(m_logs, &QPushButton::clicked, this, [this] { showDiagnosticLog(this,m_lastGeneration.jobId); });
     connect(m_configure, &QPushButton::clicked, this, &AiRecognitionPage::configureConnectionRequested);
+    connect(m_mode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+        const auto next = static_cast<GenerationMode>(m_mode->currentData().toInt());
+        if (next == m_generationMode) return;
+        m_generationMode = next;
+        activateGenerationService(true);
+    });
     const auto optionsChanged = [this] {
         if (m_updatingOptions) return;
         invalidateGeneration();
@@ -296,7 +311,26 @@ void AiRecognitionPage::setService(AiRecognitionService *service) {
 
 void AiRecognitionPage::setGenerationService(AiGenerationService *service, AiGenerationService *fallback) {
     m_generationFallback = fallback;
-    if (m_generationService == service) { refreshControls(); showIdleStatus(); return; }
+    m_modelGenerationService = service;
+    if (!usesLocalGeneration()) activateGenerationService();
+}
+
+void AiRecognitionPage::setLocalGenerationService(AiGenerationService *service, AiGenerationService *fallback) {
+    m_localGenerationFallback = fallback;
+    m_localGenerationService = service;
+    if (usesLocalGeneration()) activateGenerationService();
+}
+
+void AiRecognitionPage::setGenerationMode(GenerationMode mode) {
+    const int index = m_mode->findData(mode);
+    if (index >= 0) m_mode->setCurrentIndex(index);
+}
+
+void AiRecognitionPage::activateGenerationService(bool force) {
+    auto service = usesLocalGeneration()
+        ? (m_localGenerationService ? m_localGenerationService.data() : m_localGenerationFallback.data())
+        : (m_modelGenerationService ? m_modelGenerationService.data() : m_generationFallback.data());
+    if (!force && m_generationService == service) { refreshControls(); showIdleStatus(); return; }
     invalidateGeneration();
     for (const auto &connection : m_generationConnections) disconnect(connection);
     m_generationConnections.clear();
@@ -334,7 +368,9 @@ void AiRecognitionPage::setGenerationService(AiGenerationService *service, AiGen
                 m_pendingGeneration = {};
                 const auto state=m_generationService ? m_generationService->status() : AiGenerationService::Status{};
                 const QString retained=state.resumable ? tr("\n已保留 %1/%2 个乐句；处理上述原因后可继续。").arg(state.completedSegments).arg(state.totalSegments) : QString();
-                setStatus((message.isEmpty() ? tr("分析或生成失败，请检查模型连接。") : message)+retained, "error");
+                const QString fallback = usesLocalGeneration() ? tr("本地分析或生成失败，请检查音频与时间参数。")
+                    : tr("分析或生成失败，请检查模型连接。");
+                setStatus((message.isEmpty() ? fallback : message)+retained, "error");
                 refreshControls();
             }));
         m_generationConnections.append(connect(service, &AiGenerationService::progress, this,
@@ -349,7 +385,8 @@ void AiRecognitionPage::setGenerationService(AiGenerationService *service, AiGen
             [this, revision](const QString &jobId) {
                 if (revision != m_generationServiceRevision || jobId != m_pendingGeneration.jobId || jobId.isEmpty()) return;
                 m_pendingGeneration = {};
-                setStatus(tr("任务已停止，已完成进度保留。"));
+                setStatus(usesLocalGeneration() ? tr("本地任务已取消，可重新生成。")
+                    : tr("任务已停止，已完成进度保留。"));
                 refreshControls();
             }));
         m_generationConnections.append(connect(service, &AiGenerationService::availabilityChanged, this,
@@ -364,9 +401,9 @@ void AiRecognitionPage::setGenerationService(AiGenerationService *service, AiGen
                 if (revision != m_generationServiceRevision) return;
                 m_pendingGeneration = {};
                 m_generationService.clear();
-                emit generationInvalidated();
-                setGenerationService(m_generationFallback, m_generationFallback);
-                setStatus(tr("生成服务已断开，请检查模型连接。"), "warning");
+                activateGenerationService(true);
+                setStatus(usesLocalGeneration() ? tr("本地制谱服务已断开。")
+                    : tr("生成服务已断开，请检查模型连接。"), "warning");
             }));
     }
     refreshControls();
@@ -452,7 +489,13 @@ void AiRecognitionPage::invalidateGeneration() {
     refreshControls();
     emit generationInvalidated();
 }
-void AiRecognitionPage::pauseGenerationForConnectionChange() { cancelRecognition(); }
+void AiRecognitionPage::pauseGenerationForConnectionChange() {
+    if (!usesLocalGeneration()) cancelRecognition();
+}
+
+void AiRecognitionPage::invalidateGenerationForConnectionChange() {
+    if (!usesLocalGeneration()) invalidateGeneration();
+}
 
 void AiRecognitionPage::showGenerationApplied() {
     setStatus(tr("候选谱已应用，可在曲谱编辑中一次撤销。"), "success");
@@ -484,7 +527,8 @@ void AiRecognitionPage::cancelRecognition() {
     const auto jobId = m_pendingGeneration.jobId;
     m_pendingContextId.clear();
     m_pendingGeneration = {};
-    setStatus(contextId.isEmpty() ? tr("任务已停止，已完成进度保留。") : tr("识别已取消。"));
+    setStatus(!contextId.isEmpty() ? tr("识别已取消。") : usesLocalGeneration()
+        ? tr("本地任务已取消，可重新生成。") : tr("任务已停止，已完成进度保留。"));
     refreshControls();
     if (!contextId.isEmpty()) emit cancelRequested(contextId);
     if (!jobId.isEmpty()) emit cancelGenerationRequested(jobId);
@@ -510,21 +554,32 @@ void AiRecognitionPage::refreshControls() {
     m_generate->setEnabled(m_generationService && m_generationService->isAvailable() && hasSnapshot
         && validTiming && m_newSong && selectedTypes() != GeneratedTypes() && !m_contextBusy && !isRecognizing());
     m_difficulty->setEnabled(m_newSong && !m_contextBusy);
+    m_mode->setEnabled(!m_contextBusy);
     for (auto box : {m_directional, m_dots, m_bombs, m_walls}) box->setEnabled(m_newSong && !m_contextBusy);
     m_cancel->setEnabled(isRecognizing());
     m_cancel->setVisible(isRecognizing());
     const auto state=m_generationService ? m_generationService->status() : AiGenerationService::Status{};
-    const bool canResume=!m_lastGeneration.jobId.isEmpty() && state.jobId==m_lastGeneration.jobId && state.resumable;
+    const bool canResume=!usesLocalGeneration() && !m_lastGeneration.jobId.isEmpty()
+        && state.jobId==m_lastGeneration.jobId && state.resumable;
     m_resume->setVisible(canResume); m_resume->setEnabled(canResume && available && !m_contextBusy && !isRecognizing());
     m_preview->setVisible(m_hasDraft); m_preview->setEnabled(m_hasDraft && !m_contextBusy && !isRecognizing());
     m_logs->setVisible(!m_lastGeneration.jobId.isEmpty());
     m_generate->setText(!m_lastGeneration.jobId.isEmpty() && !m_lastGeneration.analysisOnly ? tr("重新生成") : tr("生成候选谱"));
     m_progress->setVisible(isRecognizing() || !m_lastGeneration.jobId.isEmpty());
-    m_configure->setEnabled(!isRecognizing() && !m_contextBusy);
-    m_serviceStatus->setText(available
-        ? tr("已连接分析与编排服务")
-        : tr("请先配置并保存模型连接，或完成账号授权。"));
-    if (!available) m_start->setToolTip(tr("请先配置并保存可用的模型连接。"));
+    m_configure->setEnabled((usesLocalGeneration() || !isRecognizing()) && !m_contextBusy);
+    m_configure->setText(usesLocalGeneration() ? tr("模型连接设置（可选）") : tr("配置 AI 连接"));
+    if (m_legacyOverride) {
+        m_serviceStatus->setText(available ? tr("已连接音频分析服务") : tr("音频分析服务尚未接入。"));
+    } else if (usesLocalGeneration()) {
+        m_serviceStatus->setText(available ? tr("本地快速制谱已就绪 · 离线运行，无需配置模型连接")
+            : tr("本地制谱服务尚未准备就绪。"));
+    } else {
+        m_serviceStatus->setText(available ? tr("已连接模型分析与编排服务")
+            : tr("请先配置并保存模型连接，或完成账号授权。"));
+    }
+    const QString unavailableTip = usesLocalGeneration() && !m_legacyOverride
+        ? tr("本地制谱服务尚未准备就绪。") : tr("请先配置并保存可用的模型连接。");
+    if (!available) m_start->setToolTip(unavailableTip);
     else if (!hasAudio) m_start->setToolTip(tr("请打开带有可用本地音频的歌曲或工程。"));
     else if (m_contextBusy) m_start->setToolTip(tr("请等待当前任务结束。"));
     else if (!validTiming) m_start->setToolTip(tr("请先确认歌曲的 BPM 和时间参数。"));
@@ -532,7 +587,7 @@ void AiRecognitionPage::refreshControls() {
     if (!m_newSong) m_generate->setToolTip(tr("自动制谱首版仅支持新建歌曲；已有歌曲可使用分析音乐。"));
     else if (selectedTypes() == GeneratedTypes()) m_generate->setToolTip(tr("请至少勾选一种物件类型。"));
     else if (!hasSnapshot) m_generate->setToolTip(tr("请等待当前歌曲音频准备完成。"));
-    else if (!m_generationService || !m_generationService->isAvailable()) m_generate->setToolTip(tr("请先配置并保存可用的模型连接。"));
+    else if (!m_generationService || !m_generationService->isAvailable()) m_generate->setToolTip(unavailableTip);
     else m_generate->setToolTip({});
 }
 
@@ -541,7 +596,8 @@ void AiRecognitionPage::showIdleStatus() {
     const bool available = m_legacyOverride || !m_generationService
         ? m_service && m_service->isAvailable() : m_generationService->isAvailable();
     if (!available) {
-        setStatus(tr("请先配置并保存模型连接。"));
+        setStatus(usesLocalGeneration() && !m_legacyOverride ? tr("本地制谱服务尚未准备就绪。")
+            : tr("请先配置并保存模型连接。"));
     } else if (m_contextBusy) {
         setStatus(tr("请等待当前任务结束。"));
     } else if (m_audioFile.isEmpty() || !QFileInfo(m_audioFile).isFile()

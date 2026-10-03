@@ -8,6 +8,7 @@
 #include "gui/SongImportDialog.h"
 #include "gui/SongExportDialog.h"
 #include "core/AiTextTransport.h"
+#include "core/LocalAiGenerationService.h"
 #include "core/AppInfo.h"
 #include "core/AppSettings.h"
 #include "core/AudioService.h"
@@ -153,6 +154,7 @@ private slots:
     void aiRecognitionEntry();
     void aiSuggestionsPreserveLoadedDocument();
     void aiGenerationPreviewAndAtomicApply();
+    void localGenerationOfflinePreviewAndApply();
     void outputLimitSettingsReachGenerationTransport();
     void clickPlaceApplyUndoAndDifficulty();
     void protectedSelectionRejectsEntireDrag();
@@ -429,6 +431,9 @@ void MainWindowTest::aiRecognitionEntry() {
     QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 20000);
     QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
     nav->setCurrentRow(1);
+    // The default offline analyzer works without saved model credentials.
+    QVERIFY(recognize->isEnabled());
+    window.findChild<lmsc::AiRecognitionPage *>()->setGenerationMode(lmsc::AiRecognitionPage::LanguageModel);
     QVERIFY(!recognize->isEnabled());
     QVERIFY(hasText(*workspace->currentWidget(), QStringLiteral("GUI Fixture")));
     QCOMPARE(objectCount(window), 3);
@@ -519,6 +524,102 @@ void MainWindowTest::outputLimitSettingsReachGenerationTransport() {
     tokens->setValue(65536); QVERIFY(settings->applyPreferences()); QCOMPARE(changes.count(),1);
     QCOMPARE(transport->outputPolicy().maximumTokens,65536);
 }
+void MainWindowTest::localGenerationOfflinePreviewAndApply() {
+    QString error;
+    const QString song = QDir(m_song).filePath(QStringLiteral("song.ogg"));
+    QFile source(song);
+    QVERIFY(source.open(QIODevice::ReadOnly));
+    const auto hash = QCryptographicHash::hash(source.readAll(), QCryptographicHash::Sha256);
+    source.close();
+    lmsc::BeatmapDocument original;
+    QVERIFY2(original.createNew(song, QStringLiteral("本地制谱检查"), 120, .25, {}, &error), qPrintable(error));
+    lmsc::BeatObject note;
+    note.beat = 2; note.direction = 1;
+    QVERIFY2(original.addObject(note, &error), qPrintable(error));
+    const QString project = m_temp.filePath(QStringLiteral("local-generation-project/project.lmsc"));
+    QVERIFY2(original.saveProject(project, &error), qPrintable(error));
+    MainWindow window(nullptr, settingsFile());
+    window.setTestMode(true);
+    window.show();
+    QSignalSpy ready(&window, &MainWindow::documentReady);
+    window.openPath(project);
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 20000);
+    QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
+    auto *page = window.findChild<lmsc::AiRecognitionPage *>();
+    auto *service = window.findChild<lmsc::LocalAiGenerationService *>();
+    auto *nav = window.findChild<QListWidget *>(QStringLiteral("mainNavigation"));
+    auto *generate = window.findChild<QPushButton *>(QStringLiteral("aiGenerateButton"));
+    auto *target = window.findChild<QComboBox *>(QStringLiteral("aiGenerationDifficulty"));
+    auto *actual = window.findChild<QComboBox *>(QStringLiteral("newSongDifficultySelector"));
+    auto *candidate = window.findChild<QPushButton *>(QStringLiteral("aiViewCandidate"));
+    QVERIFY(page && service && nav && generate && target && actual && candidate);
+    QCOMPARE(page->generationMode(), lmsc::AiRecognitionPage::LocalQuick);
+    QVERIFY(!QFile::exists(settingsFile()));
+    nav->setCurrentRow(1);
+    target->setCurrentIndex(target->findData(QStringLiteral("Hard")));
+    QVERIFY(generate->isEnabled());
+    QSignalSpy drafts(service, &lmsc::AiGenerationService::draftReady);
+    QSignalSpy failed(service, &lmsc::AiGenerationService::requestFailed);
+    generate->click();
+    nav->setCurrentRow(0);
+    QTRY_VERIFY_WITH_TIMEOUT(drafts.count() == 1 || failed.count() > 0, 30000);
+    const QString failure = failed.isEmpty() ? QString() : failed.first().at(1).toString();
+    QVERIFY2(failed.isEmpty(), qPrintable(failure));
+    const auto draft = qvariant_cast<lmsc::GenerationDraft>(drafts.first().first());
+    QVERIFY(draft.objects.size() > 1);
+    QCOMPARE(objectCount(window), 1);
+    QVERIFY(!window.findChild<lmsc::GenerationPreviewDialog *>());
+    nav->setCurrentRow(1);
+    QVERIFY(candidate->isEnabled());
+    const QString captures = qEnvironmentVariable("LMSC_LOCAL_CAPTURE_DIRECTORY");
+    if (!captures.isEmpty()) {
+        QVERIFY(QDir().mkpath(captures));
+        const QString originalTheme = lmsc::ThemeManager::mode();
+        for (const QString &mode : {QStringLiteral("light"), QStringLiteral("dark")}) {
+            lmsc::ThemeManager::apply(mode);
+            window.resize(1200, 800);
+            QApplication::processEvents();
+            QTest::qWait(80);
+            QVERIFY(window.grab().save(QDir(captures).filePath(QStringLiteral("local-generation-%1.png").arg(mode))));
+        }
+        lmsc::ThemeManager::apply(originalTheme);
+    }
+    candidate->click();
+    QPointer<lmsc::GenerationPreviewDialog> preview = window.findChild<lmsc::GenerationPreviewDialog *>();
+    QVERIFY(preview && preview->isVisible());
+    if (!captures.isEmpty()) {
+        QApplication::processEvents();
+        QVERIFY(preview->grab().save(QDir(captures).filePath(QStringLiteral("local-preview.png"))));
+    }
+    preview->findChild<QPushButton *>(QStringLiteral("generationPreviewApply"))->click();
+    QTRY_VERIFY(preview.isNull());
+    QCOMPARE(objectCount(window), draft.objects.size());
+    QCOMPARE(actual->currentData().toString(), QStringLiteral("Hard"));
+    QCOMPARE(window.findChild<QListWidget *>(QStringLiteral("difficultyList"))->count(), 2);
+    nav->setCurrentRow(0);
+    QAction *undo = nullptr, *redo = nullptr, *save = nullptr;
+    for (auto *action : window.findChildren<QAction *>()) {
+        if (action->text() == QStringLiteral("撤销")) undo = action;
+        if (action->text() == QStringLiteral("重做")) redo = action;
+        if (action->text() == QStringLiteral("保存工程")) save = action;
+    }
+    QVERIFY(undo && redo && save);
+    undo->trigger();
+    QCOMPARE(objectCount(window), 1);
+    QCOMPARE(actual->currentData().toString(), QStringLiteral("Expert"));
+    redo->trigger();
+    QCOMPARE(objectCount(window), draft.objects.size());
+    save->trigger();
+    QTRY_VERIFY_WITH_TIMEOUT(save->isEnabled(), 20000);
+    lmsc::BeatmapDocument reopened;
+    QVERIFY2(reopened.loadProject(project, &error), qPrintable(error));
+    QCOMPARE(reopened.difficulties().size(), 2);
+    QCOMPARE(reopened.objects().size(), draft.objects.size());
+    QVERIFY(source.open(QIODevice::ReadOnly));
+    QCOMPARE(QCryptographicHash::hash(source.readAll(), QCryptographicHash::Sha256), hash);
+    window.close();
+}
+
 void MainWindowTest::aiGenerationPreviewAndAtomicApply() {
     QString error;
     lmsc::BeatmapDocument original;
@@ -1557,7 +1658,7 @@ void MainWindowTest::captureWorkspace() {
         nav->setCurrentRow(1);
         QApplication::processEvents();
         QVERIFY(fullyInside(start, workspace->currentWidget()));
-        QVERIFY(fullyInside(configure, workspace->currentWidget()));
+        if (configure->isVisible()) QVERIFY(fullyInside(configure, workspace->currentWidget()));
         QVERIFY(capture(QStringLiteral("main-ai-recognition-%1-minimum").arg(mode)));
     }
     window.close();

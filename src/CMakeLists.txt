@@ -39,6 +39,8 @@ add_library(lmsc_core STATIC
         core/AiTextTransport.cpp core/AiTextTransport.h
         core/CodexTextSession.cpp core/CodexTextSession.h
         core/AiGenerationService.cpp core/AiGenerationService.h
+        core/LocalAiGenerationService.cpp core/LocalAiGenerationService.h
+        core/LocalChartGenerator.cpp core/LocalChartGenerator.h
         core/MusicFeatureAnalyzer.cpp core/MusicFeatureAnalyzer.h
         core/BeatmapPlayabilityValidator.cpp core/BeatmapPlayabilityValidator.h
         core/ApiModelClient.cpp core/ApiModelClient.h
@@ -204,6 +206,11 @@ if (BUILD_TESTING)
     set_target_properties(ai_generation_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
     add_test(NAME ai_generation COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:ai_generation_tests>")
     set_tests_properties(ai_generation PROPERTIES TIMEOUT 180 LABELS "core;ai;audio")
+    add_executable(local_generation_tests "${LMSC_REPOSITORY_DIR}/tests/LocalGenerationTest.cpp")
+    target_link_libraries(local_generation_tests PRIVATE lmsc_core Qt5::Test)
+    set_target_properties(local_generation_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_test(NAME local_generation COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:local_generation_tests>")
+    set_tests_properties(local_generation PROPERTIES TIMEOUT 180 LABELS "core;audio;generation")
     add_executable(ai_generation_page_tests
             "${LMSC_REPOSITORY_DIR}/tests/AiGenerationPageTest.cpp"
             gui/AiRecognitionPage.cpp gui/AiRecognitionPage.h

@@ -17,6 +17,7 @@
 #include "core/WorkspacePaths.h"
 #include "core/SongExporter.h"
 #include "core/AiTextTransport.h"
+#include "core/LocalAiGenerationService.h"
 #include <QtConcurrent>
 #include <QAction>
 #include <QApplication>
@@ -145,6 +146,7 @@ MainWindow::MainWindow(QWidget *parent, const QString &settingsFile)
     m_aiTransport = new lmsc::ConfiguredAiTextTransport(this);
     m_aiTransport->configure(preferences);
     m_defaultGenerationService = new lmsc::LlmAiGenerationService(m_aiTransport, this);
+    m_localGenerationService = new lmsc::LocalAiGenerationService(this);
     lmsc::ThemeManager::watchSystemChanges(qApp);
     setWindowIcon(QIcon(QStringLiteral(":/icons/app.png")));
     lmsc::WorkspacePaths::projectsDirectory();
@@ -521,6 +523,7 @@ void MainWindow::buildWorkspace() {
     m_workspacePages->addWidget(m_editorPage);
     m_aiPage = new lmsc::AiRecognitionPage(m_workspacePages);
     m_aiPage->setGenerationService(m_defaultGenerationService, m_defaultGenerationService);
+    m_aiPage->setLocalGenerationService(m_localGenerationService, m_localGenerationService);
     m_workspacePages->addWidget(m_aiPage);
     m_settingsPanel = new lmsc::SettingsPanel(m_workspacePages, m_settingsFile, true);
     m_workspacePages->addWidget(m_settingsPanel);
@@ -538,7 +541,7 @@ void MainWindow::buildWorkspace() {
         lmsc::DiagnosticLog::instance().setEnabled(preferences.diagnosticLogEnabled);
         if (!sameAiPreferences(m_generationPreferences, preferences)) {
             if (sameGenerationModel(m_generationPreferences, preferences)) m_aiPage->pauseGenerationForConnectionChange();
-            else m_aiPage->invalidateGeneration();
+            else m_aiPage->invalidateGenerationForConnectionChange();
             m_generationPreferences = preferences;
             m_aiTransport->configure(preferences);
             refreshRecognitionContext();
@@ -598,6 +601,13 @@ void MainWindow::setAiRecognitionService(lmsc::AiRecognitionService *service) {
 
 void MainWindow::setAiGenerationService(lmsc::AiGenerationService *service) {
     m_aiPage->setGenerationService(service ? service : m_defaultGenerationService, m_defaultGenerationService);
+    m_aiPage->setGenerationMode(lmsc::AiRecognitionPage::LanguageModel);
+    refreshRecognitionContext();
+}
+
+void MainWindow::setAiLocalGenerationService(lmsc::AiGenerationService *service) {
+    m_aiPage->setLocalGenerationService(service ? service : m_localGenerationService, m_localGenerationService);
+    m_aiPage->setGenerationMode(lmsc::AiRecognitionPage::LocalQuick);
     refreshRecognitionContext();
 }
 

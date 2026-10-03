@@ -64,6 +64,10 @@ private slots:
     void pausedJobCanResumeWithoutStartingOver();
     void themeWarningsSurviveNavigationAndPreview();
     void automaticRecoveryStaysBusyAcrossNavigation();
+    void localModeIsDefaultAndDoesNotRequireModelConnection();
+    void switchingModesCancelsAndRejectsOldResults();
+    void modelChangesPreserveLocalTasksAndDrafts();
+    void inactiveBackendDestructionAndSharedBackendsAreSafe();
 private:
     lmsc::GenerationRequest context() const;
     void setup(lmsc::AiRecognitionPage &page, FakeGenerationService &service, bool newSong = true);
@@ -102,6 +106,7 @@ lmsc::GenerationRequest AiGenerationPageTest::context() const {
 
 void AiGenerationPageTest::setup(lmsc::AiRecognitionPage &page, FakeGenerationService &service, bool newSong) {
     page.setGenerationService(&service);
+    page.setGenerationMode(lmsc::AiRecognitionPage::LanguageModel);
     page.setContext(m_audio, QStringLiteral("生成测试歌曲"), 120, 0.25, 16, false);
     page.setGenerationContext(context(), newSong, false);
 }
@@ -259,6 +264,7 @@ void AiGenerationPageTest::backendReplacementAndDestructionAreSafe() {
     page.setContext(m_audio, {}, 120, 0.25, 16, false);
     page.setGenerationContext(context(), true, false);
     page.setGenerationService(injected, &fallback);
+    page.setGenerationMode(lmsc::AiRecognitionPage::LanguageModel);
     auto generate = page.findChild<QPushButton *>(QStringLiteral("aiGenerateButton"));
     QVERIFY(!injected->parent());
     generate->click();
@@ -468,6 +474,175 @@ void AiGenerationPageTest::automaticRecoveryStaysBusyAcrossNavigation() {
     }
     QVERIFY(page.isRecognizing()); service.current.recovering=false; service.finish(source);
     QVERIFY(!page.isRecognizing()); QCOMPARE(service.requests.size(),1);
+}
+
+void AiGenerationPageTest::localModeIsDefaultAndDoesNotRequireModelConnection() {
+    FakeGenerationService local;
+    lmsc::AiRecognitionPage page;
+    auto *mode = page.findChild<QComboBox *>(QStringLiteral("aiGenerationMode"));
+    QVERIFY(mode);
+    QCOMPARE(mode->count(), 2);
+    QCOMPARE(mode->currentData().toInt(), int(lmsc::AiRecognitionPage::LocalQuick));
+    QCOMPARE(page.generationMode(), lmsc::AiRecognitionPage::LocalQuick);
+    page.setLocalGenerationService(&local);
+    page.setContext(m_audio, QStringLiteral("本地生成测试"), 120, 0.25, 16, false);
+    page.setGenerationContext(context(), true, false);
+    auto *generate = page.findChild<QPushButton *>(QStringLiteral("aiGenerateButton"));
+    auto *analyze = page.findChild<QPushButton *>(QStringLiteral("aiRecognizeButton"));
+    auto *configure = page.findChild<QPushButton *>(QStringLiteral("aiConfigureConnection"));
+    QVERIFY(generate->isEnabled());
+    QVERIFY(analyze->isEnabled());
+    QVERIFY(configure->text().contains(QStringLiteral("可选")));
+    QVERIFY(page.findChild<QLabel *>(QStringLiteral("aiServiceStatus"))->text().contains(QStringLiteral("无需配置")));
+    analyze->click();
+    QCOMPARE(local.requests.size(), 1);
+    QVERIFY(local.requests.last().analysisOnly);
+    local.finish(local.requests.last(), QStringLiteral("本地分析结果"));
+    QSignalSpy drafts(&page, &lmsc::AiRecognitionPage::generationDraftReady);
+    generate->click();
+    QCOMPARE(local.requests.size(), 2);
+    QVERIFY(!local.requests.last().analysisOnly);
+    QVERIFY(configure->isEnabled());
+    page.cancelRecognition();
+    QVERIFY(!page.isRecognizing());
+    QVERIFY(page.findChild<QPushButton *>(QStringLiteral("aiResumeGeneration"))->isHidden());
+    generate->click();
+    local.finish(local.requests.last(), QStringLiteral("本地候选谱"));
+    QCOMPARE(drafts.count(), 1);
+    auto *preview = page.findChild<QPushButton *>(QStringLiteral("aiViewCandidate"));
+    QVERIFY(preview->isEnabled());
+    preview->click();
+    QCOMPARE(drafts.count(), 2);
+    page.setGenerationContext(context(), false, false);
+    QVERIFY(!generate->isEnabled());
+    QVERIFY(analyze->isEnabled());
+    page.setGenerationMode(lmsc::AiRecognitionPage::LanguageModel);
+    QVERIFY(!generate->isEnabled());
+    QVERIFY(!analyze->isEnabled());
+}
+
+void AiGenerationPageTest::switchingModesCancelsAndRejectsOldResults() {
+    FakeGenerationService local, model;
+    lmsc::AiRecognitionPage page;
+    page.setLocalGenerationService(&local);
+    page.setGenerationService(&model);
+    page.setContext(m_audio, {}, 120, 0.25, 16, false);
+    page.setGenerationContext(context(), true, false);
+    auto *generate = page.findChild<QPushButton *>(QStringLiteral("aiGenerateButton"));
+    auto *result = page.findChild<QPlainTextEdit *>(QStringLiteral("aiRecognitionResult"));
+    auto *mode = page.findChild<QComboBox *>(QStringLiteral("aiGenerationMode"));
+    QSignalSpy drafts(&page, &lmsc::AiRecognitionPage::generationDraftReady);
+    QSignalSpy invalidated(&page, &lmsc::AiRecognitionPage::generationInvalidated);
+    generate->click();
+    const auto oldLocal = local.requests.last();
+    QVERIFY(mode->isEnabled());
+    page.setGenerationMode(lmsc::AiRecognitionPage::LanguageModel);
+    QVERIFY(local.cancelledJobs.contains(oldLocal.jobId));
+    QVERIFY(!page.isRecognizing());
+    local.finish(oldLocal, QStringLiteral("过期本地结果"));
+    QCOMPARE(drafts.count(), 0);
+    QVERIFY(result->toPlainText().isEmpty());
+    generate->click();
+    const auto oldModel = model.requests.last();
+    local.finish(oldLocal);
+    QVERIFY(page.isRecognizing());
+    model.finish(oldModel, QStringLiteral("模型候选谱"));
+    QCOMPARE(drafts.count(), 1);
+    QVERIFY(page.findChild<QPushButton *>(QStringLiteral("aiViewCandidate"))->isEnabled());
+    const int previousInvalidations = invalidated.count();
+    page.setGenerationMode(lmsc::AiRecognitionPage::LocalQuick);
+    QVERIFY(invalidated.count() > previousInvalidations);
+    QVERIFY(!page.findChild<QPushButton *>(QStringLiteral("aiViewCandidate"))->isEnabled());
+    QVERIFY(result->toPlainText().isEmpty());
+    generate->click();
+    const auto currentLocal = local.requests.last();
+    emit model.requestFailed(oldModel.jobId, QStringLiteral("过期模型错误"));
+    emit model.progress(oldModel.jobId, 90, QStringLiteral("过期模型进度"));
+    model.finish(oldModel);
+    QCOMPARE(drafts.count(), 1);
+    QVERIFY(page.isRecognizing());
+    local.finish(currentLocal);
+    QCOMPARE(drafts.count(), 2);
+}
+
+void AiGenerationPageTest::modelChangesPreserveLocalTasksAndDrafts() {
+    FakeGenerationService local, model, replacement;
+    lmsc::AiRecognitionPage page;
+    page.setLocalGenerationService(&local);
+    page.setGenerationService(&model);
+    page.setContext(m_audio, {}, 120, 0.25, 16, false);
+    page.setGenerationContext(context(), true, false);
+    auto *generate = page.findChild<QPushButton *>(QStringLiteral("aiGenerateButton"));
+    auto *result = page.findChild<QPlainTextEdit *>(QStringLiteral("aiRecognitionResult"));
+    auto *status = page.findChild<QLabel *>(QStringLiteral("aiRecognitionStatus"));
+    QSignalSpy invalidated(&page, &lmsc::AiRecognitionPage::generationInvalidated);
+    generate->click();
+    const auto source = local.requests.last();
+    emit local.progress(source.jobId, 42, QStringLiteral("本地正在编排"));
+    const int previousInvalidations = invalidated.count();
+    page.pauseGenerationForConnectionChange();
+    page.invalidateGenerationForConnectionChange();
+    page.setGenerationService(&replacement);
+    model.available = false;
+    emit model.availabilityChanged();
+    replacement.available = false;
+    emit replacement.availabilityChanged();
+    QVERIFY(page.isRecognizing());
+    QVERIFY(local.cancelledJobs.isEmpty());
+    QCOMPARE(invalidated.count(), previousInvalidations);
+    QCOMPARE(status->text(), QStringLiteral("本地正在编排"));
+    QCOMPARE(page.findChild<QProgressBar *>(QStringLiteral("aiRecognitionProgress"))->value(), 42);
+    local.finish(source, QStringLiteral("保留的本地候选"));
+    page.pauseGenerationForConnectionChange();
+    page.invalidateGenerationForConnectionChange();
+    page.setGenerationService(&model);
+    QCOMPARE(invalidated.count(), previousInvalidations);
+    QVERIFY(result->toPlainText().contains(QStringLiteral("保留的本地候选")));
+    QVERIFY(page.findChild<QPushButton *>(QStringLiteral("aiViewCandidate"))->isEnabled());
+    page.setGenerationMode(lmsc::AiRecognitionPage::LanguageModel);
+    QVERIFY(!generate->isEnabled());
+}
+
+void AiGenerationPageTest::inactiveBackendDestructionAndSharedBackendsAreSafe() {
+    FakeGenerationService local;
+    auto *model = new FakeGenerationService;
+    lmsc::AiRecognitionPage page;
+    page.setLocalGenerationService(&local);
+    page.setGenerationService(model);
+    page.setContext(m_audio, {}, 120, 0.25, 16, false);
+    page.setGenerationContext(context(), true, false);
+    auto *generate = page.findChild<QPushButton *>(QStringLiteral("aiGenerateButton"));
+    generate->click();
+    const auto source = local.requests.last();
+    delete model;
+    QVERIFY(page.isRecognizing());
+    QVERIFY(local.cancelledJobs.isEmpty());
+    local.finish(source);
+    page.setGenerationMode(lmsc::AiRecognitionPage::LanguageModel);
+    QVERIFY(!generate->isEnabled());
+    page.setGenerationService(&local);
+    generate->click();
+    const auto oldRequest = local.requests.last();
+    page.setGenerationMode(lmsc::AiRecognitionPage::LocalQuick);
+    QVERIFY(local.cancelledJobs.contains(oldRequest.jobId));
+    QSignalSpy drafts(&page, &lmsc::AiRecognitionPage::generationDraftReady);
+    generate->click();
+    const auto newRequest = local.requests.last();
+    local.finish(oldRequest);
+    QCOMPARE(drafts.count(), 0);
+    QVERIFY(page.isRecognizing());
+    local.finish(newRequest);
+    QCOMPARE(drafts.count(), 1);
+    FakeGenerationService fallback;
+    auto *injected = new FakeGenerationService;
+    page.setLocalGenerationService(injected, &fallback);
+    generate->click();
+    delete injected;
+    QVERIFY(!page.isRecognizing());
+    QCOMPARE(page.generationMode(), lmsc::AiRecognitionPage::LocalQuick);
+    QVERIFY(generate->isEnabled());
+    generate->click();
+    QCOMPARE(fallback.requests.size(), 1);
 }
 QTEST_MAIN(AiGenerationPageTest)
 #include "AiGenerationPageTest.moc"

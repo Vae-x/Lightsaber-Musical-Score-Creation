@@ -18,6 +18,7 @@ namespace lmsc {
 class AiRecognitionPage : public QWidget {
     Q_OBJECT
 public:
+    enum GenerationMode { LocalQuick, LanguageModel };
     explicit AiRecognitionPage(QWidget *parent = nullptr);
     ~AiRecognitionPage() override;
 
@@ -26,10 +27,16 @@ public:
     // The caller retains backend ownership. nullptr restores the unavailable
     // backend. Qt connections are removed when either endpoint is destroyed.
     void setService(AiRecognitionService *service);
+    // Configure each caller-owned backend independently; replacing an inactive
+    // backend does not interrupt the selected mode or its candidate.
     void setGenerationService(AiGenerationService *service, AiGenerationService *fallback = nullptr);
+    void setLocalGenerationService(AiGenerationService *service, AiGenerationService *fallback = nullptr);
+    void setGenerationMode(GenerationMode mode);
+    GenerationMode generationMode() const { return m_generationMode; }
     void setGenerationContext(const GenerationRequest &context, bool newSong, bool busy);
     void invalidateGeneration();
     void pauseGenerationForConnectionChange();
+    void invalidateGenerationForConnectionChange();
     void showGenerationApplied();
     bool isRecognizing() const { return !m_pendingContextId.isEmpty() || !m_pendingGeneration.jobId.isEmpty(); }
 
@@ -55,18 +62,24 @@ private:
     void startGeneration(bool analysisOnly);
     bool acceptsGeneration(const GenerationRequest &source) const;
     GeneratedTypes selectedTypes() const;
+    void activateGenerationService(bool force = false);
+    bool usesLocalGeneration() const { return m_generationMode == LocalQuick; }
 
     UnavailableAiRecognitionService *m_unavailable;
     QPointer<AiRecognitionService> m_service;
     QVector<QMetaObject::Connection> m_connections;
     QPointer<AiGenerationService> m_generationService;
+    QPointer<AiGenerationService> m_modelGenerationService;
     QPointer<AiGenerationService> m_generationFallback;
+    QPointer<AiGenerationService> m_localGenerationService;
+    QPointer<AiGenerationService> m_localGenerationFallback;
     QVector<QMetaObject::Connection> m_generationConnections;
     GenerationRequest m_generationContext;
     GenerationRequest m_pendingGeneration;
     GenerationRequest m_lastGeneration;
     GenerationDraft m_cachedDraft;
     bool m_hasDraft = false;
+    GenerationMode m_generationMode = LocalQuick;
     quint64 m_generationServiceRevision = 0;
     bool m_newSong = false;
     bool m_legacyOverride = false;
@@ -86,6 +99,7 @@ private:
     QLabel *m_status;
     QPushButton *m_start;
     QPushButton *m_generate;
+    QComboBox *m_mode;
     QComboBox *m_difficulty;
     QCheckBox *m_directional, *m_dots, *m_bombs, *m_walls;
     QPushButton *m_cancel;
