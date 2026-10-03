@@ -27,7 +27,21 @@ namespace lmsc {
 namespace {
 constexpr int maximumResponseSize = 4 * 1024 * 1024;
 
+AiOutputPolicy policyFor(const AppPreferences &preferences) {
+    if (preferences.aiConnection != "api") return {};
+    const auto config = preferences.providers.value(preferences.providerId);
+    const QUrl url(config.baseUrl.trimmed());
+    const bool official = preferences.providerId == "deepseek" && url.scheme() == "https"
+        && url.host().compare("api.deepseek.com", Qt::CaseInsensitive) == 0 && url.port(443) == 443
+        && QStringList{"", "/", "/v1", "/v1/", "/chat/completions", "/v1/chat/completions"}.contains(url.path())
+        && QStringList{"deepseek-flash", "deepseek-v4-pro"}.contains(config.model.trimmed());
+    const int maximum = config.maxOutputTokens > 0 ? config.maxOutputTokens : official ? 131072 : 0;
+    return {maximum > 0 ? qMin(official ? 65536 : 8192, maximum) : 0, maximum, official};
+}
+
 QString validateApi(const AiProviderConfig &config) {
+    if (config.maxOutputTokens != 0 && (config.maxOutputTokens < 1024 || config.maxOutputTokens > 131072))
+        return QStringLiteral("最大输出额度应为自动，或 1024–131072 token。");
     const QUrl url(config.baseUrl.trimmed(), QUrl::StrictMode);
     if (!url.isValid() || url.host().isEmpty()
             || (url.scheme() != "https" && url.scheme() != "http"))
@@ -67,7 +81,8 @@ bool sameConnection(const AppPreferences &a, const AppPreferences &b) {
     if (a.providerId != b.providerId) return false;
     const AiProviderConfig first = a.providers.value(a.providerId);
     const AiProviderConfig second = b.providers.value(b.providerId);
-    return first.baseUrl == second.baseUrl && first.apiKey == second.apiKey && first.model == second.model;
+    return first.baseUrl == second.baseUrl && first.apiKey == second.apiKey && first.model == second.model
+        && first.maxOutputTokens == second.maxOutputTokens;
 }
 
 QString httpError(int status) {
@@ -82,7 +97,8 @@ QString httpError(int status) {
 
 int tokenCount(const QJsonValue &value) {
     if (!value.isDouble() || value.toDouble() < 0 || value.toDouble() > std::numeric_limits<int>::max()) return -1;
-    return value.toInt(-1);
+    const int count = value.toInt(-1);
+    return value.toDouble() == count ? count : -1;
 }
 } // namespace
 
@@ -104,6 +120,7 @@ struct ConfiguredAiTextTransport::Impl {
     QElapsedTimer clock;
     QString stage = QStringLiteral("prepare");
     int nativeCode = 0;
+    int inputTokens = -1, outputTokens = -1, reasoningTokens = -1, finalTextBytes = -1;
 
     explicit Impl(ConfiguredAiTextTransport *owner) : owner(owner) {
         timeout.setSingleShot(true);
@@ -159,6 +176,9 @@ struct ConfiguredAiTextTransport::Impl {
         error.requestId=id; error.jobId=request.jobId; error.stage=stage; error.category=category;
         error.message=message; error.httpStatus=status; error.nativeCode=nativeCode;
         error.elapsedMs=clock.isValid() ? clock.elapsed() : 0; error.retryable=retryable;
+        error.maxOutputTokens=preferences.aiConnection=="api" && request.maxOutputTokens>0 ? request.maxOutputTokens : -1;
+        error.inputTokens=inputTokens; error.outputTokens=outputTokens;
+        error.reasoningTokens=reasoningTokens; error.finalTextBytes=finalTextBytes;
         logAiFailure(error);
         stop();
         emit owner->failureInfo(error);
@@ -186,22 +206,31 @@ struct ConfiguredAiTextTransport::Impl {
         }
         const QJsonObject choice = choices.first().toObject();
         const QJsonObject message = choice.value("message").toObject();
-        const QString reason=choice.value("finish_reason").toString();
-        if (reason != "stop") {
-            const auto usage=root.value("usage").toObject();
-            DiagnosticLog::instance().record("request.incomplete", {{"jobId",request.jobId},{"requestId",request.requestId},
-                {"reason",reason=="length" || reason=="content_filter" ? reason : QString("unknown")},
-                {"inputTokens",tokenCount(usage.value("prompt_tokens"))},
-                {"outputTokens",tokenCount(usage.value("completion_tokens"))},{"maxOutputTokens",request.maxOutputTokens}});
-            fail(reason=="length" ? QStringLiteral("模型输出达到长度上限，未完成的段落可手动继续；若反复发生，请更换模型。")
-                                  : QStringLiteral("AI 响应未正常结束，未应用任何结果。"), reason=="length" ? "truncated" : "protocol");
-            return;
-        }
-        if ((!message.value("tool_calls").isNull() && !message.value("tool_calls").isUndefined()
+        const auto usage = root.value("usage").toObject();
+        inputTokens=tokenCount(usage.value("prompt_tokens"));
+        outputTokens=tokenCount(usage.value("completion_tokens"));
+        reasoningTokens=tokenCount(usage.value("completion_tokens_details").toObject().value("reasoning_tokens"));
+        finalTextBytes=message.value("content").isString() ? message.value("content").toString().toUtf8().size() : -1;
+        // Reject tool/refusal responses before deciding whether a length limit can be recovered.
+        const bool unsafe=(!message.value("tool_calls").isNull() && !message.value("tool_calls").isUndefined()
                   && (!message.value("tool_calls").isArray() || !message.value("tool_calls").toArray().isEmpty()))
                 || (!message.value("function_call").isNull() && !message.value("function_call").isUndefined())
-                || !message.value("refusal").toString().isEmpty()
-                || !message.value("content").isString()
+                || !message.value("refusal").toString().isEmpty();
+        if (!choice.value("message").isObject() || unsafe
+            || (!message.value("content").isNull() && !message.value("content").isUndefined() && !message.value("content").isString())) {
+            fail(QStringLiteral("AI 响应包含不支持的文本、拒绝或工具操作，未应用任何结果。")); return;
+        }
+        const QString reason=choice.value("finish_reason").toString();
+        if (reason != "stop") {
+            DiagnosticLog::instance().record("request.incomplete", {{"jobId",request.jobId},{"requestId",request.requestId},
+                {"reason",reason=="length" || reason=="content_filter" ? reason : QString("unknown")},
+                {"inputTokens",inputTokens}, {"outputTokens",outputTokens}, {"maxOutputTokens",request.maxOutputTokens},
+                {"reasoningTokens",reasoningTokens}, {"finalTextBytes",finalTextBytes}});
+            fail(reason=="length" ? QStringLiteral("模型输出达到长度上限，进度已保留。")
+                                  : QStringLiteral("AI 响应未正常结束，未应用任何结果。"), reason=="length" ? "truncated" : "protocol", status);
+            return;
+        }
+        if (!message.value("content").isString()
                 || message.value("content").toString().trimmed().isEmpty()) {
             fail(QStringLiteral("AI 未返回可用的最终文本，或请求了工具操作，未应用任何结果。"));
             return;
@@ -209,11 +238,12 @@ struct ConfiguredAiTextTransport::Impl {
         AiTextResult result;
         result.requestId = request.requestId;
         result.text = message.value("content").toString();
-        const QJsonObject usage = root.value("usage").toObject();
-        result.inputTokens = tokenCount(usage.value("prompt_tokens"));
-        result.outputTokens = tokenCount(usage.value("completion_tokens"));
+        result.inputTokens=inputTokens; result.outputTokens=outputTokens;
+        result.reasoningTokens=reasoningTokens; result.finalTextBytes=finalTextBytes;
+        result.maxOutputTokens=request.maxOutputTokens>0 ? request.maxOutputTokens : -1;
         DiagnosticLog::instance().record("request.completed", {{"jobId", request.jobId}, {"requestId", request.requestId},
-            {"elapsedMs", double(clock.elapsed())}, {"inputTokens", result.inputTokens}, {"outputTokens", result.outputTokens}});
+            {"elapsedMs", double(clock.elapsed())}, {"inputTokens", result.inputTokens}, {"outputTokens", result.outputTokens},
+            {"maxOutputTokens", result.maxOutputTokens}, {"reasoningTokens", result.reasoningTokens}, {"finalTextBytes", result.finalTextBytes}});
         stop();
         emit owner->completed(result);
     }
@@ -222,9 +252,12 @@ struct ConfiguredAiTextTransport::Impl {
         stop();
         request = incoming;
         request.timeoutMs = qBound(1, request.timeoutMs, 30 * 60000);
-        request.maxOutputTokens = qBound(1, request.maxOutputTokens, 32768);
+        request.maxOutputTokens = qBound(0, request.maxOutputTokens, 131072);
+        const auto policy = policyFor(preferences);
+        if (policy.maximumTokens > 0) request.maxOutputTokens = qMin(request.maxOutputTokens, policy.maximumTokens);
         active = true;
         clock.start(); stage="prepare"; nativeCode=0;
+        inputTokens=outputTokens=reasoningTokens=finalTextBytes=-1;
         const QString validation = validatePreferences(preferences);
         if (!validation.isEmpty()) { fail(validation); return; }
         if (request.requestId.trimmed().isEmpty() || request.userPrompt.trimmed().isEmpty()
@@ -236,7 +269,8 @@ struct ConfiguredAiTextTransport::Impl {
         DiagnosticLog::instance().record("request.started", {{"jobId", request.jobId}, {"requestId", request.requestId},
             {"connection", preferences.aiConnection}, {"provider", preferences.providerId},
             {"model", preferences.aiConnection=="codex" ? preferences.codexModel : preferences.providers.value(preferences.providerId).model},
-            {"proxyMode", preferences.networkProxy.mode}, {"timeoutMs", request.timeoutMs}, {"maxOutputTokens", request.maxOutputTokens}});
+            {"proxyMode", preferences.networkProxy.mode}, {"timeoutMs", request.timeoutMs},
+            {"maxOutputTokens", preferences.aiConnection=="api" ? request.maxOutputTokens : -1}});
         if (preferences.aiConnection=="api") DiagnosticLog::instance().record("request.endpoint", {{"jobId",request.jobId},
             {"requestId",request.requestId},{"host",QUrl(preferences.providers.value(preferences.providerId).baseUrl).host()}});
         const quint64 current = generation;
@@ -245,7 +279,9 @@ struct ConfiguredAiTextTransport::Impl {
                 [this, current](const AiTextResult &result) {
                     if (!active || generation != current) return;
                     DiagnosticLog::instance().record("request.completed", {{"jobId", request.jobId},
-                        {"requestId", request.requestId}, {"elapsedMs", double(clock.elapsed())}});
+                        {"requestId", request.requestId}, {"elapsedMs", double(clock.elapsed())},
+                        {"maxOutputTokens", result.maxOutputTokens}, {"inputTokens", result.inputTokens},
+                        {"outputTokens", result.outputTokens}, {"reasoningTokens", result.reasoningTokens}, {"finalTextBytes", result.finalTextBytes}});
                     codex.clear();
                     stop();
                     emit owner->completed(result);
@@ -279,11 +315,11 @@ struct ConfiguredAiTextTransport::Impl {
         QJsonObject parameters{{"model", config.model.trimmed()}, {"stream", false},
             {"messages", QJsonArray{QJsonObject{{"role", "system"}, {"content", system}},
                                       QJsonObject{{"role", "user"}, {"content", request.userPrompt}}}}};
-        parameters.insert(preferences.providerId == "openai" ? "max_completion_tokens" : "max_tokens",
-                          request.maxOutputTokens);
-        // Optional sampling / response_format parameters differ by provider and
-        // model. The schema is included in the prompt and verified by the
-        // generation service, without retrying a chargeable POST on errors.
+        if (request.maxOutputTokens > 0)
+            parameters.insert(preferences.providerId == "openai" ? "max_completion_tokens" : "max_tokens",
+                              request.maxOutputTokens);
+        if (policy.jsonOutput && !request.outputSchema.isEmpty()) parameters.insert("response_format", QJsonObject{{"type", "json_object"}});
+        // Model-specific options are sent only for verified capability profiles.
         const QByteArray body = QJsonDocument(parameters).toJson(QJsonDocument::Compact);
 #ifdef Q_OS_WIN
         native.post(url, config.apiKey.trimmed(), preferences.providerId, body,
@@ -345,13 +381,16 @@ bool ConfiguredAiTextTransport::isAvailable() const { return validatePreferences
 
 void ConfiguredAiTextTransport::configure(const AppPreferences &preferences) {
     const bool before = isAvailable();
-    if (!sameConnection(d->preferences, preferences) && d->active)
-        d->fail(QStringLiteral("AI 设置已更改，请重新生成。"));
+    const bool changed = !sameConnection(d->preferences, preferences);
+    if (changed && d->active)
+        d->fail(QStringLiteral("AI 设置已更改，进度已保留。"), "configuration");
     d->preferences = preferences;
     for (const auto &config : preferences.providers) DiagnosticLog::instance().addSecret(config.apiKey);
+    if (changed) emit configurationChanged();
     if (before != isAvailable()) emit availabilityChanged();
 }
 int ConfiguredAiTextTransport::requestTimeoutMs() const { return qBound(1, d->preferences.requestTimeoutMinutes, 30)*60000; }
+AiOutputPolicy ConfiguredAiTextTransport::outputPolicy() const { return policyFor(d->preferences); }
 QString ConfiguredAiTextTransport::connectionIdentity() const {
     const auto &p=d->preferences;
     const auto config=p.providers.value(p.providerId);

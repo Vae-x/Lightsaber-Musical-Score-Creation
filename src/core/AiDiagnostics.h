@@ -8,6 +8,8 @@ struct AiFailure {
     int httpStatus = 0, rpcCode = 0, nativeCode = 0;
     qint64 elapsedMs = 0;
     bool retryable = true;
+    int maxOutputTokens = -1, inputTokens = -1, outputTokens = -1;
+    int reasoningTokens = -1, finalTextBytes = -1;
 };
 inline QString aiHttpCategory(int status) {
     if (status == 401) return "authentication";
@@ -21,7 +23,9 @@ inline void logAiFailure(const AiFailure &error) {
     DiagnosticLog::instance().record("request.failed", {{"jobId", error.jobId}, {"requestId", error.requestId},
         {"stage", error.stage}, {"category", error.category}, {"httpStatus", error.httpStatus},
         {"rpcCode", error.rpcCode}, {"nativeCode", error.nativeCode}, {"elapsedMs", double(error.elapsedMs)},
-        {"retryable", error.retryable}});
+        {"retryable", error.retryable}, {"maxOutputTokens", error.maxOutputTokens},
+        {"inputTokens", error.inputTokens}, {"outputTokens", error.outputTokens},
+        {"reasoningTokens", error.reasoningTokens}, {"finalTextBytes", error.finalTextBytes}});
 }
 }
 Q_DECLARE_METATYPE(lmsc::AiFailure)

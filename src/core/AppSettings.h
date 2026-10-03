@@ -19,6 +19,8 @@ struct AiProviderConfig {
     QString apiKey;
     QString model;
     QStringList models;
+    // Zero uses the verified model policy, or the service default for unknown models.
+    int maxOutputTokens = 0;
 };
 
 struct NetworkProxyConfig {

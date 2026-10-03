@@ -76,6 +76,7 @@ public:
 lmsc::AiTextRequest request(const QString &id = "request-1") {
     lmsc::AiTextRequest result;
     result.requestId = id;
+    result.maxOutputTokens = 8192;
     result.systemPrompt = QStringLiteral("根据音乐特征生成曲谱 JSON。");
     result.userPrompt = QStringLiteral("八小节，流畅的左右手交替。");
     result.outputSchema = {{"type", "object"}, {"properties", QJsonObject{{"notes", QJsonObject{{"type", "array"}}}}},
@@ -236,6 +237,10 @@ private slots:
     void codexFailures();
     void codexCancelAndTimeout();
     void codexNpmWrapperUsesNestedBinary();
+    void verifiedOutputPolicies();
+    void serviceDefaultAndLargeOutputBudget();
+    void usageDetails_data();
+    void usageDetails();
 };
 
 void AiTextTransportTest::apiBodyAndCompletedText() {
@@ -293,6 +298,8 @@ void AiTextTransportTest::invalidResponse_data() {
     QTest::addColumn<QByteArray>("body");
     QTest::newRow("truncated") << QByteArray(R"({"choices":[{"finish_reason":"length","message":{"content":"partial"}}]})");
     QTest::newRow("tool") << QByteArray(R"({"choices":[{"finish_reason":"stop","message":{"content":"{}","tool_calls":[{}]}}]})");
+    QTest::newRow("truncated-tool") << QByteArray(R"({"choices":[{"finish_reason":"length","message":{"content":"partial","tool_calls":[{}]}}]})");
+    QTest::newRow("truncated-content-parts") << QByteArray(R"({"choices":[{"finish_reason":"length","message":{"content":[{"text":"partial"}]}}]})");
     QTest::newRow("function") << QByteArray(R"({"choices":[{"finish_reason":"stop","message":{"content":"{}","function_call":{}}}]})");
     QTest::newRow("refusal") << QByteArray(R"({"choices":[{"finish_reason":"stop","message":{"content":"{}","refusal":"refused"}}]})");
     QTest::newRow("content-parts") << QByteArray(R"({"choices":[{"finish_reason":"stop","message":{"content":[{"text":"{}"}]}}]})");
@@ -315,7 +322,8 @@ void AiTextTransportTest::invalidResponse() {
     QVERIFY(!failed.first().at(1).toString().contains("test-only-api-key"));
     QCOMPARE(details.count(),1);
     QCOMPARE(qvariant_cast<lmsc::AiFailure>(details.first().first()).category,
-             body.contains("\"length\"") ? QString("truncated") : QString("protocol"));
+             body.contains("\"length\"") && !body.contains("tool_calls") && !body.contains("\"content\":[")
+             ? QString("truncated") : QString("protocol"));
 }
 
 void AiTextTransportTest::errorsNeverRetry_data() {
@@ -429,7 +437,7 @@ void AiTextTransportTest::codexCompletedTextAndSecurity() {
     QVERIFY2(failed.isEmpty(), failed.isEmpty() ? "" : qPrintable(failed.first().at(1).toString()));
     QCOMPARE(completed.count(), 1);
     QCOMPARE(qvariant_cast<lmsc::AiTextResult>(completed.first().first()).text, QStringLiteral("{\"notes\":[]}"));
-    bool threadSeen = false;
+    bool threadSeen = false; int threadStarts=0,turnStarts=0;
     for (const QJsonObject &entry : readLog(log)) {
         const QString method = entry.value("method").toString();
         QVERIFY(method != "account/login/start" && method != "account/logout" && !method.startsWith("mcpServer"));
@@ -441,6 +449,7 @@ void AiTextTransportTest::codexCompletedTextAndSecurity() {
             QVERIFY(args.contains("features.hooks=false"));
             QVERIFY(args.contains("features.plugins=false"));
         } else if (method == "thread/start") {
+            ++threadStarts;
             threadSeen = true;
             const QJsonObject parameters = entry.value("params").toObject();
             QVERIFY(parameters.value("ephemeral").toBool());
@@ -449,9 +458,14 @@ void AiTextTransportTest::codexCompletedTextAndSecurity() {
             const QJsonObject mcp = parameters.value("config").toObject().value("mcp_servers").toObject();
             QCOMPARE(mcp.value("test.server").toObject(), QJsonObject({{"enabled", false}}));
             QVERIFY(!QJsonDocument(parameters).toJson().contains("test-only-secret"));
+        } else if (method == "turn/start") {
+            ++turnStarts;
+            const auto parameters=entry.value("params").toObject();
+            QVERIFY(!parameters.contains("max_tokens") && !parameters.contains("maxOutputTokens"));
         }
     }
     QVERIFY(threadSeen);
+    QCOMPARE(threadStarts,1); QCOMPARE(turnStarts,1);
 }
 
 void AiTextTransportTest::codexFailures_data() {
@@ -538,6 +552,60 @@ void AiTextTransportTest::codexNpmWrapperUsesNestedBinary() {
 #endif
 }
 
+void AiTextTransportTest::verifiedOutputPolicies() {
+    lmsc::AppPreferences preferences; auto &config=preferences.providers["deepseek"];
+    config.baseUrl="https://api.deepseek.com/v1"; config.apiKey="test-only-key"; config.model="deepseek-flash";
+    lmsc::ConfiguredAiTextTransport transport; transport.configure(preferences);
+    QCOMPARE(transport.outputPolicy().initialTokens,65536); QCOMPARE(transport.outputPolicy().maximumTokens,131072);
+    QVERIFY(transport.outputPolicy().jsonOutput);
+    config.maxOutputTokens=32768; transport.configure(preferences);
+    QCOMPARE(transport.outputPolicy().initialTokens,32768); QCOMPARE(transport.outputPolicy().maximumTokens,32768);
+    config.maxOutputTokens=0; config.model="deepseek-v4-pro"; transport.configure(preferences);
+    QCOMPARE(transport.outputPolicy().initialTokens,65536);
+    config.model="unknown-model"; transport.configure(preferences);
+    QCOMPARE(transport.outputPolicy().initialTokens,0); QVERIFY(!transport.outputPolicy().jsonOutput);
+    config.model="deepseek-flash"; config.baseUrl="https://api.deepseek.com.example.invalid/v1";
+    transport.configure(preferences); QCOMPARE(transport.outputPolicy().maximumTokens,0); QVERIFY(!transport.outputPolicy().jsonOutput);
+    config.maxOutputTokens=65536; transport.configure(preferences);
+    QCOMPARE(transport.outputPolicy().initialTokens,8192); QCOMPARE(transport.outputPolicy().maximumTokens,65536);
+    preferences.aiConnection="codex"; transport.configure(preferences); QCOMPARE(transport.outputPolicy().maximumTokens,0);
+}
+void AiTextTransportTest::serviceDefaultAndLargeOutputBudget() {
+    HttpFixture fixture; QVERIFY(fixture.listen()); lmsc::ConfiguredAiTextTransport transport;
+    transport.configure(fixture.preferences("custom")); QSignalSpy completed(&transport,&lmsc::AiTextTransport::completed);
+    auto input=request(); input.maxOutputTokens=0; transport.complete(input); QTRY_COMPARE(completed.count(),1);
+    auto body=httpBody(fixture.requests.first()); QVERIFY(!body.contains("max_tokens")); QVERIFY(!body.contains("max_completion_tokens"));
+    input=request("large"); input.maxOutputTokens=131072; transport.complete(input); QTRY_COMPARE(completed.count(),2);
+    body=httpBody(fixture.requests.last()); QCOMPARE(body.value("max_tokens").toInt(),131072);
+    QVERIFY(!body.contains("thinking") && !body.contains("response_format"));
+}
+void AiTextTransportTest::usageDetails_data() {
+    QTest::addColumn<QByteArray>("usage"); QTest::addColumn<int>("reasoning"); QTest::addColumn<bool>("truncated");
+    QTest::newRow("reasoning-completed") << QByteArray(R"({"prompt_tokens":42,"completion_tokens":8192,"completion_tokens_details":{"reasoning_tokens":8000}})") << 8000 << false;
+    QTest::newRow("reasoning-truncated") << QByteArray(R"({"prompt_tokens":42,"completion_tokens":8192,"completion_tokens_details":{"reasoning_tokens":8000}})") << 8000 << true;
+    QTest::newRow("usage-missing") << QByteArray("{}") << -1 << false;
+    QTest::newRow("reasoning-negative") << QByteArray(R"({"completion_tokens_details":{"reasoning_tokens":-2}})") << -1 << false;
+    QTest::newRow("reasoning-fractional") << QByteArray(R"({"completion_tokens_details":{"reasoning_tokens":2.5}})") << -1 << false;
+    QTest::newRow("reasoning-string") << QByteArray(R"({"completion_tokens_details":{"reasoning_tokens":"20"}})") << -1 << false;
+}
+void AiTextTransportTest::usageDetails() {
+    QFETCH(QByteArray,usage); QFETCH(int,reasoning); QFETCH(bool,truncated);
+    const QString finalText=QStringLiteral("{\"结果\":1}");
+    const QJsonObject root{{"choices",QJsonArray{QJsonObject{{"finish_reason",truncated ? "length" : "stop"},
+        {"message",QJsonObject{{"content",finalText},{"reasoning_content","private-reasoning-text"}}}}}},
+        {"usage",QJsonDocument::fromJson(usage).object()}};
+    HttpFixture fixture; fixture.responses.append({200,QJsonDocument(root).toJson(QJsonDocument::Compact),{},0}); QVERIFY(fixture.listen());
+    lmsc::ConfiguredAiTextTransport transport; transport.configure(fixture.preferences());
+    QSignalSpy completed(&transport,&lmsc::AiTextTransport::completed),failure(&transport,&lmsc::AiTextTransport::failureInfo);
+    transport.complete(request()); QTRY_VERIFY(completed.count() || failure.count());
+    if (truncated) {
+        const auto error=qvariant_cast<lmsc::AiFailure>(failure.first().first()); QCOMPARE(error.reasoningTokens,reasoning);
+        QCOMPARE(error.finalTextBytes,finalText.toUtf8().size()); QCOMPARE(error.httpStatus,200); QCOMPARE(error.maxOutputTokens,8192);
+    } else {
+        const auto result=qvariant_cast<lmsc::AiTextResult>(completed.first().first()); QCOMPARE(result.reasoningTokens,reasoning);
+        QCOMPARE(result.finalTextBytes,finalText.toUtf8().size()); QCOMPARE(result.maxOutputTokens,8192); QCOMPARE(result.text,finalText);
+    }
+}
 int main(int argc, char **argv) {
     QCoreApplication application(argc, argv);
     if (application.arguments().contains("--version")) {

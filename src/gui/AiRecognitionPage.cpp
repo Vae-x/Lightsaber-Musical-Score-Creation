@@ -333,7 +333,7 @@ void AiRecognitionPage::setGenerationService(AiGenerationService *service, AiGen
                 if (revision != m_generationServiceRevision || jobId != m_pendingGeneration.jobId || jobId.isEmpty()) return;
                 m_pendingGeneration = {};
                 const auto state=m_generationService ? m_generationService->status() : AiGenerationService::Status{};
-                const QString retained=state.resumable ? tr("\n已保留 %1/%2 个乐句，检查连接后点击继续。").arg(state.completedSegments).arg(state.totalSegments) : QString();
+                const QString retained=state.resumable ? tr("\n已保留 %1/%2 个乐句；处理上述原因后可继续。").arg(state.completedSegments).arg(state.totalSegments) : QString();
                 setStatus((message.isEmpty() ? tr("分析或生成失败，请检查模型连接。") : message)+retained, "error");
                 refreshControls();
             }));

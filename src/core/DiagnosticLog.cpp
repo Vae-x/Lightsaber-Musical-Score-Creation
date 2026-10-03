@@ -32,6 +32,7 @@ QJsonObject DiagnosticLog::sanitize(const QString &event, const QJsonObject &fie
         "host", "stage", "category", "reason", "method", "cliVersion", "build", "code", "decision"};
     static const QSet<QString> numbers{"port", "elapsedMs", "timeoutMs", "httpStatus", "rpcCode", "nativeCode",
         "exitCode", "segment", "segments", "percent", "objects", "repairs", "inputTokens", "outputTokens", "maxOutputTokens",
+        "reasoningTokens", "finalTextBytes", "recoveryAttempt", "automaticRecoveries", "delayMs", "previousMaxOutputTokens",
         "referenceSegment", "repeatConfidence", "referenceNotes", "currentNotes", "matchedActions", "actionDifference",
         "rhythmCoverage", "positionDifference", "countDifference", "targetVariation"};
     QJsonObject row{{"time", QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)},

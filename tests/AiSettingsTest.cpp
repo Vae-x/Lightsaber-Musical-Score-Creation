@@ -106,6 +106,7 @@ private slots:
     void redirectDoesNotForwardCredentials();
     void oversizedResponseIsRejected();
     void destroyingClientCancelsPendingRequest();
+    void outputLimitsRoundTripAndValidate();
 };
 
 void AiSettingsTest::missingSettingsUseProviderDefaults() {
@@ -581,5 +582,21 @@ void AiSettingsTest::destroyingClientCancelsPendingRequest() {
     QTest::qWait(100);
 }
 
+void AiSettingsTest::outputLimitsRoundTripAndValidate() {
+    QTemporaryDir directory; lmsc::AppSettings settings(directory.filePath("settings.json"));
+    auto preferences=settings.load(); QCOMPARE(preferences.providers["deepseek"].maxOutputTokens,0);
+    preferences.providers["deepseek"].maxOutputTokens=131072; preferences.providers["kimi"].maxOutputTokens=16384;
+    QString error; QVERIFY2(settings.save(preferences,&error),qPrintable(error));
+    const auto restored=settings.load(&error); QVERIFY(error.isEmpty());
+    QCOMPARE(restored.providers["deepseek"].maxOutputTokens,131072); QCOMPARE(restored.providers["kimi"].maxOutputTokens,16384);
+    for (int invalid : {1,1023,131073,-1}) { preferences.providers["deepseek"].maxOutputTokens=invalid; QVERIFY(!settings.save(preferences,&error)); }
+    auto root=QJsonDocument::fromJson(readFile(settings.filePath())).object(); auto providers=root["providers"].toObject();
+    auto config=providers["deepseek"].toObject(); config.remove("maxOutputTokens"); providers["deepseek"]=config;
+    root["providers"]=providers; QVERIFY(writeFile(settings.filePath(),QJsonDocument(root).toJson()));
+    QCOMPARE(settings.load(&error).providers["deepseek"].maxOutputTokens,0); QVERIFY(error.isEmpty());
+    config["maxOutputTokens"]=8192.5; providers["deepseek"]=config; root["providers"]=providers;
+    QVERIFY(writeFile(settings.filePath(),QJsonDocument(root).toJson())); QCOMPARE(settings.load(&error).providers["deepseek"].maxOutputTokens,0);
+    QVERIFY(!error.isEmpty());
+}
 QTEST_GUILESS_MAIN(AiSettingsTest)
 #include "AiSettingsTest.moc"

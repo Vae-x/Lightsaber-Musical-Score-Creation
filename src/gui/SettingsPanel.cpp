@@ -326,6 +326,13 @@ QWidget *SettingsPanel::buildModelPage() {
     m_models->setInsertPolicy(QComboBox::NoInsert);
     m_models->lineEdit()->setPlaceholderText(tr("获取后选择，或手动输入模型名"));
     form->addRow(tr("模型"), m_models);
+    m_maxOutputTokens = new QSpinBox(apiCard);
+    m_maxOutputTokens->setObjectName("aiMaxOutputTokens");
+    m_maxOutputTokens->setRange(0, 131072);
+    m_maxOutputTokens->setSingleStep(1024);
+    m_maxOutputTokens->setSpecialValueText(tr("自动"));
+    m_maxOutputTokens->setToolTip(tr("自动沿用已验证模型的额度或服务默认值。手动范围 1024–131072；思考也可能占用额度，自动重试会增加实际用量。"));
+    form->addRow(tr("最大输出额度（token）"), m_maxOutputTokens);
     apiCardLayout->addLayout(form);
     apiCardLayout->addWidget(description(tr("填入密钥后离开输入框，会自动读取模型。每个提供商的地址、密钥与模型分别保存。"), apiCard));
     auto fetchRow = new QHBoxLayout;
@@ -673,6 +680,7 @@ void SettingsPanel::captureProvider() {
     config.baseUrl = m_baseUrl->text().trimmed();
     config.apiKey = m_apiKey->text().trimmed();
     config.model = m_models->currentText().trimmed();
+    config.maxOutputTokens = m_maxOutputTokens->value();
 }
 
 void SettingsPanel::selectProvider(const QString &id) {
@@ -698,6 +706,7 @@ void SettingsPanel::selectProvider(const QString &id) {
         show->setChecked(false);
     }
     replaceModelList(m_models, config.models, config.model);
+    m_maxOutputTokens->setValue(config.maxOutputTokens);
     m_preferences.providers[m_currentProvider] = config;
     m_loadingProvider = false;
     setApiStatus(config.models.isEmpty() ? tr("填入 API Key 后可自动获取模型，也支持手动填写。")

@@ -70,6 +70,7 @@ private:
     QComboBox *m_connection;
     QComboBox *m_provider;
     QComboBox *m_models;
+    QSpinBox *m_maxOutputTokens;
     QLineEdit *m_baseUrl;
     QLineEdit *m_apiKey;
     QLabel *m_apiStatus;

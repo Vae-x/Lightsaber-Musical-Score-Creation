@@ -63,6 +63,7 @@ private slots:
     void busyAndNavigationPreserveProgressAndReusableDraft();
     void pausedJobCanResumeWithoutStartingOver();
     void themeWarningsSurviveNavigationAndPreview();
+    void automaticRecoveryStaysBusyAcrossNavigation();
 private:
     lmsc::GenerationRequest context() const;
     void setup(lmsc::AiRecognitionPage &page, FakeGenerationService &service, bool newSong = true);
@@ -445,6 +446,28 @@ void AiGenerationPageTest::themeWarningsSurviveNavigationAndPreview() {
         lmsc::ThemeManager::apply(original);
     }
     preview->close(); QTRY_VERIFY(preview.isNull());
+}
+void AiGenerationPageTest::automaticRecoveryStaysBusyAcrossNavigation() {
+    FakeGenerationService service; lmsc::AiRecognitionPage page; setup(page,service);
+    auto *generate=page.findChild<QPushButton *>("aiGenerateButton"); generate->click();
+    const auto source=service.requests.last(); service.current.recovering=true; service.current.percent=41;
+    emit service.progress(source.jobId,41,QStringLiteral("连接暂时中断 · 正在自动恢复 1/2 · 已完成 6/21 个乐句"));
+    QVERIFY(page.isRecognizing()); QVERIFY(!generate->isEnabled());
+    QVERIFY(!page.findChild<QPushButton *>("aiResumeGeneration")->isVisible());
+    page.hide(); page.show(); page.setGenerationContext(context(),true,false);
+    QCOMPARE(page.findChild<QProgressBar *>("aiRecognitionProgress")->value(),41);
+    QVERIFY(page.findChild<QLabel *>("aiRecognitionStatus")->text().contains(QStringLiteral("自动恢复")));
+    const QString captures=qEnvironmentVariable("LMSC_AI_RECOVERY_CAPTURE_DIRECTORY");
+    if (!captures.isEmpty()) {
+        QVERIFY(QDir().mkpath(captures)); const QString original=lmsc::ThemeManager::mode(); page.resize(1050,660);
+        for (const QString mode : {QString("dark"),QString("light")}) {
+            lmsc::ThemeManager::apply(mode); QTest::qWait(80);
+            QVERIFY(page.grab().save(QDir(captures).filePath("ai-recovering-"+mode+".png")));
+        }
+        lmsc::ThemeManager::apply(original);
+    }
+    QVERIFY(page.isRecognizing()); service.current.recovering=false; service.finish(source);
+    QVERIFY(!page.isRecognizing()); QCOMPARE(service.requests.size(),1);
 }
 QTEST_MAIN(AiGenerationPageTest)
 #include "AiGenerationPageTest.moc"

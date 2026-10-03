@@ -234,6 +234,13 @@ AppPreferences AppSettings::load(QString *error) const {
             if (json.value(QStringLiteral("baseUrl")).isString())
                 config.baseUrl = json.value(QStringLiteral("baseUrl")).toString();
             config.model = json.value(QStringLiteral("model")).toString();
+            if (json.contains("maxOutputTokens")) {
+                const auto value = json.value("maxOutputTokens");
+                const int tokens = value.toInt(-1);
+                if (value.isDouble() && value.toDouble() == tokens
+                    && (tokens == 0 || (tokens >= 1024 && tokens <= 131072))) config.maxOutputTokens = tokens;
+                else warnings.append(QStringLiteral("部分输出额度设置无效，已使用自动额度。"));
+            }
             const QJsonValue keyValue = json.value(QStringLiteral("apiKeyProtected"));
             const QString scheme = json.value(QStringLiteral("keyProtection")).toString();
             if ((!keyValue.isUndefined() && !keyValue.isString())
@@ -279,6 +286,11 @@ bool AppSettings::save(const AppPreferences &preferences, QString *error) const 
     }
     QJsonObject providers;
     for (auto it = preferences.providers.constBegin(); it != preferences.providers.constEnd(); ++it) {
+        if (it.value().maxOutputTokens != 0
+            && (it.value().maxOutputTokens < 1024 || it.value().maxOutputTokens > 131072)) {
+            if (error) *error = QStringLiteral("最大输出额度应为自动，或 1024–131072 token。");
+            return false;
+        }
         QString protectedKey;
         if (!protectKey(it.value().apiKey, &protectedKey)) {
             if (error) *error = QStringLiteral("无法使用 Windows 账户保护 API Key，设置未保存。");
@@ -288,6 +300,7 @@ bool AppSettings::save(const AppPreferences &preferences, QString *error) const 
         config.insert(QStringLiteral("baseUrl"), it.value().baseUrl);
         config.insert(QStringLiteral("model"), it.value().model);
         config.insert(QStringLiteral("models"), QJsonArray::fromStringList(it.value().models));
+        config.insert("maxOutputTokens", it.value().maxOutputTokens);
         config.insert(QStringLiteral("keyProtection"), QStringLiteral("dpapi-user"));
         config.insert(QStringLiteral("apiKeyProtected"), protectedKey);
         providers.insert(it.key(), config);

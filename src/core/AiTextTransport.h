@@ -7,6 +7,11 @@
 #include <memory>
 
 namespace lmsc {
+struct AiOutputPolicy {
+    int initialTokens = 0;
+    int maximumTokens = 0;
+    bool jsonOutput = false;
+};
 struct AiTextRequest {
     QString requestId;
     QString jobId;
@@ -14,13 +19,16 @@ struct AiTextRequest {
     QString userPrompt;
     QJsonObject outputSchema;
     int timeoutMs = 600000;
-    int maxOutputTokens = 8192;
+    int maxOutputTokens = 0;
 };
 struct AiTextResult {
     QString requestId;
     QString text;
     int inputTokens = -1;
     int outputTokens = -1;
+    int maxOutputTokens = -1;
+    int reasoningTokens = -1;
+    int finalTextBytes = -1;
 };
 class AiTextTransport : public QObject {
     Q_OBJECT
@@ -30,6 +38,7 @@ public:
     virtual void configure(const AppPreferences &preferences) = 0;
     virtual int requestTimeoutMs() const { return 600000; }
     virtual QString connectionIdentity() const { return {}; }
+    virtual AiOutputPolicy outputPolicy() const { return {}; }
 public slots:
     virtual void complete(const lmsc::AiTextRequest &request) = 0;
     virtual void cancel(const QString &requestId) = 0;
@@ -39,6 +48,7 @@ signals:
     void failureInfo(const lmsc::AiFailure &error);
     void requestProgress(const QString &requestId, const QString &stage, qint64 elapsedMs);
     void availabilityChanged();
+    void configurationChanged();
 };
 class ConfiguredAiTextTransport final : public AiTextTransport {
     Q_OBJECT
@@ -49,6 +59,7 @@ public:
     void configure(const AppPreferences &preferences) override;
     int requestTimeoutMs() const override;
     QString connectionIdentity() const override;
+    AiOutputPolicy outputPolicy() const override;
 public slots:
     void complete(const lmsc::AiTextRequest &request) override;
     void cancel(const QString &requestId) override;

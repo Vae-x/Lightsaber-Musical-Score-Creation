@@ -10,6 +10,18 @@
 class DiagnosticLogTest : public QObject {
     Q_OBJECT
 private slots:
+    void recoveryFieldsExcludePrivateText() {
+        QTemporaryDir directory; lmsc::DiagnosticLog log(directory.path());
+        log.record("generation.recovering",{{"jobId","recovery-job"},{"category","truncated"},
+            {"recoveryAttempt",1},{"automaticRecoveries",6},{"delayMs",2000},{"previousMaxOutputTokens",65536},
+            {"maxOutputTokens",131072},{"reasoningTokens",-1},{"finalTextBytes",24},
+            {"reasoning_content","private-reasoning"},{"candidate","private-candidate"},{"prompt","private-prompt"}});
+        const auto content=log.read("recovery-job"); const auto row=QJsonDocument::fromJson(content.trimmed()).object();
+        QCOMPARE(row["recoveryAttempt"].toInt(),1); QCOMPARE(row["automaticRecoveries"].toInt(),6);
+        QCOMPARE(row["delayMs"].toInt(),2000); QCOMPARE(row["previousMaxOutputTokens"].toInt(),65536);
+        QCOMPARE(row["maxOutputTokens"].toInt(),131072); QCOMPARE(row["reasoningTokens"].toInt(),-1);
+        QCOMPARE(row["finalTextBytes"].toInt(),24); QVERIFY(!content.contains("private"));
+    }
     void motifQualityFieldsSurviveExportWithoutCandidateText() {
         QTemporaryDir directory; lmsc::DiagnosticLog log(directory.path());
         log.record("generation.motifQuality",{{"jobId","quality-job"},{"segment",7},{"referenceSegment",2},

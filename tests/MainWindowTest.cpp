@@ -4,6 +4,8 @@
 #include "gui/EditorViews.h"
 #include "gui/NavigationSidebar.h"
 #include "gui/ThemeManager.h"
+#include "gui/SettingsPanel.h"
+#include "core/AiTextTransport.h"
 #include "core/AppInfo.h"
 #include "core/AppSettings.h"
 #include "core/AudioService.h"
@@ -31,6 +33,7 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QPointer>
+#include <QSpinBox>
 #include <QRegularExpression>
 #include <QSpinBox>
 #include <QStatusBar>
@@ -134,6 +137,7 @@ private slots:
     void aiRecognitionEntry();
     void aiSuggestionsPreserveLoadedDocument();
     void aiGenerationPreviewAndAtomicApply();
+    void outputLimitSettingsReachGenerationTransport();
     void clickPlaceApplyUndoAndDifficulty();
     void protectedSelectionRejectsEntireDrag();
     void importMp3AndCropThroughDialogs_data();
@@ -413,6 +417,15 @@ void MainWindowTest::aiSuggestionsPreserveLoadedDocument() {
     window.close();
 }
 
+void MainWindowTest::outputLimitSettingsReachGenerationTransport() {
+    MainWindow window(nullptr,m_temp.filePath("output-policy-settings.json")); window.setTestMode(true);
+    auto *transport=window.findChild<lmsc::ConfiguredAiTextTransport *>();
+    auto *settings=window.findChild<lmsc::SettingsPanel *>();
+    auto *tokens=window.findChild<QSpinBox *>("aiMaxOutputTokens"); QVERIFY(transport && settings && tokens);
+    QSignalSpy changes(transport,&lmsc::AiTextTransport::configurationChanged);
+    tokens->setValue(65536); QVERIFY(settings->applyPreferences()); QCOMPARE(changes.count(),1);
+    QCOMPARE(transport->outputPolicy().maximumTokens,65536);
+}
 void MainWindowTest::aiGenerationPreviewAndAtomicApply() {
     QString error;
     lmsc::BeatmapDocument original;

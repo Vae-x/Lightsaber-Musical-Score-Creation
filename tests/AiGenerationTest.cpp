@@ -8,6 +8,7 @@
 #include <QJsonDocument>
 #include <QMap>
 #include <QSignalSpy>
+#include <QSet>
 #include <QTemporaryDir>
 #include <QTest>
 #include <QTimer>
@@ -104,21 +105,35 @@ public:
     QVector<lmsc::AiTextRequest> requests;
     QStringList cancellations;
     std::function<QString(const lmsc::AiTextRequest &, const QJsonObject &)> responder;
+    std::function<lmsc::AiFailure(const lmsc::AiTextRequest &, const QJsonObject &)> failureResponder;
+    lmsc::AiOutputPolicy policy;
     bool isAvailable() const override { return available; }
     void configure(const lmsc::AppPreferences &) override {}
+    lmsc::AiOutputPolicy outputPolicy() const override { return policy; }
     void complete(const lmsc::AiTextRequest &request) override {
         requests.append(request);
         if (hold) return;
         const auto input=QJsonDocument::fromJson(request.userPrompt.toUtf8()).object();
         const QString answer=responder ? responder(request,input)
             : QString::fromUtf8(QJsonDocument(input.value("stage").toString()=="plan" ? validPlan(input) : validSegment(input)).toJson(QJsonDocument::Compact));
-        QTimer::singleShot(0,this,[this,request,answer] {
-            if (networkFailure) emit failed(request.requestId,QStringLiteral("模拟网络失败"));
+        auto failure=failureResponder ? failureResponder(request,input) : lmsc::AiFailure{};
+        failure.requestId=request.requestId; failure.jobId=request.jobId;
+        QTimer::singleShot(0,this,[this,request,answer,failure] {
+            if (!failure.category.isEmpty()) { emit failureInfo(failure); emit failed(request.requestId,QStringLiteral("模拟暂时失败")); }
+            else if (networkFailure) emit failed(request.requestId,QStringLiteral("模拟网络失败"));
             else emit completed({request.requestId,answer,10,20});
         });
     }
     void cancel(const QString &id) override { cancellations.append(id); }
 };
+void accelerateRecovery(lmsc::LlmAiGenerationService &service) {
+    QObject::connect(&service,&lmsc::AiGenerationService::progress,&service,[&service] {
+        if (service.status().recovering) QTimer::singleShot(0,&service,[&service] {
+            auto *timer=service.findChild<QTimer *>("aiGenerationRecoveryTimer");
+            if (timer && timer->isActive()) timer->start(0);
+        });
+    });
+}
 }
 
 class AiGenerationTest : public QObject {
@@ -158,6 +173,18 @@ private slots:
     void completedAnalysisIsReusedForGeneration();
     void emptyOrUnknownOptionsAreRejected();
     void completedAndCancelledTasksReleaseAudioLease();
+    void truncationRaisesBudgetAndRetainsIt();
+    void sixTransientFailuresFinish21Segments();
+    void recoveryLimitAndManualContinue();
+    void taskRecoveryBudgetSurvivesResume();
+    void truncationWithoutLargerBudgetPauses_data();
+    void truncationWithoutLargerBudgetPauses();
+    void nonTransientFailuresNeverRecover_data();
+    void nonTransientFailuresNeverRecover();
+    void recoveryCanBeCancelledReconfiguredAndTimedOut_data();
+    void recoveryCanBeCancelledReconfiguredAndTimedOut();
+    void bestCandidateSurvivesAutomaticRecovery();
+    void manualContinueRaisesTruncatedBudget();
 private:
     QTemporaryDir temporary;
     QString shortPcm,longPcm,twentyOnePcm;
@@ -687,6 +714,171 @@ void AiGenerationTest::completedAnalysisIsReusedForGeneration() {
     int plans=0;
     for (const auto &message:transport.requests) if (QJsonDocument::fromJson(message.userPrompt.toUtf8()).object().value("stage").toString()=="plan") ++plans;
     QCOMPARE(plans,1); QVERIFY(!qvariant_cast<lmsc::GenerationDraft>(ready.last().first()).objects.isEmpty());
+}
+void AiGenerationTest::truncationRaisesBudgetAndRetainsIt() {
+    FakeTransport transport; transport.policy={8192,32768,false};
+    transport.failureResponder=[](const lmsc::AiTextRequest &message,const QJsonObject &input) {
+        lmsc::AiFailure failure;
+        if (input.value("stage").toString()=="plan" && message.maxOutputTokens<32768) {
+            failure.category="truncated"; failure.maxOutputTokens=message.maxOutputTokens;
+        }
+        return failure;
+    };
+    lmsc::LlmAiGenerationService service(&transport);
+    QSignalSpy ready(&service,&lmsc::AiGenerationService::draftReady), failed(&service,&lmsc::AiGenerationService::requestFailed);
+    service.generate(request()); QTRY_COMPARE(ready.count(),1); QCOMPARE(failed.count(),0);
+    QCOMPARE(transport.requests[0].maxOutputTokens,8192); QCOMPARE(transport.requests[1].maxOutputTokens,16384);
+    for (int i=2;i<transport.requests.size();++i) QCOMPARE(transport.requests[i].maxOutputTokens,32768);
+    QCOMPARE(transport.requests[0].userPrompt,transport.requests[1].userPrompt);
+    QCOMPARE(transport.requests[1].userPrompt,transport.requests[2].userPrompt);
+    QVERIFY(transport.requests[0].requestId!=transport.requests[1].requestId);
+    QCOMPARE(service.status().percent,100); QVERIFY(!service.status().recovering);
+}
+void AiGenerationTest::sixTransientFailuresFinish21Segments() {
+    auto source=request(168); source.profile=lmsc::DifficultyProfile::forName("Easy");
+    FakeTransport baseline; lmsc::LlmAiGenerationService original(&baseline);
+    QSignalSpy originalReady(&original,&lmsc::AiGenerationService::draftReady);
+    original.generate(source); QTRY_COMPARE(originalReady.count(),1);
+    const auto expected=qvariant_cast<lmsc::GenerationDraft>(originalReady.first().first());
+    FakeTransport transport; QSet<QString> injected;
+    transport.failureResponder=[&](const lmsc::AiTextRequest &,const QJsonObject &input) {
+        lmsc::AiFailure failure; const QString id=input.value("music").toObject().value("segmentId").toString();
+        if (QStringList{"s1","s4","s7","s10","s13","s16"}.contains(id) && !injected.contains(id)) {
+            injected.insert(id); failure.category=injected.size()%3==0 ? "server" : injected.size()%3==1 ? "network" : "timeout";
+            if (failure.category=="server") failure.httpStatus=503;
+        }
+        return failure;
+    };
+    lmsc::LlmAiGenerationService service(&transport); accelerateRecovery(service);
+    QSignalSpy ready(&service,&lmsc::AiGenerationService::draftReady), failed(&service,&lmsc::AiGenerationService::requestFailed);
+    service.generate(source); QTRY_COMPARE(ready.count(),1); QCOMPARE(failed.count(),0);
+    QCOMPARE(injected.size(),6); QCOMPARE(service.status().completedSegments,21); QCOMPARE(transport.requests.size(),28);
+    const auto draft=qvariant_cast<lmsc::GenerationDraft>(ready.first().first()); QCOMPARE(draft.objects.size(),expected.objects.size());
+    for (int i=0;i<draft.objects.size();++i) {
+        QCOMPARE(draft.objects[i].beat,expected.objects[i].beat); QCOMPARE(draft.objects[i].kind,expected.objects[i].kind);
+        QCOMPARE(draft.objects[i].x,expected.objects[i].x); QCOMPARE(draft.objects[i].direction,expected.objects[i].direction);
+    }
+}
+void AiGenerationTest::recoveryLimitAndManualContinue() {
+    FakeTransport transport; transport.failureResponder=[](const lmsc::AiTextRequest &,const QJsonObject &) {
+        lmsc::AiFailure failure; failure.category="network"; return failure;
+    };
+    lmsc::LlmAiGenerationService service(&transport); accelerateRecovery(service);
+    QSignalSpy failed(&service,&lmsc::AiGenerationService::requestFailed), ready(&service,&lmsc::AiGenerationService::draftReady);
+    service.generate(request()); QTRY_COMPARE(failed.count(),1); QCOMPARE(transport.requests.size(),3);
+    QCOMPARE(service.status().pauseCategory,QString("network")); QVERIFY(service.status().resumable);
+    transport.failureResponder={}; service.resume("job-1"); QTRY_COMPARE(ready.count(),1);
+    QCOMPARE(transport.requests[2].userPrompt,transport.requests[3].userPrompt);
+}
+void AiGenerationTest::taskRecoveryBudgetSurvivesResume() {
+    FakeTransport transport; QSet<QString> injected;
+    transport.failureResponder=[&](const lmsc::AiTextRequest &,const QJsonObject &input) {
+        lmsc::AiFailure failure; const QString id=input.value("music").toObject().value("segmentId").toString();
+        if (!id.isEmpty() && !injected.contains(id)) { injected.insert(id); failure.category="network"; }
+        return failure;
+    };
+    lmsc::LlmAiGenerationService service(&transport); accelerateRecovery(service);
+    QSignalSpy failed(&service,&lmsc::AiGenerationService::requestFailed), ready(&service,&lmsc::AiGenerationService::draftReady);
+    service.generate(request(168)); QTRY_COMPARE(failed.count(),1); QCOMPARE(injected.size(),11);
+    QCOMPARE(service.status().completedSegments,10);
+    service.resume("job-1"); QTRY_COMPARE(failed.count(),2); QCOMPARE(injected.size(),12);
+    QCOMPARE(service.status().completedSegments,11); // Manual continuation does not renew the ten automatic recoveries.
+    transport.failureResponder={}; service.resume("job-1"); QTRY_COMPARE(ready.count(),1);
+}
+void AiGenerationTest::truncationWithoutLargerBudgetPauses_data() {
+    QTest::addColumn<int>("initial"); QTest::addColumn<int>("maximum");
+    QTest::newRow("service-managed") << 0 << 0;
+    QTest::newRow("already-at-cap") << 8192 << 8192;
+}
+void AiGenerationTest::truncationWithoutLargerBudgetPauses() {
+    QFETCH(int,initial); QFETCH(int,maximum);
+    FakeTransport transport; transport.policy={initial,maximum,false};
+    transport.failureResponder=[](const lmsc::AiTextRequest &message,const QJsonObject &) {
+        lmsc::AiFailure failure; failure.category="truncated"; failure.maxOutputTokens=message.maxOutputTokens>0 ? message.maxOutputTokens : -1; return failure;
+    };
+    lmsc::LlmAiGenerationService service(&transport); QSignalSpy failed(&service,&lmsc::AiGenerationService::requestFailed);
+    service.generate(request()); QTRY_COMPARE(failed.count(),1); QCOMPARE(transport.requests.size(),1);
+    service.cancel("job-1"); transport.policy={65536,131072,true}; transport.failureResponder={};
+    QSignalSpy ready(&service,&lmsc::AiGenerationService::draftReady); service.resume("job-1"); QTRY_COMPARE(ready.count(),1);
+    QCOMPARE(transport.requests[1].maxOutputTokens,65536);
+}
+void AiGenerationTest::nonTransientFailuresNeverRecover_data() {
+    QTest::addColumn<QString>("category");
+    QTest::addColumn<bool>("retryable");
+    for (const QString category : {"authentication","permission","quota","parameters","tls","proxy","protocol"})
+        QTest::newRow(qPrintable(category)) << category << true;
+    QTest::newRow("unsupported-server") << QString("server") << true;
+    QTest::newRow("network-not-retryable") << QString("network") << false;
+}
+void AiGenerationTest::nonTransientFailuresNeverRecover() {
+    QFETCH(QString,category); QFETCH(bool,retryable); FakeTransport transport;
+    transport.failureResponder=[category,retryable](const lmsc::AiTextRequest &,const QJsonObject &) {
+        lmsc::AiFailure failure; failure.category=category; failure.retryable=retryable;
+        if (category=="server") failure.httpStatus=501; return failure;
+    };
+    lmsc::LlmAiGenerationService service(&transport); QSignalSpy failed(&service,&lmsc::AiGenerationService::requestFailed),ready(&service,&lmsc::AiGenerationService::draftReady);
+    service.generate(request()); QTRY_COMPARE(failed.count(),1); QCOMPARE(transport.requests.size(),1);
+    QCOMPARE(service.status().pauseCategory,category); QCOMPARE(ready.count(),0);
+}
+void AiGenerationTest::recoveryCanBeCancelledReconfiguredAndTimedOut_data() {
+    QTest::addColumn<QString>("action");
+    for (const QString action : {"cancel","discard","configure","timeout"}) QTest::newRow(qPrintable(action)) << action;
+}
+void AiGenerationTest::recoveryCanBeCancelledReconfiguredAndTimedOut() {
+    QFETCH(QString,action); FakeTransport transport;
+    transport.failureResponder=[](const lmsc::AiTextRequest &,const QJsonObject &) { lmsc::AiFailure failure; failure.category="network"; return failure; };
+    lmsc::LlmAiGenerationService service(&transport); QSignalSpy ready(&service,&lmsc::AiGenerationService::draftReady);
+    service.generate(request()); QTRY_VERIFY(service.status().recovering);
+    auto *timer=service.findChild<QTimer *>("aiGenerationRecoveryTimer"); QVERIFY(timer && timer->isActive()); QCOMPARE(timer->interval(),2000);
+    auto *deadline=service.findChild<QTimer *>("aiGenerationTaskTimer"); QVERIFY(deadline && deadline->isActive());
+    QVERIFY(deadline->remainingTime()<45*60000); const auto old=transport.requests.first();
+    if (action=="cancel") service.cancel("job-1");
+    else if (action=="discard") service.discard("job-1");
+    else if (action=="configure") emit transport.configurationChanged();
+    else { deadline->start(0); QTRY_COMPARE(service.status().state,lmsc::AiGenerationService::Status::Paused); }
+    QVERIFY(!timer->isActive()); QVERIFY(!service.status().recovering);
+    emit transport.completed({old.requestId,"{}",1,1}); QCOMPARE(ready.count(),0);
+    QVERIFY(QMetaObject::invokeMethod(timer,"timeout",Qt::DirectConnection)); QTest::qWait(30); QCOMPARE(transport.requests.size(),1);
+}
+void AiGenerationTest::bestCandidateSurvivesAutomaticRecovery() {
+    FakeTransport transport; int calls=0; bool recovered=false,contextMatches=false; QString interrupted;
+    transport.responder=[&](const lmsc::AiTextRequest &,const QJsonObject &input) {
+        auto response=input.value("stage").toString()=="plan" ? validPlan(input) : fourNoteSegment(input);
+        if (input.value("music").toObject().value("segmentId").toString()=="s2" && input.contains("motifReference")) {
+            ++calls; auto rows=response.value("objects").toArray(); auto row=rows[0].toObject(); row["direction"]=0;
+            if (calls>=3) row["anchorId"]="invalid"; rows[0]=row; response["objects"]=rows;
+        }
+        return QString::fromUtf8(QJsonDocument(response).toJson(QJsonDocument::Compact));
+    };
+    transport.failureResponder=[&](const lmsc::AiTextRequest &message,const QJsonObject &input) {
+        lmsc::AiFailure failure;
+        if (calls==2 && input.value("music").toObject().value("segmentId").toString()=="s2") {
+            failure.category="network"; interrupted=message.userPrompt;
+        } else if (calls==3) { recovered=true; contextMatches=message.userPrompt==interrupted; }
+        return failure;
+    };
+    lmsc::LlmAiGenerationService service(&transport); accelerateRecovery(service);
+    QSignalSpy ready(&service,&lmsc::AiGenerationService::draftReady),failed(&service,&lmsc::AiGenerationService::requestFailed);
+    service.generate(request()); QTRY_COMPARE(ready.count(),1); QCOMPARE(failed.count(),0); QVERIFY(recovered); QVERIFY(contextMatches);
+    const auto draft=qvariant_cast<lmsc::GenerationDraft>(ready.first().first()); QVERIFY(draft.hasThemeWarnings);
+    QCOMPARE(draft.objects[8].direction,0); QCOMPARE(draft.objects[0].direction,1);
+}
+void AiGenerationTest::manualContinueRaisesTruncatedBudget() {
+    FakeTransport transport; transport.policy={8192,131072,false};
+    transport.failureResponder=[](const lmsc::AiTextRequest &message,const QJsonObject &input) {
+        lmsc::AiFailure failure;
+        if (input.value("stage").toString()=="plan" && message.maxOutputTokens<65536) {
+            failure.category="truncated"; failure.maxOutputTokens=message.maxOutputTokens;
+        }
+        return failure;
+    };
+    lmsc::LlmAiGenerationService service(&transport);
+    QSignalSpy failed(&service,&lmsc::AiGenerationService::requestFailed),ready(&service,&lmsc::AiGenerationService::draftReady);
+    service.generate(request()); QTRY_COMPARE(failed.count(),1); QCOMPARE(transport.requests.size(),3);
+    QCOMPARE(transport.requests.last().maxOutputTokens,32768);
+    service.resume("job-1"); QTRY_COMPARE(ready.count(),1); QCOMPARE(failed.count(),1);
+    QCOMPARE(transport.requests[3].maxOutputTokens,65536);
+    QCOMPARE(transport.requests[2].userPrompt,transport.requests[3].userPrompt);
 }
 QTEST_GUILESS_MAIN(AiGenerationTest)
 #include "AiGenerationTest.moc"

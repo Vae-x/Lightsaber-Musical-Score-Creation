@@ -102,7 +102,8 @@ bool sameAiPreferences(const lmsc::AppPreferences &a, const lmsc::AppPreferences
     for (auto it = a.providers.begin(); it != a.providers.end(); ++it) {
         const auto other = b.providers.value(it.key());
         if (it.value().baseUrl != other.baseUrl || it.value().apiKey != other.apiKey
-            || it.value().model != other.model || it.value().models != other.models) return false;
+            || it.value().model != other.model || it.value().models != other.models
+            || it.value().maxOutputTokens != other.maxOutputTokens) return false;
     }
     return true;
 }

@@ -535,6 +535,7 @@ struct CodexTextSession::Impl {
             AiTextResult output;
             output.requestId = request.requestId;
             output.text = finalMessages.constBegin().value();
+            output.finalTextBytes = output.text.toUtf8().size();
             stop(false, true);
             success(output);
         }

@@ -49,6 +49,8 @@ public:
         QString jobId, stage, message;
         int percent = 0, completedSegments = 0, totalSegments = 0;
         bool resumable = false;
+        bool recovering = false;
+        QString pauseCategory;
     };
     virtual Status status() const { return {}; }
 public slots:
