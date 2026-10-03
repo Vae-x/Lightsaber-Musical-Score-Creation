@@ -131,6 +131,135 @@ void verifyShift(const QJsonObject &before, const QJsonObject &after, double bea
         }
     }
 }
+
+void verifyMultipleDifficulties(const QString &tools, const QString &root, const QString &sourceProject,
+                                double leadIn, double bpm, const QVector<qint16> &originalPcm) {
+    QString error;
+    BeatmapDocument document;
+    require(document.loadProject(sourceProject, &error), error);
+    const QStringList names{"Hard", "Normal", "Expert", "ExpertPlus"};
+    const QVector<int> ranks{5, 3, 7, 9};
+    for (int i = 0; i < names.size(); ++i) {
+        BeatObject note; note.beat = 1 + i; note.x = i % 4; note.y = 1; note.color = i % 2; note.direction = 1;
+        BeatObject wall; wall.kind = ObjectKind::Wall; wall.beat = 5 + i; wall.x = 0; wall.y = 0; wall.width = 1; wall.duration = .5;
+        require(document.applyGeneratedChart({note, wall}, names[i], ranks[i], document.revision(), &error), error);
+    }
+    require(document.difficulties().size() == 5, "generating four more difficulties retains the original Easy chart");
+    const QString project = QDir(root).filePath("multi-project");
+    require(document.saveProject(project, &error), error);
+    const auto savedHashes = folderHashes(project);
+    const QString beforeSelection = document.currentDifficultyId();
+    const QString baseline = QDir(root).filePath("multi-baseline"), padded = QDir(root).filePath("multi-padded");
+    require(SongExporter::exportSong(document, baseline, 0, "missing-tools", &error), error);
+    require(SongExporter::exportSong(document, padded, leadIn, tools, &error), error);
+    const auto beforeInfo = readJson(QDir(baseline).filePath("Info.dat"));
+    const auto afterInfo = readJson(QDir(padded).filePath("Info.dat"));
+    const auto beforeDifficulties = beforeInfo.value("_difficultyBeatmapSets").toArray().first().toObject().value("_difficultyBeatmaps").toArray();
+    require(beforeDifficulties.size() == 5 && beforeInfo.value("_difficultyBeatmapSets") == afterInfo.value("_difficultyBeatmapSets"),
+            "lead-in preserves all five difficulty descriptors and filenames");
+    for (const auto &value : beforeDifficulties) {
+        const auto difficulty = value.toObject();
+        const QString name = difficulty.value("_difficulty").toString();
+        const QString filename = difficulty.value("_beatmapFilename").toString();
+        require(filename == name + ".dat", "each exported difficulty has its own standard filename");
+        verifyShift(readJson(QDir(baseline).filePath(filename)), readJson(QDir(padded).filePath(filename)), leadIn * bpm / 60);
+    }
+    verifyAudioDelay(originalPcm, decode(QDir(tools).filePath("ffmpeg.exe"), QDir(padded).filePath("song.ogg"),
+                                       QDir(root).filePath("multi-padded.pcm")), leadIn);
+    require(document.currentDifficultyId() == beforeSelection && !document.isModified() && folderHashes(project) == savedHashes,
+            "multi-difficulty export leaves selection, saved assets, and dirty state unchanged");
+    BeatmapDocument exported;
+    require(exported.loadSong(padded, &error) && exported.difficulties().size() == 5, error);
+    const auto difficulties = document.difficulties();
+    for (const auto &difficulty : difficulties) {
+        require(document.setDifficulty(difficulty.id, &error), error);
+        QString exportedId;
+        for (const auto &candidate : exported.difficulties()) if (candidate.name == difficulty.name) exportedId = candidate.id;
+        require(!exportedId.isEmpty() && exported.setDifficulty(exportedId, &error), error);
+        require(document.objects().size() == exported.objects().size(), "all padded charts reload without missing objects");
+        for (int i = 0; i < document.objects().size(); ++i)
+            require(std::abs(exported.timeMap().beatToSeconds(exported.objects()[i].beat)
+                             - document.timeMap().beatToSeconds(document.objects()[i].beat) - leadIn) < 1e-9,
+                    "every padded difficulty has the same gameplay-time shift");
+    }
+    BeatmapDocument reopened;
+    require(reopened.loadProject(project, &error), error);
+    const QString repeated = QDir(root).filePath("multi-repeated");
+    require(SongExporter::exportSong(reopened, repeated, leadIn, tools, &error), error);
+    for (const auto &value : beforeDifficulties) {
+        const QString filename = value.toObject().value("_beatmapFilename").toString();
+        require(readJson(QDir(repeated).filePath(filename)) == readJson(QDir(padded).filePath(filename)),
+                "multi-difficulty save/reopen exports do not accumulate lead-in");
+    }
+
+    // Inject protected content into the non-selected original Easy map. The
+    // saved source snapshot deliberately remains the original Expert.dat.
+    for (int variant = 0; variant < 7; ++variant) {
+        const QString variantProject = QDir(root).filePath(QString("multi-protected-project-%1").arg(variant));
+        require(ProjectStore::copyTree(project, variantProject, &error), error);
+        const QString manifestPath = QDir(variantProject).filePath("project.lmsc");
+        auto manifest = readJson(manifestPath);
+        const QString mapPath = QDir(variantProject).filePath(manifest.value("assets").toString() + "/Expert.dat");
+        auto map = readJson(mapPath);
+        if (variant == 0)
+            map.insert("_events", QJsonArray{QJsonObject{{"_time", 2}, {"_type", 100}, {"_floatValue", 180}}});
+        else if (variant == 1)
+            map.insert("_events", QJsonArray{QJsonObject{{"_time", 2}, {"_type", 14}, {"_value", 1}}});
+        else if (variant == 2)
+            map.insert("_customData", QJsonObject{{"_customEvents", QJsonArray{QJsonObject{{"_time", 1}, {"_type", "AnimateTrack"}}}}});
+        else if (variant == 3)
+            map.insert("_notes", QJsonArray{QJsonObject{{"_time", 1}, {"_lineIndex", 3}, {"_lineLayer", 2}, {"_type", 0},
+                                                      {"_cutDirection", 8}, {"customData", QJsonObject{{"animation", "keep"}}}}});
+        else if (variant == 4)
+            map.insert("_obstacles", QJsonArray{QJsonObject{{"_time", 1}, {"_lineIndex", 0}, {"_type", 0}, {"_duration", 1}, {"_width", 5}}});
+        else if (variant == 5)
+            map.insert("customData", "malformed mod data must not be silently discarded");
+        else {
+            auto info = manifest.value("info").toObject();
+            auto sets = info.value("_difficultyBeatmapSets").toArray();
+            auto set = sets.first().toObject();
+            auto descriptors = set.value("_difficultyBeatmaps").toArray();
+            for (int i = 0; i < descriptors.size(); ++i) {
+                auto descriptor = descriptors[i].toObject();
+                if (descriptor.value("_difficulty").toString() == "Easy") {
+                    descriptor.insert("customData", QJsonObject{{"keep", true}}); descriptors[i] = descriptor;
+                }
+            }
+            set.insert("_difficultyBeatmaps", descriptors); sets[0] = set; info.insert("_difficultyBeatmapSets", sets);
+            manifest.insert("info", info);
+        }
+        require(ProjectStore::writeJson(mapPath, map, &error), error);
+        auto assetHashes = manifest.value("assetHashes").toObject();
+        assetHashes.insert("Expert.dat", QString::fromLatin1(hash(mapPath).toHex())); manifest.insert("assetHashes", assetHashes);
+        auto stateDifficulties = manifest.value("difficulties").toArray();
+        for (int i = 0; i < stateDifficulties.size(); ++i) {
+            auto difficulty = stateDifficulties[i].toObject();
+            if (difficulty.value("file").toString() == "Expert.dat") {
+                difficulty.insert("edits", QJsonArray{}); stateDifficulties[i] = difficulty;
+            }
+        }
+        manifest.insert("difficulties", stateDifficulties);
+        require(ProjectStore::writeJson(manifestPath, manifest, &error), error);
+        const auto originalHashes = folderHashes(variantProject);
+        BeatmapDocument protectedSong;
+        require(protectedSong.loadProject(variantProject, &error), error);
+        QString hardId;
+        for (const auto &difficulty : protectedSong.difficulties()) if (difficulty.name == "Hard") hardId = difficulty.id;
+        require(!hardId.isEmpty() && protectedSong.setDifficulty(hardId, &error), error);
+        require(protectedSong.readOnlyReason().isEmpty() && protectedSong.timeMap().changes().isEmpty(),
+                "selected Hard chart is editable while Easy contains protected content");
+        const QString output = QDir(root).filePath(QString("multi-protected-output-%1").arg(variant));
+        require(!SongExporter::exportSong(protectedSong, output, leadIn, tools, &error) && !QFileInfo::exists(output),
+                "protected content in a non-selected difficulty blocks the entire lead-in export");
+        const QString zeroOutput = QDir(root).filePath(QString("multi-protected-zero-output-%1").arg(variant));
+        require(SongExporter::exportSong(protectedSong, zeroOutput, 0, "missing-tools", &error) &&
+                readJson(QDir(zeroOutput).filePath("Easy.dat")) == map,
+                "zero lead-in preserves protected content in non-selected difficulties");
+        require(folderHashes(variantProject) == originalHashes && protectedSong.currentDifficultyId() == hardId,
+                "rejected multi-chart padding does not alter source snapshots or current selection");
+    }
+}
+
 void runTests(const QString &tools, const QString &root) {
     const QString ffmpeg = QDir(tools).filePath("ffmpeg.exe");
     const QString wav = QDir(root).filePath("synthetic-stereo.wav"), ogg = QDir(root).filePath("synthetic-stereo.ogg");
@@ -316,6 +445,7 @@ void runTests(const QString &tools, const QString &root) {
         require(folderHashes(variantProject) == protectedHashes, "protected export attempts never mutate their original project");
     }
     require(folderHashes(project) == sourceHashes, "all export attempts leave the original project unchanged");
+    verifyMultipleDifficulties(tools, root, project, leadIn, bpm, originalPcm);
 }
 }
 
@@ -326,7 +456,7 @@ int main(int argc, char **argv) {
     try {
         require(temporary.isValid(), "create temporary test workspace");
         runTests(QString::fromLocal8Bit(argv[1]), temporary.path());
-        std::fprintf(stdout, "PASS difficulty filenames, synchronized audio/map lead-in, stereo PCM, first-second notes, project immutability, repeat export, no-padding/import preservation, atomic errors, protected data\n");
+        std::fprintf(stdout, "PASS single/multiple difficulty filenames, synchronized audio/all-map lead-in, stereo PCM, first-second notes, project immutability, repeat export, no-padding/import preservation, atomic errors, non-selected protected data\n");
         return 0;
     } catch (const std::exception &error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());

@@ -12,7 +12,7 @@
 
 namespace lmsc {
 GenerationPreviewDialog::GenerationPreviewDialog(const GenerationDraft &draft, int replacedObjectCount,
-                                                 AudioService *audio, QWidget *parent)
+                                                 AudioService *audio, QWidget *parent, bool addsDifficulty)
     : QDialog(parent), m_draft(draft), m_audio(audio), m_timeline(new TimelineView(this)),
       m_track(new TrackView(this)), m_status(new QLabel(this)), m_play(new QPushButton(this)) {
     setObjectName(QStringLiteral("generationPreviewDialog"));
@@ -60,8 +60,11 @@ GenerationPreviewDialog::GenerationPreviewDialog(const GenerationDraft &draft, i
     counts->setObjectName(QStringLiteral("generationPreviewCounts"));
     counts->setWordWrap(true);
     detailsLayout->addWidget(counts);
-    auto notice = new QLabel(tr("应用后将替换当前新歌的 %1 个物件，并将难度设为 %2；全部变化可一次撤销。\n工程音频和时间保持原样，开场缓冲仍在导出时添加。")
-        .arg(replacedObjectCount).arg(draft.source.profile.name), detailsContent);
+    const QString application = addsDifficulty
+        ? tr("应用后将添加 %1 难度，保留其他难度；全部变化可一次撤销。").arg(draft.source.profile.name)
+        : tr("应用后将替换 %1 难度的 %2 个物件，保留其他难度；全部变化可一次撤销。")
+            .arg(draft.source.profile.name).arg(replacedObjectCount);
+    auto notice = new QLabel(application+tr("\n工程音频和时间保持原样，开场缓冲仍在导出时添加。"), detailsContent);
     notice->setObjectName(QStringLiteral("generationReplaceNotice"));
     notice->setWordWrap(true);
     detailsLayout->addWidget(notice);

@@ -18,6 +18,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QMenu>
 #include <QPushButton>
 #include <QPlainTextEdit>
 #include <QScrollArea>
@@ -44,6 +45,7 @@ private slots:
     void themePreviewCancelAndApply();
     void navigationCollapsePreservesDraft();
     void compactNavigationMouseAndKeyboard();
+    void accountSubmenuMouseKeyboardAndDirectLink();
     void responsiveSettingsLayout_data();
     void responsiveSettingsLayout();
     void providerIsolationAndEncryptedSave();
@@ -176,6 +178,69 @@ void SettingsDialogTest::compactNavigationMouseAndKeyboard() {
     QCOMPARE(nav->currentRow(), 3);
     QCOMPARE(pages->currentIndex(), 3);
     QCOMPARE(nav->currentItem()->text(), QStringLiteral("网络"));
+}
+
+void SettingsDialogTest::accountSubmenuMouseKeyboardAndDirectLink() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    lmsc::SettingsDialog dialog(nullptr, directory.filePath(QStringLiteral("preferences.json")));
+    dialog.show();
+    auto sidebar = dialog.findChild<lmsc::NavigationSidebar *>(QStringLiteral("settingsSidebar"));
+    auto nav = dialog.findChild<QListWidget *>(QStringLiteral("settingsNavigation"));
+    auto pages = dialog.findChild<QStackedWidget *>(QStringLiteral("settingsPages"));
+    auto codexPath = dialog.findChild<QLineEdit *>(QStringLiteral("codexExecutable"));
+    auto model = dialog.findChild<QComboBox *>(QStringLiteral("aiModel"));
+    QVERIFY(sidebar && nav && pages && codexPath && model);
+    codexPath->setText(directory.filePath(QStringLiteral("unavailable-submenu-codex.exe")));
+    QCOMPARE(sidebar->parentRow(2), 1);
+    QVERIFY(nav->item(2)->isHidden());
+    nav->setCurrentRow(1);
+    nav->setFocus();
+    model->setEditText(QStringLiteral("unsaved-submenu-model"));
+    QVERIFY(sidebar->isSubmenuExpanded(1));
+    QVERIFY(!nav->item(2)->isHidden());
+    const QPoint arrow = nav->visualItemRect(nav->item(1)).topRight() + QPoint(-15, 24);
+    QTest::mouseClick(nav->viewport(), Qt::LeftButton, Qt::NoModifier, arrow);
+    QVERIFY(nav->item(2)->isHidden());
+    QCOMPARE(nav->currentRow(), 1);
+    QTest::mouseClick(nav->viewport(), Qt::LeftButton, Qt::NoModifier, arrow);
+    QVERIFY(!nav->item(2)->isHidden());
+    QTest::keyClick(nav, Qt::Key_Down);
+    QCOMPARE(nav->currentRow(), 2);
+    QCOMPARE(pages->currentIndex(), 2);
+    QTest::keyClick(nav, Qt::Key_Left);
+    QCOMPARE(nav->currentRow(), 1);
+    QVERIFY(nav->item(2)->isHidden());
+    QTest::keyClick(nav, Qt::Key_Return);
+    QVERIFY(!nav->item(2)->isHidden());
+    QVERIFY(dialog.isVisible());
+    sidebar->setCollapsed(true);
+    QTest::keyClick(nav, Qt::Key_Right);
+    auto menu = sidebar->findChild<QMenu *>(QStringLiteral("navigationSubmenu"));
+    QVERIFY(menu && menu->isVisible());
+    QCOMPARE(menu->actions().size(), 1);
+    QTest::keyClick(menu, Qt::Key_Return);
+    QCOMPARE(nav->currentRow(), 2);
+    QCOMPARE(pages->currentIndex(), 2);
+    QVERIFY(nav->item(2)->isHidden());
+    QVERIFY(dialog.isVisible());
+    sidebar->setCollapsed(false);
+    QVERIFY(!nav->item(2)->isHidden());
+    nav->setCurrentRow(1);
+    QCOMPARE(model->currentText(), QStringLiteral("unsaved-submenu-model"));
+    sidebar->setSubmenuExpanded(1, false);
+    auto connection = dialog.findChild<QComboBox *>(QStringLiteral("aiConnection"));
+    QVERIFY(connection);
+    connection->setCurrentIndex(connection->findData(QStringLiteral("codex")));
+    QPushButton *configure = nullptr;
+    for (auto button : dialog.findChildren<QPushButton *>())
+        if (button->text() == QStringLiteral("配置 Codex 账号授权")) configure = button;
+    QVERIFY(configure);
+    QTest::mouseClick(configure, Qt::LeftButton);
+    QCOMPARE(nav->currentRow(), 2);
+    QCOMPARE(pages->currentIndex(), 2);
+    QVERIFY(!nav->item(2)->isHidden());
+    QVERIFY(!QFile::exists(directory.filePath(QStringLiteral("preferences.json"))));
 }
 
 void SettingsDialogTest::responsiveSettingsLayout_data() {

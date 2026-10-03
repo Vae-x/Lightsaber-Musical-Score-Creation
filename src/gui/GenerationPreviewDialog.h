@@ -15,7 +15,7 @@ class GenerationPreviewDialog final : public QDialog {
     Q_OBJECT
 public:
     explicit GenerationPreviewDialog(const GenerationDraft &draft, int replacedObjectCount,
-                                     AudioService *audio, QWidget *parent = nullptr);
+                                     AudioService *audio, QWidget *parent = nullptr, bool addsDifficulty = false);
     ~GenerationPreviewDialog() override;
     const GenerationDraft &draft() const { return m_draft; }
     void showApplicationError(const QString &message);

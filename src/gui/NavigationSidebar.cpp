@@ -2,6 +2,7 @@
 #include "ThemeManager.h"
 
 #include <QAbstractItemView>
+#include <QAction>
 #include <QApplication>
 #include <QFontMetrics>
 #include <QHBoxLayout>
@@ -9,6 +10,8 @@
 #include <QKeyEvent>
 #include <QLabel>
 #include <QListWidget>
+#include <QMenu>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
 #include <QStyleOptionToolButton>
@@ -21,6 +24,9 @@
 namespace lmsc {
 namespace {
 constexpr int iconRole = Qt::UserRole + 1;
+constexpr int parentRole = Qt::UserRole + 2;
+constexpr int submenuRole = Qt::UserRole + 3;
+constexpr int expandedRole = Qt::UserRole + 4;
 
 class NavigationIconEngine final : public QIconEngine {
 public:
@@ -99,7 +105,9 @@ public:
         painter->setClipRect(styled.rect);
         painter->setRenderHint(QPainter::Antialiasing);
         const QRectF bounds = QRectF(styled.rect).adjusted(1, 1, -1, -1);
-        const bool selected = styled.state.testFlag(QStyle::State_Selected);
+        const bool childSelected = m_sidebar->isCollapsed()
+            && m_sidebar->parentRow(m_sidebar->listWidget()->currentRow()) == index.row();
+        const bool selected = styled.state.testFlag(QStyle::State_Selected) || childSelected;
         const bool hovered = styled.state.testFlag(QStyle::State_MouseOver);
         const QColor accent = styled.palette.color(QPalette::Link);
         if (selected || hovered) {
@@ -119,8 +127,10 @@ public:
         const QPalette::ColorGroup group = styled.state.testFlag(QStyle::State_Enabled)
                                               ? QPalette::Active : QPalette::Disabled;
         const QColor foreground = selected ? accent : styled.palette.color(group, QPalette::Text);
+        const bool child = index.data(parentRole).toInt() >= 0;
+        const qreal indent = child ? 18 : 0;
         const qreal iconLeft = m_sidebar->isCollapsed() ? bounds.center().x() - 11
-                                                       : bounds.left() + 14;
+                                                       : bounds.left() + 14 + indent;
         drawNavigationIcon(*painter, static_cast<NavigationIcon>(index.data(iconRole).toInt()),
                            QRectF(iconLeft, bounds.center().y() - 11, 22, 22), foreground);
         if (!m_sidebar->isCollapsed()) {
@@ -128,10 +138,23 @@ public:
             QFont font = styled.font;
             font.setWeight(selected ? QFont::DemiBold : QFont::Normal);
             painter->setFont(font);
-            const QRect textRect = bounds.adjusted(48, 0, -10, 0).toRect();
+            const QRect textRect = bounds.adjusted(48 + indent, 0,
+                index.data(submenuRole).toBool() ? -30 : -10, 0).toRect();
             painter->drawText(textRect, Qt::AlignLeft | Qt::AlignVCenter,
                               QFontMetrics(font).elidedText(styled.text, Qt::ElideRight,
                                                            textRect.width()));
+        }
+        if (index.data(submenuRole).toBool()) {
+            const QPointF center(m_sidebar->isCollapsed() ? bounds.right() - 5 : bounds.right() - 15,
+                                 bounds.center().y());
+            painter->setPen(QPen(foreground, 1.6, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+            if (!m_sidebar->isCollapsed() && index.data(expandedRole).toBool()) {
+                painter->drawLine(center + QPointF(-3, -2), center + QPointF(0, 1));
+                painter->drawLine(center + QPointF(0, 1), center + QPointF(3, -2));
+            } else {
+                painter->drawLine(center + QPointF(-2, -3), center + QPointF(1, 0));
+                painter->drawLine(center + QPointF(1, 0), center + QPointF(-2, 3));
+            }
         }
         if (styled.state.testFlag(QStyle::State_HasFocus)) {
             painter->setBrush(Qt::NoBrush);
@@ -254,10 +277,25 @@ NavigationSidebar::NavigationSidebar(QWidget *parent)
     m_list->setMouseTracking(true);
     m_list->setFocusPolicy(Qt::StrongFocus);
     m_list->setAccessibleName(tr("设置导航"));
-    m_list->setAccessibleDescription(tr("使用上下方向键切换设置页面。"));
+    m_list->setAccessibleDescription(tr("使用上下方向键切换页面，左右方向键展开或收起子菜单。导航收起时可按右方向键打开子菜单。"));
     m_list->setItemDelegate(new NavigationDelegate(this));
     layout->addWidget(m_list, 1);
     connect(m_toggle, &QToolButton::clicked, this, [this] { setCollapsed(!m_collapsed); });
+    m_list->installEventFilter(this);
+    m_list->viewport()->installEventFilter(this);
+    connect(m_list, &QListWidget::currentRowChanged, this, [this](int row) {
+        const int parent = parentRow(row);
+        if (parent >= 0) setSubmenuExpanded(parent, true);
+        else if (row >= 0 && m_list->item(row)->data(submenuRole).toBool())
+            setSubmenuExpanded(row, true);
+        m_list->viewport()->update();
+    });
+    connect(m_list, &QListWidget::itemClicked, this, [this](QListWidgetItem *item) {
+        if (!item->data(submenuRole).toBool()) return;
+        const int row = m_list->row(item);
+        if (m_collapsed) showSubmenu(row);
+        else setSubmenuExpanded(row, true);
+    });
     setTabOrder(m_toggle, m_list);
 }
 
@@ -265,21 +303,130 @@ void NavigationSidebar::addItem(const QString &text, NavigationIcon icon) {
     auto item = new QListWidgetItem(text, m_list);
     item->setIcon(QIcon(new NavigationIconEngine(icon)));
     item->setData(iconRole, static_cast<int>(icon));
+    item->setData(parentRole, -1);
     item->setToolTip(text);
     item->setData(Qt::AccessibleTextRole, text);
+}
+
+void NavigationSidebar::addSubItem(int parent, const QString &text, NavigationIcon icon) {
+    if (parent < 0 || parent >= m_list->count() || parentRow(parent) >= 0) return;
+    addItem(text, icon);
+    auto item = m_list->item(m_list->count() - 1);
+    item->setData(parentRole, parent);
+    item->setData(Qt::AccessibleDescriptionRole,
+                  tr("%1 的子菜单").arg(m_list->item(parent)->text()));
+    m_list->item(parent)->setData(submenuRole, true);
+    m_list->item(parent)->setData(Qt::AccessibleDescriptionRole,
+                  tr("包含子菜单，按右方向键展开。"));
+    updateSubmenuVisibility();
+}
+
+int NavigationSidebar::parentRow(int row) const {
+    return row >= 0 && row < m_list->count() ? m_list->item(row)->data(parentRole).toInt() : -1;
+}
+
+bool NavigationSidebar::isSubmenuExpanded(int row) const {
+    return row >= 0 && row < m_list->count() && m_list->item(row)->data(expandedRole).toBool();
+}
+
+void NavigationSidebar::setSubmenuExpanded(int row, bool expanded) {
+    if (row < 0 || row >= m_list->count() || !m_list->item(row)->data(submenuRole).toBool()) return;
+    if (!expanded && parentRow(m_list->currentRow()) == row) m_list->setCurrentRow(row);
+    m_list->item(row)->setData(expandedRole, expanded);
+    m_list->item(row)->setData(Qt::AccessibleDescriptionRole,
+        expanded ? tr("子菜单已展开，按左方向键收起。") : tr("子菜单已收起，按右方向键展开。"));
+    updateSubmenuVisibility();
+}
+
+void NavigationSidebar::updateSubmenuVisibility() {
+    for (int row = 0; row < m_list->count(); ++row) {
+        const int parent = parentRow(row);
+        if (parent >= 0) m_list->item(row)->setHidden(m_collapsed || !isSubmenuExpanded(parent));
+    }
+    m_list->viewport()->update();
+}
+
+void NavigationSidebar::showSubmenu(int row) {
+    if (row < 0 || row >= m_list->count() || !m_list->item(row)->data(submenuRole).toBool()) return;
+    if (!m_submenu) {
+        m_submenu = new QMenu(this);
+        m_submenu->setObjectName(QStringLiteral("navigationSubmenu"));
+    }
+    m_submenu->clear();
+    m_submenu->setAccessibleName(tr("%1 子菜单").arg(m_list->item(row)->text()));
+    for (int child = 0; child < m_list->count(); ++child) {
+        if (parentRow(child) != row) continue;
+        auto item = m_list->item(child);
+        auto action = m_submenu->addAction(item->icon(), item->text());
+        action->setData(child);
+        action->setCheckable(true);
+        action->setChecked(m_list->currentRow() == child);
+        connect(action, &QAction::triggered, this, [this, child] {
+            m_list->setCurrentRow(child);
+            m_list->setFocus();
+        });
+    }
+    const QRect itemRect = m_list->visualItemRect(m_list->item(row));
+    m_submenu->popup(m_list->viewport()->mapToGlobal(itemRect.topRight() + QPoint(8, 0)));
+    if (!m_submenu->actions().isEmpty()) m_submenu->setActiveAction(m_submenu->actions().first());
+}
+
+bool NavigationSidebar::eventFilter(QObject *watched, QEvent *event) {
+    if (watched == m_list && event->type() == QEvent::KeyPress) {
+        auto key = static_cast<QKeyEvent *>(event);
+        const int row = m_list->currentRow();
+        const bool parent = row >= 0 && m_list->item(row)->data(submenuRole).toBool();
+        const int menuRow = parent ? row : (m_collapsed ? parentRow(row) : -1);
+        if (key->modifiers() == Qt::NoModifier || key->modifiers() == Qt::KeypadModifier) {
+            if (key->key() == Qt::Key_Right && menuRow >= 0) {
+                if (m_collapsed) showSubmenu(menuRow);
+                else setSubmenuExpanded(row, true);
+                return true;
+            }
+            if (key->key() == Qt::Key_Left && (parent || parentRow(row) >= 0)) {
+                setSubmenuExpanded(parent ? row : parentRow(row), false);
+                return true;
+            }
+            if (key->key() == Qt::Key_Return || key->key() == Qt::Key_Enter) {
+                if (menuRow >= 0) {
+                    if (m_collapsed) showSubmenu(menuRow);
+                    else setSubmenuExpanded(row, !isSubmenuExpanded(row));
+                }
+                // Avoid activating the settings dialog's default Save button.
+                return true;
+            }
+        }
+    }
+    if (watched == m_list->viewport()
+        && (event->type() == QEvent::MouseButtonPress || event->type() == QEvent::MouseButtonRelease)) {
+        auto mouse = static_cast<QMouseEvent *>(event);
+        auto item = m_list->itemAt(mouse->pos());
+        if (mouse->button() == Qt::LeftButton && item && item->data(submenuRole).toBool() && !m_collapsed) {
+            const QRect bounds = m_list->visualItemRect(item);
+            if (mouse->pos().x() >= bounds.right() - 30) {
+                if (event->type() == QEvent::MouseButtonPress) {
+                    const int row = m_list->row(item);
+                    setSubmenuExpanded(row, !isSubmenuExpanded(row));
+                }
+                return true;
+            }
+        }
+    }
+    return QWidget::eventFilter(watched, event);
 }
 
 void NavigationSidebar::setCollapsed(bool collapsed) {
     if (m_collapsed == collapsed)
         return;
     m_collapsed = collapsed;
+    if (m_submenu) m_submenu->close();
     setFixedWidth(collapsed ? 64 : 208);
     m_heading->setVisible(!collapsed);
     const QString action = collapsed ? tr("展开导航") : tr("收起导航");
     m_toggle->setText(action);
     m_toggle->setToolTip(action);
     m_toggle->setAccessibleName(action);
-    m_list->viewport()->update();
+    updateSubmenuVisibility();
     emit collapsedChanged(collapsed);
 }
 

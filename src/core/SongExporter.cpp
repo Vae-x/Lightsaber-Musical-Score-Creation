@@ -6,6 +6,7 @@
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QProcess>
+#include <QSet>
 #include <QTemporaryDir>
 #include <cmath>
 
@@ -19,6 +20,11 @@ bool hasCustomContent(const QJsonObject &object) {
     for (const auto &key : {QStringLiteral("_customData"), QStringLiteral("customData")})
         if (object.contains(key) && (!object.value(key).isObject() || !object.value(key).toObject().isEmpty())) return true;
     return false;
+}
+
+bool integer(const QJsonValue &value) {
+    return value.isDouble() && std::isfinite(value.toDouble())
+        && std::floor(value.toDouble()) == value.toDouble();
 }
 
 bool shiftBasicMap(QJsonObject *map, double beats, QString *error) {
@@ -37,12 +43,38 @@ bool shiftBasicMap(QJsonObject *map, double beats, QString *error) {
                 return fail(error, QStringLiteral("谱面物件时间无效，未完成导出。"));
             auto object = value.toObject();
             const double time = object.value("_time").toDouble();
-            if (!std::isfinite(time) || !std::isfinite(time + beats))
+            if (!std::isfinite(time) || time < 0 || !std::isfinite(time + beats))
                 return fail(error, QStringLiteral("谱面物件时间无效，未完成导出。"));
-            if (key == QStringLiteral("_events") && object.value("_type").toInt() == 100)
-                return fail(error, QStringLiteral("谱面包含变速事件，不能自动后移；请将导出开场缓冲设为 0。"));
+            if (key == QStringLiteral("_events")) {
+                const int type = object.value("_type").toInt(-1);
+                if (type == 100 || type == 10 || type == 14 || type == 15)
+                    return fail(error, QStringLiteral("谱面包含变速或旋转事件，不能自动后移；请将导出开场缓冲设为 0。"));
+            }
             if (hasCustomContent(object))
                 return fail(error, QStringLiteral("物件包含模组内容，不能自动后移；请将导出开场缓冲设为 0。"));
+            if (key == QStringLiteral("_notes") || key == QStringLiteral("_obstacles")) {
+                const int x = object.value("_lineIndex").toInt(-1);
+                if (!integer(object.value("_lineIndex")) || x < 0 || x > 3)
+                    return fail(error, QStringLiteral("物件含受保护的扩展坐标，不能自动后移；请将导出开场缓冲设为 0。"));
+                const int type = object.value("_type").toInt(-1);
+                if (!integer(object.value("_type")))
+                    return fail(error, QStringLiteral("物件类型无效，不能自动后移；请将导出开场缓冲设为 0。"));
+                if (key == QStringLiteral("_notes")) {
+                    const int y = object.value("_lineLayer").toInt(-1);
+                    const int cut = object.value("_cutDirection").toInt(-1);
+                    if (!integer(object.value("_lineLayer")) || y < 0 || y > 2
+                        || (type != 0 && type != 1 && type != 3)
+                        || (type != 3 && (!integer(object.value("_cutDirection")) || cut < 0 || cut > 8)))
+                        return fail(error, QStringLiteral("音符含受保护的扩展数据，不能自动后移；请将导出开场缓冲设为 0。"));
+                } else {
+                    const int width = object.value("_width").toInt(-1);
+                    const double duration = object.value("_duration").toDouble(-1);
+                    if ((type != 0 && type != 1) || !integer(object.value("_width"))
+                        || width < 1 || x + width > 4 || !object.value("_duration").isDouble()
+                        || !std::isfinite(duration) || duration <= 0)
+                        return fail(error, QStringLiteral("墙含受保护的扩展数据，不能自动后移；请将导出开场缓冲设为 0。"));
+                }
+            }
             object.insert("_time", time + beats);
             shifted.append(object);
         }
@@ -60,7 +92,7 @@ bool SongExporter::exportSong(const BeatmapDocument &document, const QString &de
         return document.exportSong(destinationFolder, error);
     const QFileInfo target(destinationFolder);
     if (target.exists()) return fail(error, QStringLiteral("导出目录必须是新目录，未覆盖已有歌曲。"));
-    if (!document.isLoaded() || document.difficulties().size() != 1 || !document.readOnlyReason().isEmpty()
+    if (!document.isLoaded() || document.difficulties().isEmpty() || !document.readOnlyReason().isEmpty()
         || !document.timeMap().changes().isEmpty())
         return fail(error, QStringLiteral("该工程不支持新歌开场缓冲，未完成导出。"));
     for (const auto &object : document.objects())
@@ -79,23 +111,34 @@ bool SongExporter::exportSong(const BeatmapDocument &document, const QString &de
     const QString infoPath = QDir(song).filePath(QStringLiteral("Info.dat"));
     if (!ProjectStore::readJson(infoPath, &info, error)) return false;
     const auto sets = info.value("_difficultyBeatmapSets").toArray();
-    if (sets.size() != 1 || sets.first().toObject().value("_difficultyBeatmaps").toArray().size() != 1
-        || hasCustomContent(info))
-        return fail(error, QStringLiteral("开场缓冲仅支持基础单难度新歌，未完成导出。"));
-    const auto difficulty = sets.first().toObject().value("_difficultyBeatmaps").toArray().first().toObject();
-    if (hasCustomContent(sets.first().toObject()) || hasCustomContent(difficulty))
+    if (sets.size() != 1 || sets.first().toObject().value("_beatmapCharacteristicName").toString() != "Standard"
+        || sets.first().toObject().value("_difficultyBeatmaps").toArray().isEmpty() || hasCustomContent(info))
+        return fail(error, QStringLiteral("开场缓冲仅支持基础 Standard 新歌，未完成导出。"));
+    if (hasCustomContent(sets.first().toObject()))
         return fail(error, QStringLiteral("难度包含模组内容，不能自动后移；请将导出开场缓冲设为 0。"));
-    const QString mapFile = difficulty.value("_beatmapFilename").toString();
     const QString audioFile = info.value("_songFilename").toString();
-    if (!ProjectStore::safeRelativePath(mapFile) || !ProjectStore::safeRelativePath(audioFile))
+    if (!ProjectStore::safeRelativePath(audioFile))
         return fail(error, QStringLiteral("导出资源路径无效。"));
     const qint64 delaySamples = qRound64(leadInSeconds * 44100);
     const double actualDelay = delaySamples / 44100.0;
     const double bpm = info.value("_beatsPerMinute").toDouble();
     if (!std::isfinite(bpm) || bpm <= 0) return fail(error, QStringLiteral("导出 BPM 无效。"));
-    QJsonObject map;
-    const QString mapPath = QDir(song).filePath(mapFile);
-    if (!ProjectStore::readJson(mapPath, &map, error) || !shiftBasicMap(&map, actualDelay * bpm / 60, error)) return false;
+    QVector<QPair<QString, QJsonObject>> maps;
+    QSet<QString> filenames;
+    for (const auto &value : sets.first().toObject().value("_difficultyBeatmaps").toArray()) {
+        if (!value.isObject() || hasCustomContent(value.toObject()))
+            return fail(error, QStringLiteral("难度包含模组内容，不能自动后移；请将导出开场缓冲设为 0。"));
+        const QString mapFile = value.toObject().value("_beatmapFilename").toString();
+        const QString key = mapFile.toLower();
+        if (!ProjectStore::safeRelativePath(mapFile) || filenames.contains(key)
+            || key == audioFile.toLower() || key == QStringLiteral("info.dat"))
+            return fail(error, QStringLiteral("导出难度资源路径无效或重复。"));
+        filenames.insert(key);
+        QJsonObject map;
+        const QString mapPath = QDir(song).filePath(mapFile);
+        if (!ProjectStore::readJson(mapPath, &map, error) || !shiftBasicMap(&map, actualDelay * bpm / 60, error)) return false;
+        maps.append(qMakePair(mapPath, map));
+    }
     const QString originalAudio = QDir(song).filePath(audioFile);
     const QString paddedAudio = QDir(staging.path()).filePath(QStringLiteral("padded.ogg"));
     QProcess process;
@@ -126,7 +169,9 @@ bool SongExporter::exportSong(const BeatmapDocument &document, const QString &de
     info.insert("_previewStartTime", info.value("_previewStartTime").toDouble() + actualDelay);
     if (info.value("_songApproximativeDuration").toDouble() > 0)
         info.insert("_songApproximativeDuration", info.value("_songApproximativeDuration").toDouble() + actualDelay);
-    if (!ProjectStore::writeJson(mapPath, map, error) || !ProjectStore::writeJson(infoPath, info, error)) return false;
+    for (const auto &map : maps)
+        if (!ProjectStore::writeJson(map.first, map.second, error)) return false;
+    if (!ProjectStore::writeJson(infoPath, info, error)) return false;
     if (!QDir().rename(song, target.absoluteFilePath()))
         return fail(error, QStringLiteral("无法完成导出目录提交；目标可能已被创建。"));
     return true;

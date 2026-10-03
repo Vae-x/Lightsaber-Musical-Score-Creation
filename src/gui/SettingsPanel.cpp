@@ -127,7 +127,7 @@ SettingsPanel::SettingsPanel(QWidget *parent, const QString &settingsFile, bool 
     m_navigation->setObjectName(QStringLiteral("settingsNavigation"));
     sidebar->addItem(tr("外观"), NavigationIcon::Appearance);
     sidebar->addItem(tr("大语言模型"), NavigationIcon::Model);
-    sidebar->addItem(tr("账号授权"), NavigationIcon::Account);
+    sidebar->addSubItem(1, tr("账号授权"), NavigationIcon::Account);
     sidebar->addItem(tr("网络"), NavigationIcon::Network);
     sidebar->addItem(tr("关于"), NavigationIcon::About);
     m_pages = new QStackedWidget(this);

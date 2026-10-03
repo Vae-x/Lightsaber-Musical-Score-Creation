@@ -27,6 +27,7 @@
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMessageBox>
+#include <QMenu>
 #include <QMouseEvent>
 #include <QProcess>
 #include <QPixmap>
@@ -134,6 +135,7 @@ private slots:
     void aboutHomepageOpensProject();
     void settingsEntryAndThemeCancel();
     void navigationPreservesEditorAndSettingsDraft();
+    void languageModelAccountSubmenu();
     void aiRecognitionEntry();
     void aiSuggestionsPreserveLoadedDocument();
     void aiGenerationPreviewAndAtomicApply();
@@ -313,6 +315,80 @@ void MainWindowTest::navigationPreservesEditorAndSettingsDraft() {
     grid->setFocus();
     QTest::keyClick(grid, Qt::Key_Z, Qt::ControlModifier);
     QCOMPARE(objectCount(window), 1);
+    window.close();
+}
+
+void MainWindowTest::languageModelAccountSubmenu() {
+    MainWindow window(nullptr, settingsFile());
+    window.setTestMode(true);
+    window.show();
+    auto sidebar = window.findChild<lmsc::NavigationSidebar *>(QStringLiteral("mainSidebar"));
+    auto nav = window.findChild<QListWidget *>(QStringLiteral("mainNavigation"));
+    auto settingsPages = window.findChild<QStackedWidget *>(QStringLiteral("settingsPages"));
+    auto codexPath = window.findChild<QLineEdit *>(QStringLiteral("codexExecutable"));
+    auto model = window.findChild<QComboBox *>(QStringLiteral("aiModel"));
+    auto key = window.findChild<QLineEdit *>(QStringLiteral("aiApiKey"));
+    QVERIFY(sidebar && nav && settingsPages && codexPath && model && key);
+    codexPath->setText(m_temp.filePath(QStringLiteral("unavailable-submenu-codex.exe")));
+    QCOMPARE(sidebar->parentRow(4), 3);
+    QVERIFY(nav->item(4)->isHidden());
+    sidebar->setCollapsed(false);
+    QVERIFY(nav->item(4)->isHidden());
+    nav->setCurrentRow(3);
+    QCOMPARE(settingsPages->currentIndex(), 1);
+    QVERIFY(sidebar->isSubmenuExpanded(3));
+    QVERIFY(!nav->item(4)->isHidden());
+    nav->setFocus();
+    model->setEditText(QStringLiteral("unsaved-submenu-model"));
+    key->setText(QStringLiteral("test-only-submenu-key"));
+    QTest::keyClick(nav, Qt::Key_Left);
+    QVERIFY(!sidebar->isSubmenuExpanded(3));
+    QVERIFY(nav->item(4)->isHidden());
+    QCOMPARE(nav->currentRow(), 3);
+    QTest::keyClick(nav, Qt::Key_Down);
+    QCOMPARE(nav->currentRow(), 5);
+    nav->setCurrentRow(3);
+    QTest::keyClick(nav, Qt::Key_Right);
+    QTest::keyClick(nav, Qt::Key_Down);
+    QCOMPARE(nav->currentRow(), 4);
+    QCOMPARE(settingsPages->currentIndex(), 2);
+    QTest::keyClick(nav, Qt::Key_Left);
+    QCOMPARE(nav->currentRow(), 3);
+    QVERIFY(nav->item(4)->isHidden());
+    QCOMPARE(settingsPages->currentIndex(), 1);
+    nav->setCurrentRow(4); // A direct settings link expands its parent first.
+    QVERIFY(!nav->item(4)->isHidden());
+    QCOMPARE(settingsPages->currentIndex(), 2);
+    sidebar->setCollapsed(true);
+    QCOMPARE(nav->currentRow(), 4);
+    QVERIFY(nav->item(4)->isHidden());
+    nav->setFocus();
+    QTest::keyClick(nav, Qt::Key_Right);
+    auto menu = sidebar->findChild<QMenu *>(QStringLiteral("navigationSubmenu"));
+    QVERIFY(menu && menu->isVisible());
+    QVERIFY(menu->actions().first()->isChecked());
+    QTest::keyClick(menu, Qt::Key_Escape);
+    QCOMPARE(nav->currentRow(), 4);
+    nav->setCurrentRow(3);
+    nav->setFocus();
+    QTest::keyClick(nav, Qt::Key_Right);
+    QVERIFY(menu && menu->isVisible());
+    QCOMPARE(menu->actions().size(), 1);
+    QCOMPARE(menu->actions().first()->text(), QStringLiteral("账号授权"));
+    QTest::keyClick(menu, Qt::Key_Return);
+    QCOMPARE(nav->currentRow(), 4);
+    QCOMPARE(settingsPages->currentIndex(), 2);
+    QVERIFY(!menu->isVisible());
+    nav->setCurrentRow(3);
+    QTest::mouseClick(nav->viewport(), Qt::LeftButton, Qt::NoModifier,
+                     nav->visualItemRect(nav->item(3)).center());
+    QVERIFY(menu->isVisible());
+    menu->close();
+    sidebar->setCollapsed(false);
+    nav->setCurrentRow(3);
+    QCOMPARE(model->currentText(), QStringLiteral("unsaved-submenu-model"));
+    QCOMPARE(key->text(), QStringLiteral("test-only-submenu-key"));
+    QVERIFY(!QFile::exists(settingsFile()));
     window.close();
 }
 
@@ -505,14 +581,79 @@ void MainWindowTest::aiGenerationPreviewAndAtomicApply() {
     QTRY_VERIFY(preview.isNull());
     QCOMPARE(objectCount(window), 3);
     QCOMPARE(actualDifficulty->currentData().toString(), QStringLiteral("Hard"));
+    auto difficulties=window.findChild<QListWidget *>(QStringLiteral("difficultyList"));
+    QVERIFY(difficulties);
+    QCOMPARE(difficulties->count(),2);
     nav->setCurrentRow(0);
+    window.activateWindow(); window.raise(); QTRY_VERIFY(window.isActiveWindow());
     grid->setFocus();
+    QTRY_COMPARE(QApplication::focusWidget(),static_cast<QWidget *>(grid));
     QTest::keyClick(grid, Qt::Key_Z, Qt::ControlModifier);
     QCOMPARE(objectCount(window), 1);
     QCOMPARE(actualDifficulty->currentData().toString(), QStringLiteral("Expert"));
     QTest::keyClick(grid, Qt::Key_Y, Qt::ControlModifier);
     QCOMPARE(objectCount(window), 3);
     QCOMPARE(actualDifficulty->currentData().toString(), QStringLiteral("Hard"));
+    // A second generation adds Easy without changing Expert or the first Hard.
+    nav->setCurrentRow(1);
+    targetDifficulty->setCurrentIndex(targetDifficulty->findData(QStringLiteral("Easy")));
+    generate->click();
+    QCOMPARE(service.requests.size(),3);
+    draft.source=service.requests.last(); draft.objects.resize(2);
+    emit service.draftReady(draft);
+    preview=window.findChild<lmsc::GenerationPreviewDialog *>(); QVERIFY(preview);
+    auto notice=preview->findChild<QLabel *>(QStringLiteral("generationReplaceNotice"));
+    QVERIFY(notice && notice->text().contains(QStringLiteral("添加 Easy")));
+    preview->findChild<QPushButton *>(QStringLiteral("generationPreviewApply"))->click();
+    QTRY_VERIFY(preview.isNull());
+    QCOMPARE(difficulties->count(),3);
+    QCOMPARE(actualDifficulty->currentData().toString(),QStringLiteral("Easy"));
+    QCOMPARE(objectCount(window),2);
+    nav->setCurrentRow(0);
+    for (int i=0;i<difficulties->count();++i)
+        if (difficulties->item(i)->text().endsWith(QStringLiteral("Expert"))) { difficulties->setCurrentRow(i); break; }
+    QCOMPARE(objectCount(window),1);
+    QCOMPARE(actualDifficulty->currentData().toString(),QStringLiteral("Expert"));
+    window.activateWindow(); window.raise(); QTRY_VERIFY(window.isActiveWindow());
+    grid->setFocus(); QTRY_COMPARE(QApplication::focusWidget(),static_cast<QWidget *>(grid));
+    QTest::keyClick(grid,Qt::Key_Z,Qt::ControlModifier);
+    QCOMPARE(difficulties->count(),2);
+    QCOMPARE(objectCount(window),3);
+    QCOMPARE(actualDifficulty->currentData().toString(),QStringLiteral("Hard"));
+    QTest::keyClick(grid,Qt::Key_Y,Qt::ControlModifier);
+    QCOMPARE(difficulties->count(),3);
+    QCOMPARE(objectCount(window),2);
+    QCOMPARE(actualDifficulty->currentData().toString(),QStringLiteral("Easy"));
+    const QString captures=qEnvironmentVariable("LMSC_MAIN_CAPTURE_DIRECTORY");
+    if (!captures.isEmpty()) {
+        QVERIFY(QDir().mkpath(captures));
+        for (const QString &mode : QStringList{"dark","light"}) {
+            lmsc::ThemeManager::apply(mode); QTest::qWait(80);
+            QVERIFY(window.grab().save(QDir(captures).filePath("main-editor-multiple-difficulties-"+mode+".png")));
+        }
+    }
+    // Replacement notice counts Hard's chart, even while Easy is selected.
+    nav->setCurrentRow(1);
+    targetDifficulty->setCurrentIndex(targetDifficulty->findData(QStringLiteral("Hard")));
+    generate->click(); QCOMPARE(service.requests.size(),4);
+    draft.source=service.requests.last(); draft.objects.resize(1);
+    emit service.draftReady(draft);
+    preview=window.findChild<lmsc::GenerationPreviewDialog *>(); QVERIFY(preview);
+    notice=preview->findChild<QLabel *>(QStringLiteral("generationReplaceNotice"));
+    QVERIFY(notice && notice->text().contains(QStringLiteral("Hard 难度的 3 个物件")));
+    if (!captures.isEmpty()) {
+        QTest::qWait(80);
+        QVERIFY(preview->grab().save(QDir(captures).filePath("main-preview-replace-target-only.png")));
+    }
+    preview->findChild<QPushButton *>(QStringLiteral("generationPreviewApply"))->click();
+    QTRY_VERIFY(preview.isNull());
+    QCOMPARE(difficulties->count(),3); QCOMPARE(objectCount(window),1);
+    QCOMPARE(actualDifficulty->currentData().toString(),QStringLiteral("Hard"));
+    nav->setCurrentRow(0); window.activateWindow(); window.raise(); QTRY_VERIFY(window.isActiveWindow());
+    grid->setFocus(); QTRY_COMPARE(QApplication::focusWidget(),static_cast<QWidget *>(grid));
+    QTest::keyClick(grid,Qt::Key_Z,Qt::ControlModifier);
+    QCOMPARE(difficulties->count(),3); QCOMPARE(objectCount(window),3);
+    QCOMPARE(actualDifficulty->currentData().toString(),QStringLiteral("Hard"));
     QVERIFY(sourceAudio.open(QIODevice::ReadOnly));
     QCOMPARE(QCryptographicHash::hash(sourceAudio.readAll(), QCryptographicHash::Sha256), audioHash);
     QCOMPARE(audio->pcmSnapshot().revision, originalAudio.revision);
@@ -1174,6 +1315,9 @@ void MainWindowTest::captureWorkspace() {
     auto start = window.findChild<QPushButton *>(QStringLiteral("aiRecognizeButton"));
     auto configure = window.findChild<QPushButton *>(QStringLiteral("aiConfigureConnection"));
     QVERIFY(sidebar && nav && theme && key && workspace && settingsPanel && settingsButtons && start && configure);
+    auto codexPath = window.findChild<QLineEdit *>(QStringLiteral("codexExecutable"));
+    QVERIFY(codexPath);
+    codexPath->setText(m_temp.filePath(QStringLiteral("unavailable-capture-codex.exe")));
     QVERIFY(key->text().isEmpty());
     const QString originalTheme = lmsc::ThemeManager::mode();
     const auto capture = [&](const QString &name) {
@@ -1197,12 +1341,22 @@ void MainWindowTest::captureWorkspace() {
         QVERIFY(capture(QStringLiteral("main-settings-appearance-%1").arg(mode)));
         nav->setCurrentRow(3);
         QVERIFY(capture(QStringLiteral("main-settings-model-%1").arg(mode)));
+        nav->setCurrentRow(4);
+        QVERIFY(capture(QStringLiteral("main-settings-account-submenu-%1").arg(mode)));
         nav->setCurrentRow(1);
         QVERIFY(capture(QStringLiteral("main-ai-recognition-%1").arg(mode)));
         nav->setCurrentRow(6);
         QVERIFY(capture(QStringLiteral("main-about-%1").arg(mode)));
         sidebar->setCollapsed(true);
         nav->setCurrentRow(3);
+        nav->setFocus();
+        QTest::keyClick(nav, Qt::Key_Right);
+        auto submenu = sidebar->findChild<QMenu *>(QStringLiteral("navigationSubmenu"));
+        QVERIFY(submenu && submenu->isVisible());
+        QTest::qWait(30);
+        QVERIFY(submenu->grab().save(QDir(directory).filePath(
+            QStringLiteral("main-settings-account-popup-%1.png").arg(mode))));
+        submenu->close();
         QApplication::processEvents();
         const QSize minimum = window.minimumSize();
         window.resize(minimum);

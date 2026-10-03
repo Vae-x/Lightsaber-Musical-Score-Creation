@@ -303,7 +303,7 @@ void MainWindow::buildEditor() {
     m_newDifficultySelector = new QComboBox(m_newDifficultyRow);
     m_newDifficultySelector->setObjectName(QStringLiteral("newSongDifficultySelector"));
     addNewSongDifficultyChoices(m_newDifficultySelector);
-    m_newDifficultySelector->setToolTip(tr("调整这张新歌曲谱的难度标识，保留已有音符。"));
+    m_newDifficultySelector->setToolTip(tr("调整当前曲谱的难度标识；选择已存在的难度时切换到该谱。AI 生成其他难度会保留已有谱面。"));
     difficultyLayout->addWidget(m_newDifficultySelector);
     leftLayout->addWidget(m_newDifficultyRow);
     connect(m_newDifficultySelector, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
@@ -510,12 +510,12 @@ void MainWindow::buildWorkspace() {
     auto navigation = m_sidebar->listWidget();
     navigation->setObjectName(QStringLiteral("mainNavigation"));
     navigation->setAccessibleName(tr("工作区导航"));
-    navigation->setAccessibleDescription(tr("使用上下方向键切换曲谱编辑、AI 分析与制谱或设置页面。"));
+    navigation->setAccessibleDescription(tr("使用上下方向键切换页面，左右方向键展开或收起大语言模型的账号授权子菜单。"));
     m_sidebar->addItem(tr("曲谱编辑"), lmsc::NavigationIcon::Editor);
     m_sidebar->addItem(tr("AI 分析与制谱"), lmsc::NavigationIcon::Recognition);
     m_sidebar->addItem(tr("外观"), lmsc::NavigationIcon::Appearance);
     m_sidebar->addItem(tr("大语言模型"), lmsc::NavigationIcon::Model);
-    m_sidebar->addItem(tr("账号授权"), lmsc::NavigationIcon::Account);
+    m_sidebar->addSubItem(3, tr("账号授权"), lmsc::NavigationIcon::Account);
     m_sidebar->addItem(tr("网络"), lmsc::NavigationIcon::Network);
     m_sidebar->addItem(tr("关于"), lmsc::NavigationIcon::About);
     m_sidebar->setCollapsed(true);
@@ -622,7 +622,10 @@ void MainWindow::previewGeneratedChart(const lmsc::GenerationDraft &draft) {
         statusBar()->showMessage(tr("AI 候选谱已生成，可返回 AI 页面查看。"),10000); return;
     }
     if (m_generationPreview) m_generationPreview->close();
-    auto preview = new lmsc::GenerationPreviewDialog(draft, m_document->objects().size(), m_audio, this);
+    QString targetId;
+    for (const auto &difficulty : m_document->difficulties())
+        if (difficulty.name.compare(draft.source.profile.name,Qt::CaseInsensitive)==0) { targetId=difficulty.id; break; }
+    auto preview = new lmsc::GenerationPreviewDialog(draft, m_document->objectCount(targetId), m_audio, this, targetId.isEmpty());
     m_generationPreview = preview;
     connect(preview, &lmsc::GenerationPreviewDialog::applyRequested, this, [this, preview] {
         const auto &draft = preview->draft();
@@ -1000,8 +1003,10 @@ void MainWindow::refreshDocument() {
     m_exportLeadInRow->setVisible(loaded && m_document->isNewSong());
     m_exportLeadIn->setEnabled(loaded && m_document->isNewSong() && !m_busy);
     m_newDifficultySelector->setEnabled(loaded && m_document->isNewSong() && !m_busy);
-    if (loaded && m_document->isNewSong() && !m_document->difficulties().isEmpty())
-        m_newDifficultySelector->setCurrentIndex(m_newDifficultySelector->findData(m_document->difficulties().first().name));
+    if (loaded && m_document->isNewSong())
+        for (const auto &difficulty : m_document->difficulties())
+            if (difficulty.id==m_document->currentDifficultyId())
+                m_newDifficultySelector->setCurrentIndex(m_newDifficultySelector->findData(difficulty.name));
     QVector<EditorObject> display;
     QSet<QString> valid;
     int protectedCount = 0;

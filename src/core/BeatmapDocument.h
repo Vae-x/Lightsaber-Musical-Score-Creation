@@ -69,6 +69,7 @@ public:
     QString currentDifficultyId() const;
     bool setDifficulty(const QString &id, QString *error = nullptr);
     const QVector<BeatObject> &objects() const;
+    int objectCount(const QString &difficultyId) const;
     const TimeMap &timeMap() const;
     QString readOnlyReason() const;
     QStringList warnings() const;
@@ -83,7 +84,8 @@ public:
     bool pasteObjects(const QVector<BeatObject> &objects, double beatOffset,
                       int xOffset = 0, bool mirror = false, QString *error = nullptr);
     bool mirrorObjects(const QStringList &ids, QString *error = nullptr);
-    // New songs only: replace the entire chart and its difficulty in one command.
+    // New songs only: add or replace the target difficulty in one undo command;
+    // preserve the other charts and select the applied difficulty.
     bool applyGeneratedChart(const QVector<BeatObject> &objects,
                              const QString &difficultyName, int difficultyRank,
                              quint64 expectedRevision, QString *error = nullptr);
