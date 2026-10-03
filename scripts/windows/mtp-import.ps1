@@ -30,7 +30,7 @@ function Test-SupportedLocator {
     $segments = @($Locator.segments)
     foreach ($segment in $segments) {
         if ($segment -isnot [string]) { return $false }
-        try { Assert-SafeName $segment } catch { return $false }
+        try { Assert-RemoteName $segment } catch { return $false }
     }
     foreach ($source in Get-SongSources) {
         if ($segments.Count -lt $source.Segments.Count + 2 -or
@@ -55,13 +55,22 @@ function Find-SongRootFolder {
     return $folder
 }
 
+function Assert-RemoteName {
+    param([string]$Name)
+    # 这些段只用于 Shell 的逐级精确查找，不作为 Windows 本地文件名。
+    if ([string]::IsNullOrWhiteSpace($Name) -or $Name -eq '.' -or $Name -eq '..' -or
+        $Name -match '[/\\\x00-\x1f\x7f-\x9f]') {
+        throw "头显目录名称无法安全定位：$Name"
+    }
+}
+
 function Assert-SafeName {
     param([string]$Name)
     if ([string]::IsNullOrWhiteSpace($Name) -or $Name -eq '.' -or $Name -eq '..' -or
         $Name.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0 -or
         $Name.EndsWith('.') -or $Name.EndsWith(' ') -or
         $Name -match '^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])($|\.)') {
-        throw "头显中存在无法安全复制到 Windows 的文件名：$Name"
+        throw "歌曲资源中存在无法安全复制到 Windows 的文件名：$Name"
     }
 }
 
@@ -88,7 +97,7 @@ function Find-CategorizedSongs {
     }
     foreach ($item in $items) {
         if (-not $item.IsFolder) { continue }
-        Assert-SafeName ([string]$item.Name)
+        Assert-RemoteName ([string]$item.Name)
         Find-CategorizedSongs $item.GetFolder (@($Categories) + @([string]$item.Name)) ($Depth + 1) $Source $Device $Storage $Songs $Counters
     }
 }

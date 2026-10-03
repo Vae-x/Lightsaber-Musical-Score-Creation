@@ -8,6 +8,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QList>
 #include <QTemporaryDir>
 #include <QTextStream>
 #include <QTimer>
@@ -144,11 +145,80 @@ int main(int argc, char **argv) {
     check(result.completed && result.error.isEmpty() && QFileInfo::exists(result.path + QStringLiteral("/Info.dat")),
           QStringLiteral("光之乐团七层定位通过环境变量完整传递并只向本地临时目录复制"));
 
+    const QString remoteSongName = QStringLiteral("合成歌曲|示例 <节奏>:\"?* $(abc) ' . ");
+    const QStringList remoteCategories{QStringLiteral("CON"), QStringLiteral("分类|尾点."), QStringLiteral("尾空格 ")};
+    const QJsonObject remoteLocatorObject{
+        {QStringLiteral("device"), QStringLiteral("Pico Neo 3")},
+        {QStringLiteral("segments"), QJsonArray{QStringLiteral("内部共享存储空间"), QStringLiteral("SoulTopia"),
+            QStringLiteral("BeatNote"), QStringLiteral("Custom"), remoteCategories[0], remoteCategories[1],
+            remoteCategories[2], remoteSongName}}
+    };
+    const QString remoteLocator = QString::fromUtf8(QJsonDocument(remoteLocatorObject).toJson(QJsonDocument::Compact));
+    const QString remoteListRecord = QString::fromUtf8(QJsonDocument(QJsonObject{
+        {QStringLiteral("type"), QStringLiteral("songs")},
+        {QStringLiteral("songs"), QJsonArray{QJsonObject{
+            {QStringLiteral("name"), remoteSongName}, {QStringLiteral("deviceName"), QStringLiteral("Pico Neo 3")},
+            {QStringLiteral("categorySegments"), QJsonArray::fromStringList(remoteCategories)},
+            {QStringLiteral("locator"), remoteLocatorObject}}}}
+    }).toJson(QJsonDocument::Compact));
+    service.setScriptPath(makeScript(scripts, QStringLiteral("[Console]::WriteLine('%1')\n")
+        .arg(QString(remoteListRecord).replace(QLatin1Char('\''), QStringLiteral("''")))));
+    result = waitFor(service, [&] { service.listSongs(); });
+    check(result.completed && result.songs.size() == 1 && result.songs[0].name == remoteSongName
+            && result.songs[0].categorySegments == remoteCategories && result.songs[0].locator == remoteLocator,
+          QStringLiteral("头显外层目录的管道符、保留名与尾点尾空格原样保留在列表和定位信息中"));
+    MtpSongEntry remoteEntry = entry;
+    remoteEntry.name = remoteSongName;
+    remoteEntry.locator = remoteLocator;
+    service.setScriptPath(makeScript(scripts, QStringLiteral(
+        "if($env:LMSC_MTP_LOCATOR -cne '%1'){throw '远程目录 JSON 定位信息变形'}\n"
+        "if([IO.Path]::GetFileName($env:LMSC_MTP_TARGET) -cne 'song'){throw '本机目标误用远程目录名称'}\n"
+        "[IO.File]::WriteAllText((Join-Path $env:LMSC_MTP_TARGET 'Info.dat'),'{}')\n"
+        "[Console]::WriteLine((@{type='imported';path=$env:LMSC_MTP_TARGET}|ConvertTo-Json -Compress))\n")
+        .arg(QString(remoteLocator).replace(QLatin1Char('\''), QStringLiteral("''")))));
+    result = waitFor(service, [&] { service.importSong(remoteEntry); });
+    check(result.completed && result.error.isEmpty() && QFileInfo::exists(result.path + QStringLiteral("/Info.dat")),
+          QStringLiteral("Windows 非法外层目录名通过原始定位导入固定 song 副本，无需修改头显文件名"));
+
+    const QJsonArray rootSegments{QStringLiteral("内部共享存储空间"), QStringLiteral("SoulTopia"),
+        QStringLiteral("BeatNote"), QStringLiteral("Custom")};
+    const QStringList unsafeRemoteNames{QString(), QStringLiteral(" \t"), QStringLiteral("."), QStringLiteral(".."),
+        QStringLiteral("分类/逃逸"), QStringLiteral("分类\\逃逸"), QStringLiteral("控制") + QChar(0),
+        QStringLiteral("控制") + QChar(31), QStringLiteral("控制") + QChar(127), QStringLiteral("控制") + QChar(159)};
+    for (const auto &name : unsafeRemoteNames) {
+        QJsonArray invalidSegments = rootSegments;
+        invalidSegments.append(name);
+        MtpSongEntry invalidEntry = entry;
+        invalidEntry.locator = QString::fromUtf8(QJsonDocument(QJsonObject{
+            {QStringLiteral("device"), QStringLiteral("Pico Neo 3")}, {QStringLiteral("segments"), invalidSegments}
+        }).toJson(QJsonDocument::Compact));
+        result = waitFor(service, [&] { service.importSong(invalidEntry); });
+        check(!result.completed && !result.error.isEmpty() && !service.isBusy(),
+              QStringLiteral("远程定位拒绝空名、相对导航、路径分隔符及控制字符（序号 %1）").arg(unsafeRemoteNames.indexOf(name)));
+    }
+    QList<QJsonArray> invalidRemotePaths;
+    QJsonArray foreignRoot = rootSegments; foreignRoot[1] = QStringLiteral("OtherGame"); foreignRoot.append(QStringLiteral("歌曲"));
+    invalidRemotePaths.append(foreignRoot);
+    invalidRemotePaths.append(rootSegments);
+    QJsonArray nonString = rootSegments; nonString.append(42); invalidRemotePaths.append(nonString);
+    QJsonArray tooDeep = rootSegments;
+    for (int depth = 0; depth < 21; ++depth) tooDeep.append(QStringLiteral("层"));
+    invalidRemotePaths.append(tooDeep);
+    for (const auto &segments : invalidRemotePaths) {
+        MtpSongEntry invalidEntry = entry;
+        invalidEntry.locator = QString::fromUtf8(QJsonDocument(QJsonObject{
+            {QStringLiteral("device"), QStringLiteral("Pico Neo 3")}, {QStringLiteral("segments"), segments}
+        }).toJson(QJsonDocument::Compact));
+        result = waitFor(service, [&] { service.importSong(invalidEntry); });
+        check(!result.completed && !result.error.isEmpty() && !service.isBusy(),
+              QStringLiteral("远程定位仍限制已支持的歌曲根、歌曲节点、字符串段与 20 层边界"));
+    }
+
     const QString locatorValidationScript = QStringLiteral(
         "$tokens=$null; $parseErrors=$null\n"
         "$ast=[Management.Automation.Language.Parser]::ParseFile('%1',[ref]$tokens,[ref]$parseErrors)\n"
         "if($parseErrors.Count){throw '设备导入脚本语法错误'}\n"
-        "foreach($functionName in @('Assert-SafeName','Get-SongSources','Test-SupportedLocator','Find-CategorizedSongs')){\n"
+        "foreach($functionName in @('Assert-SafeName','Assert-RemoteName','Get-SongSources','Test-SupportedLocator','Find-CategorizedSongs')){\n"
         "  $definition=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName},$true)\n"
         "  if(-not $definition){throw '缺少设备目录校验函数'}\n"
         "  Invoke-Expression $definition.Extent.Text\n"
@@ -157,6 +227,12 @@ int main(int argc, char **argv) {
         "$oasis=@{device='Pico Neo 3';segments=@('内部共享存储空间','SoulTopia','BeatNote','Custom','歌曲')}\n"
         "$categorized=@{device='Pico Neo 3';segments=@('内部共享存储空间','SoulTopia','BeatNote','Custom','光剑曲谱制作','电子音乐','歌曲')}\n"
         "if(-not (Test-SupportedLocator $lightBand) -or -not (Test-SupportedLocator $oasis) -or -not (Test-SupportedLocator $categorized)){throw '已支持的游戏目录遭拒绝'}\n"
+        "foreach($name in @('歌曲|示例','CON','尾点.','尾空格 ')){\n"
+        "  $remote=@{device='Pico Neo 3';segments=@('内部共享存储空间','SoulTopia','BeatNote','Custom',$name)}\n"
+        "  if(-not (Test-SupportedLocator $remote)){throw '合法远程目录遭拒绝'}\n"
+        "  $localRejected=$false; try {Assert-SafeName $name}catch{$localRejected=$true}\n"
+        "  if(-not $localRejected){throw '本地资源文件名保护被放宽'}\n"
+        "}\n"
         "$invalid=@(\n"
         "  @{device='Pico Neo 3';segments=@('内部共享存储空间','Android','data','com.other.game','files','CustomMusic','歌曲')},\n"
         "  @{device='Pico Neo 3';segments=@('内部共享存储空间','Android','data','com.StarRiverVR.LightBand','files','CustomMusic')},\n"
@@ -164,7 +240,8 @@ int main(int argc, char **argv) {
         "  @{device='';segments=@('内部共享存储空间','SoulTopia','BeatNote','Custom','歌曲')},\n"
         "  @{device='Pico Neo 3';segments=@('内部共享存储空间','SoulTopia','BeatNote','Custom','..','歌曲')},\n"
         "  @{device='Pico Neo 3';segments=@('内部共享存储空间','SoulTopia','BeatNote','Custom','分类/逃逸','歌曲')},\n"
-        "  @{device='Pico Neo 3';segments=@('内部共享存储空间','SoulTopia','BeatNote','Custom','CON','歌曲')},\n"
+        "  @{device='Pico Neo 3';segments=@('内部共享存储空间','SoulTopia','BeatNote','Custom','分类\\逃逸','歌曲')},\n"
+        "  @{device='Pico Neo 3';segments=@('内部共享存储空间','SoulTopia','BeatNote','Custom',('控制'+[char]127),'歌曲')},\n"
         "  @{device='Pico Neo 3';segments=@('内部共享存储空间','SoulTopia','BeatNote','Custom')+(@('层')*21)+@('歌曲')}\n"
         ")\n"
         "foreach($item in $invalid){if(Test-SupportedLocator $item){throw '未支持的路径通过了校验'}}\n"

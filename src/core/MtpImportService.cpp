@@ -8,25 +8,26 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcessEnvironment>
-#include <QRegularExpression>
 #include <QUuid>
 #ifdef Q_OS_WIN
 #include <qt_windows.h>
 #endif
 
 namespace {
-bool safeSegment(const QJsonValue &value) {
+bool safeRemoteSegment(const QJsonValue &value) {
     if (!value.isString()) return false;
     const QString name = value.toString();
-    static const QRegularExpression invalid(QStringLiteral("[<>:\"/\\\\|?*\\x00-\\x1f]"));
-    static const QRegularExpression reserved(QStringLiteral("^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])($|\\.)"), QRegularExpression::CaseInsensitiveOption);
-    return !name.trimmed().isEmpty() && name != "." && name != ".." && !name.endsWith('.')
-        && !name.endsWith(' ') && !invalid.match(name).hasMatch() && !reserved.match(name).hasMatch();
+    if (name.trimmed().isEmpty() || name == "." || name == "..") return false;
+    // 远程目录按名称精确定位；本机副本使用固定 song 目录，不套用 Windows 文件名规则。
+    for (const auto character : name) {
+        if (character == '/' || character == '\\' || character.category() == QChar::Other_Control) return false;
+    }
+    return true;
 }
 bool supportedLocator(const QJsonObject &locator) {
     if (!locator.value("device").isString() || locator.value("device").toString().trimmed().isEmpty()) return false;
     const auto segments = locator.value("segments").toArray();
-    for (const auto &value : segments) if (!safeSegment(value)) return false;
+    for (const auto &value : segments) if (!safeRemoteSegment(value)) return false;
     const QVector<QStringList> roots{{"SoulTopia", "BeatNote", "Custom"},
         {"Android", "data", "com.StarRiverVR.LightBand", "files", "CustomMusic"}};
     for (const auto &root : roots) {

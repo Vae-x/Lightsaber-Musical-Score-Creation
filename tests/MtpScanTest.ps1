@@ -13,7 +13,7 @@ if ($scanErrors.Count -ne 0) { throw '真实 MTP 导入脚本存在语法错误�
 
 # 只加载真实扫描函数的 AST，不 dot-source 脚本，也不执行末尾设备主流程。
 $functionNames = @('Find-UniqueItem', 'Get-SongSources', 'Test-SupportedLocator',
-    'Find-SongRootFolder', 'Assert-SafeName', 'Find-CategorizedSongs')
+    'Find-SongRootFolder', 'Assert-RemoteName', 'Assert-SafeName', 'Find-CategorizedSongs', 'Get-Manifest')
 foreach ($functionName in $functionNames) {
     $definitions = @($scanAst.FindAll({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName
@@ -112,6 +112,27 @@ Assert-Test ($songs[0].location -cne $songs[1].location) '同名歌曲完整位�
 Assert-Test ((Test-SupportedLocator $songs[0].locator) -and (Test-SupportedLocator $songs[1].locator)) '扫描产生的多层定位可用于安全导入'
 Assert-Test ($resourceTrap.Reads -eq 0) '找到 Info.dat 后停止资源子目录扫描'
 
+# Android 外层目录按原名定位；Windows 文件名限制只应用于实际复制的资源。
+$remoteNames = @('合成歌曲 (演示|测试)', '分类:示例', 'CON', '尾点.', '尾空格 ', '引号"尖括号<>问号?星号*')
+foreach ($remoteName in $remoteNames) {
+    foreach ($source in $sources) {
+        $remoteSong = New-TestFolder @((New-TestItem 'Info.dat'))
+        $remoteCategory = New-TestFolder @((New-TestItem $remoteName $remoteSong))
+        $remoteRoot = New-TestFolder @((New-TestItem $remoteName $remoteCategory))
+        $songs = New-TestSongs
+        $counters = @{ Songs = 0; Directories = 0 }
+        Invoke-TestScan $remoteRoot $source $songs $counters
+        Assert-Test ($songs.Count -eq 1) 'Windows 不允许的外层目录名仍可完成扫描'
+        Assert-Test ($songs[0].name -ceq $remoteName) '歌曲显示名保持头显原名'
+        Assert-Test ($songs[0].categorySegments[0] -ceq $remoteName) '分类显示名保持头显原名'
+        Assert-Test ($songs[0].locator.segments[-1] -ceq $remoteName -and
+            $songs[0].locator.segments[-2] -ceq $remoteName) '远程定位不清洗或截断原名'
+        Assert-Test (Test-SupportedLocator $songs[0].locator) '扫描产生的 Android 名称定位可导入'
+        Assert-Test ([object]::ReferenceEquals((Find-UniqueItem $remoteCategory $remoteName).GetFolder, $remoteSong)) '特殊字符按字面精确查找'
+    }
+    Assert-ScanFailure { Get-Manifest (New-TestFolder @((New-TestItem $remoteName))) '' 0 } '歌曲资源中存在无法安全复制' '实际资源仍拒绝 Windows 非法文件名'
+}
+
 # 空游戏根仍能被实际根路径查找定位，扫描得到零歌曲，而非“未找到游戏”。
 foreach ($source in $sources) {
     $emptyRoot = New-TestFolder
@@ -168,7 +189,7 @@ $songs = New-TestSongs
 $counters = @{ Songs = 0; Directories = 0 }
 Assert-ScanFailure { Invoke-TestScan (New-TestFolder @((New-TestItem '重复Info' $badInfo))) $oasis $songs $counters } '多个 Info.dat' '重复Info拒绝定位'
 Assert-ScanFailure { Invoke-TestScan $basicSong $oasis $songs $counters } '游戏根目录' '游戏根不能直接作为歌曲'
-Assert-ScanFailure { Invoke-TestScan (New-TestFolder @((New-TestItem '..' $emptyFolder))) $oasis $songs $counters } '无法安全复制' '非法分类名称拒绝扫描'
+Assert-ScanFailure { Invoke-TestScan (New-TestFolder @((New-TestItem '..' $emptyFolder))) $oasis $songs $counters } '无法安全定位' '非法分类名称拒绝扫描'
 
 $validSegments = @('内部共享存储空间') + $oasis.Segments + @('分类', '歌曲')
 $valid = @{ device = 'PICO Neo 3'; segments = $validSegments }
@@ -179,14 +200,20 @@ $invalidLocators = @(
     @{ device = 'PICO Neo 3'; segments = @('内部共享存储空间', 'SoulTopia', 'Other', 'Custom', '歌曲') },
     @{ device = 'PICO Neo 3'; segments = @('内部共享存储空间', 'soultopia', 'BeatNote', 'Custom', '歌曲') },
     @{ device = 'PICO Neo 3'; segments = @('内部共享存储空间') + $oasis.Segments + @('..', '歌曲') },
-    @{ device = 'PICO Neo 3'; segments = @('内部共享存储空间') + $oasis.Segments + @('非法:分类', '歌曲') },
-    @{ device = 'PICO Neo 3'; segments = @('内部共享存储空间') + $oasis.Segments + @('CON', '歌曲') },
+    @{ device = 'PICO Neo 3'; segments = @('内部共享存储空间') + $oasis.Segments + @('非法/分类', '歌曲') },
+    @{ device = 'PICO Neo 3'; segments = @('内部共享存储空间') + $oasis.Segments + @('非法\分类', '歌曲') },
     @{ device = 'PICO Neo 3'; segments = @('内部共享存储空间') + $oasis.Segments + @('', '歌曲') },
     @{ device = 'PICO Neo 3'; segments = @('内部共享存储空间') + $oasis.Segments + @(12, '歌曲') },
     @{ device = 'PICO Neo 3'; segments = @('内部共享存储空间') + $oasis.Segments + (1..21 | ForEach-Object { '层-' + $_ }) }
 )
 foreach ($locator in $invalidLocators) { Assert-Test (-not (Test-SupportedLocator $locator)) '非法、越界或未知游戏定位被拒绝' }
+foreach ($controlCode in @(0, 9, 10, 31, 127, 128, 159)) {
+    $controlName = '分类' + [char]$controlCode + '示例'
+    $locator = @{ device = 'PICO Neo 3'; segments = @('内部共享存储空间') + $oasis.Segments + @($controlName, '歌曲') }
+    Assert-Test (-not (Test-SupportedLocator $locator)) '控制字符定位被拒绝'
+    Assert-ScanFailure { Invoke-TestScan (New-TestFolder @((New-TestItem $controlName $emptyFolder))) $oasis $songs $counters } '无法安全定位' '控制字符分类不能扫描'
+}
 $duplicated = New-TestFolder @((New-TestItem '歌曲' $basicSong), (New-TestItem '歌曲' $basicSong))
 Assert-ScanFailure { Find-UniqueItem $duplicated '歌曲' } '名称重复' '同一父目录重复名称禁止用于导入'
 
-Write-Output '通过：真实MTP扫描函数的分类定位、同名歌曲、资源停止、空游戏目录、20层/4000首/10000目录边界及非法定位；未访问设备。'
+Write-Output '通过：真实MTP扫描函数的原名定位、Windows非法外层名称兼容、资源文件安全校验、分类与同名歌曲、资源停止、空游戏目录、20层/4000首/10000目录边界及非法定位；未访问设备。'
