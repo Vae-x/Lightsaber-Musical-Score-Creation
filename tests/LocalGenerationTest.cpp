@@ -6,6 +6,7 @@
 #include <QFile>
 #include <QNetworkProxy>
 #include <QPointer>
+#include <QPointF>
 #include <QSet>
 #include <QSignalSpy>
 #include <QTemporaryDir>
@@ -24,7 +25,8 @@ constexpr int channels = 2;
 // Real PCM, rather than fabricated MusicAnalysis, exercises onset extraction,
 // subdivisions, repeated sections and the silent interval together.
 bool writeMusic(const QString &path, double duration, const lmsc::TimeMap &map,
-                bool silence = false, double spacingBeats = 1.0, int rate = sampleRate) {
+                bool silence = false, double spacingBeats = 1.0, int rate = sampleRate,
+                double ordinaryAccent = 0.55) {
     QFile file(path);
     if (!file.open(QIODevice::WriteOnly)) return false;
     QVector<double> pulses;
@@ -43,7 +45,7 @@ bool writeMusic(const QString &path, double duration, const lmsc::TimeMap &map,
         const double age = pulse >= 0 ? time - pulses[pulse] : 1.0;
         const bool quiet = silence && time >= 12 && time < 16;
         const double beat = pulse >= 0 ? map.secondsToBeat(pulses[pulse]) : 0;
-        const double accent = qRound64(beat * 2) % 8 == 0 ? 0.82 : 0.55;
+        const double accent = qRound64(beat * 2) % 8 == 0 ? 0.82 : ordinaryAccent;
         const double envelope = age < 0.06 ? accent * std::exp(-age * 45) : 0;
         const double sample = quiet ? 0 : (0.025 + envelope) * std::sin(2 * pi * 110 * time);
         const qint16 integer = static_cast<qint16>(sample * 30000);
@@ -128,6 +130,10 @@ private slots:
     void initTestCase();
     void everyDifficulty_data();
     void everyDifficulty();
+    void musicalPhrasesHaveSpaceAndDiagonalCuts_data();
+    void musicalPhrasesHaveSpaceAndDiagonalCuts();
+    void mixedTypesShareDotAccentsBetweenHands();
+    void dotOnlyPhrasesUseThePlayingSpace();
     void options_data();
     void options();
     void slowTempoWallsHaveRealMusicalEvidence();
@@ -152,7 +158,7 @@ private slots:
     void threeMinuteBenchmark();
 private:
     QTemporaryDir temporary;
-    QString music, repeated, dense, longMusic, variable;
+    QString music, repeated, halfBeatPhrases, weakAttackPhrases, dense, longMusic, variable;
     lmsc::TimeMap variableMap;
     lmsc::GenerationRequest request(const QString &path = {}, double duration = 32) const;
 };
@@ -181,11 +187,15 @@ void LocalGenerationTest::initTestCase() {
     QVERIFY(map.configure(120, 0));
     music = temporary.filePath("music.pcm");
     repeated = temporary.filePath("repeated.pcm");
+    halfBeatPhrases = temporary.filePath("half-beat-phrases.pcm");
+    weakAttackPhrases = temporary.filePath("weak-attack-phrases.pcm");
     dense = temporary.filePath("dense.pcm");
     longMusic = temporary.filePath("three-minutes.pcm");
     variable = temporary.filePath("variable-tempo.pcm");
     QVERIFY(writeMusic(music, 32, map, true));
     QVERIFY(writeMusic(repeated, 48, map));
+    QVERIFY(writeMusic(halfBeatPhrases, 48, map, false, 0.5));
+    QVERIFY(writeMusic(weakAttackPhrases, 48, map, false, 0.5, sampleRate, 0.2));
     QVERIFY(writeMusic(dense, 32, map, false, 0.25));
     QVERIFY(writeMusic(longMusic, 180, map));
     QVERIFY(variableMap.configure(120, 0.375, {{24, 90}, {48, 150}}));
@@ -218,6 +228,117 @@ void LocalGenerationTest::everyDifficulty() {
     QVERIFY(!progress.isEmpty());
     QCOMPARE(progress.last(), 100);
     for (int i = 1; i < progress.size(); ++i) QVERIFY(progress[i] >= progress[i - 1]);
+}
+
+void LocalGenerationTest::musicalPhrasesHaveSpaceAndDiagonalCuts_data() {
+    QTest::addColumn<QString>("difficulty");
+    QTest::addColumn<QString>("fixture");
+    for (const auto &name : QStringList{"Easy", "Normal", "Hard", "Expert", "ExpertPlus"})
+        for (const auto &rhythm : QStringList{"quarter", "eighth", "weak-eighth"})
+            QTest::newRow(qPrintable(name + '-' + rhythm)) << name << rhythm;
+}
+
+void LocalGenerationTest::musicalPhrasesHaveSpaceAndDiagonalCuts() {
+    QFETCH(QString, difficulty);
+    QFETCH(QString, fixture);
+    const QString path = fixture == "quarter" ? repeated
+        : fixture == "eighth" ? halfBeatPhrases : weakAttackPhrases;
+    auto source = request(path, 48);
+    source.profile = lmsc::DifficultyProfile::forName(difficulty);
+    lmsc::MusicAnalysis analysis;
+    lmsc::GenerationDraft draft;
+    QString error;
+    QVERIFY2(lmsc::MusicFeatureAnalyzer::analyze(source, &analysis, &error), qPrintable(error));
+    QVERIFY2(lmsc::LocalChartGenerator::generate(source, analysis, &draft, &error), qPrintable(error));
+    verifyDraft(source, analysis, draft);
+
+    QSet<int> cells, columns, rows, handCells[2];
+    int notes = 0, diagonals = 0, handNotes[2] = {}, handDiagonals[2] = {};
+    const lmsc::BeatObject *previous[2] = {nullptr, nullptr};
+    const double diagonal = std::sqrt(0.5);
+    const QPointF cuts[] = {{0,1}, {0,-1}, {-1,0}, {1,0}, {-diagonal,diagonal},
+                           {diagonal,diagonal}, {-diagonal,-diagonal}, {diagonal,-diagonal}};
+    for (const auto &note : draft.objects) {
+        if (note.kind != lmsc::ObjectKind::Note) continue;
+        ++notes;
+        ++handNotes[note.color];
+        cells.insert(note.x * 3 + note.y);
+        handCells[note.color].insert(note.x * 3 + note.y);
+        columns.insert(note.x);
+        rows.insert(note.y);
+        if (note.direction >= 4 && note.direction <= 7) {
+            ++diagonals;
+            ++handDiagonals[note.color];
+        }
+        if (previous[note.color]) {
+            const auto &prior = *previous[note.color];
+            const double gap = source.timeMap.beatToSeconds(note.beat)
+                - source.timeMap.beatToSeconds(prior.beat);
+            if (gap <= 1.0 + 1e-7 && prior.direction < 8 && note.direction < 8) {
+                const double agreement = QPointF::dotProduct(cuts[prior.direction], cuts[note.direction]);
+                QVERIFY2(agreement <= 0.1 + 1e-7, "短间隔同手动作需要反向衔接，不能以增加斜切为由强制回刀");
+            }
+        }
+        previous[note.color] = &note;
+    }
+    QVERIFY(notes >= 24); // Enough musical attacks for a phrase, not a one-note special case.
+    QVERIFY2(cells.size() >= 4, "整曲仍被限制在两个固定格位");
+    QVERIFY2(rows.size() >= 2, "整曲没有上下层运动");
+    QVERIFY2(diagonals >= int(std::ceil(notes * 0.1)), "斜切应构成乐句的一部分，不能只插入一个装饰方块");
+    for (int hand = 0; hand < 2; ++hand) {
+        QVERIFY2(handCells[hand].size() >= 2, "一只手仍永远停在固定格位");
+        QVERIFY2(handDiagonals[hand] > 0, "一只手没有斜向挥刀");
+        QVERIFY2(handNotes[hand] >= notes / 4, "动作多样性不能导致另一只手长期缺席");
+    }
+    if (source.profile.rank >= 5) {
+        QCOMPARE(columns.size(), 4);
+        QCOMPARE(rows.size(), 3);
+    }
+}
+
+void LocalGenerationTest::dotOnlyPhrasesUseThePlayingSpace() {
+    auto source = request(halfBeatPhrases, 48);
+    source.allowedTypes = lmsc::DotType;
+    lmsc::MusicAnalysis analysis;
+    lmsc::GenerationDraft draft;
+    QString error;
+    QVERIFY2(lmsc::MusicFeatureAnalyzer::analyze(source, &analysis, &error), qPrintable(error));
+    QVERIFY2(lmsc::LocalChartGenerator::generate(source, analysis, &draft, &error), qPrintable(error));
+    verifyDraft(source, analysis, draft);
+    QSet<int> columns, rows, handCells[2];
+    int notes = 0;
+    for (const auto &note : draft.objects) {
+        QCOMPARE(note.kind, lmsc::ObjectKind::Note);
+        QCOMPARE(note.direction, 8);
+        ++notes;
+        columns.insert(note.x);
+        rows.insert(note.y);
+        handCells[note.color].insert(note.x * 3 + note.y);
+    }
+    QVERIFY(notes >= 24);
+    QCOMPARE(columns.size(), 4);
+    QCOMPARE(rows.size(), 3);
+    for (int hand = 0; hand < 2; ++hand)
+        QVERIFY2(handCells[hand].size() >= 2, "纯无方向块也需要乐句内的格位运动");
+}
+
+void LocalGenerationTest::mixedTypesShareDotAccentsBetweenHands() {
+    auto source = request(halfBeatPhrases, 48);
+    source.allowedTypes = lmsc::DirectionalType | lmsc::DotType;
+    lmsc::MusicAnalysis analysis;
+    lmsc::GenerationDraft draft;
+    QString error;
+    QVERIFY2(lmsc::MusicFeatureAnalyzer::analyze(source, &analysis, &error), qPrintable(error));
+    QVERIFY2(lmsc::LocalChartGenerator::generate(source, analysis, &draft, &error), qPrintable(error));
+    verifyDraft(source, analysis, draft);
+    int dots[2] = {};
+    for (const auto &note : draft.objects)
+        if (note.kind == lmsc::ObjectKind::Note && note.direction == 8) ++dots[note.color];
+    const int total = dots[0] + dots[1];
+    QVERIFY(draft.metrics.directional > 0);
+    QVERIFY(total >= 8);
+    for (int hand = 0; hand < 2; ++hand)
+        QVERIFY2(dots[hand] >= total / 4, "周期性无方向重音不能始终固定在同一只手");
 }
 
 void LocalGenerationTest::options_data() {
@@ -382,6 +503,7 @@ void LocalGenerationTest::repeatsKeepThemesAndSectionBoundariesSafe() {
             sectionNotes(draft, reference), reference.startBeat, sectionNotes(draft, segment), segment.startBeat);
         QVERIFY(comparison.comparable);
         QVERIFY2(comparison.actionDifference <= 0.2 + 1e-7, "重复音乐段落失去了主要左右手/切向主题");
+        QVERIFY2(comparison.positionDifference <= 0.35 + 1e-7, "重复音乐段落的格位运动变成了无依据的随机跳动");
         ++compared;
     }
     QVERIFY(compared >= 2);

@@ -30,6 +30,10 @@ int opposite(int direction) {
     constexpr int directions[] = {1,0,3,2,7,6,5,4,8};
     return direction >= 0 && direction <= 8 ? directions[direction] : 1;
 }
+int mirrored(int direction) {
+    constexpr int directions[] = {0,1,3,2,5,4,7,6,8};
+    return direction >= 0 && direction <= 8 ? directions[direction] : 1;
+}
 double pointToSegment(const QPointF &point, const QPointF &start, const QPointF &end) {
     const QPointF delta = end-start;
     const double square = dot(delta,delta);
@@ -61,25 +65,40 @@ Action expectedAction(const Theme &theme, const Hit &hit, int index, int count,
                                   int(qint64(index)*theme.actions.size()/qMax(1,count)));
         return theme.actions[reference];
     }
-    // Four bounded movement themes. Each hand reverses its previous stroke;
-    // changes of rhythm are handled by the search rather than random positions.
-    static const int cuts[4][4] = {{1,1,0,0}, {6,7,5,4}, {2,3,3,2}, {1,7,0,4}};
+    // An eight-stroke phrase for each hand: paired vertical, diagonal and
+    // horizontal swings. Its positions describe continuous movement within
+    // that hand's half of the grid, rather than independently scattered notes.
+    // Phrase variants rotate by complete pairs, preserving stroke reversals.
+    static const int cuts[] = {1,0,6,5,2,3,6,5};
+    static const int easyCuts[] = {1,0,1,0,6,5,1,0};
+    static const QPoint easyPositions[] = {{1,1},{1,1},{1,0},{1,0},
+                                           {1,0},{1,0},{1,1},{1,1}};
+    static const QPoint normalPositions[] = {{1,1},{1,1},{0,1},{0,0},
+                                             {0,0},{0,0},{1,0},{1,1}};
+    static const QPoint fullPositions[] = {{1,1},{1,0},{0,1},{0,0},
+                                           {0,0},{0,1},{0,2},{0,1}};
     Action result;
     result.hand = index%2;
-    result.direction = cuts[theme.family][index%4];
-    result.x = result.hand == 0 ? 1 : 2;
-    if (request.profile.rank >= 5 && (index%16 >= 4 && index%16 < 8)
-            && hit.anchor->strength > .65) result.y = 2;
+    const bool easy = request.profile.rank == 1;
+    const int phase = (index/2+(easy ? (theme.family%2)*2 : theme.family*2))%8;
+    const QPoint position = easy ? easyPositions[phase]
+        : request.profile.rank <= 3 ? normalPositions[phase] : fullPositions[phase];
+    result.direction = easy ? easyCuts[phase] : cuts[phase];
+    result.x = result.hand == 0 ? position.x() : 3-position.x();
+    result.y = position.y();
+    if (result.hand == 1) result.direction = mirrored(result.direction);
+    // Alternate the hand carrying periodic dot accents; an even-only phase
+    // otherwise assigns all of them to the left hand of an alternating phrase.
     if (!request.allowedTypes.testFlag(DirectionalType)
             || (request.allowedTypes.testFlag(DotType)
-                && (index%8 == 6 || hit.anchor->confidence < .45))) result.direction = 8;
+                && (index%16 == 6 || index%16 == 15 || hit.anchor->confidence < .45))) result.direction = 8;
     return result;
 }
 
 QVector<BeatObject> actionCandidates(const SearchState &state, const Hit &hit,
                                     const Action &preferred, const GenerationRequest &request) {
     QVector<BeatObject> result;
-    result.reserve(32);
+    result.reserve(64);
     for (int order=0; order<2; ++order) {
         const int hand = order == 0 ? preferred.hand : 1-preferred.hand;
         QVector<int> directions;
@@ -88,14 +107,27 @@ QVector<BeatObject> actionCandidates(const SearchState &state, const Hit &hit,
                     || (direction < 8 && request.allowedTypes.testFlag(DirectionalType)))
                 if (!directions.contains(direction)) directions.append(direction);
         };
-        addDirection(preferred.direction);
+        const int preferredDirection = hand == preferred.hand ? preferred.direction : mirrored(preferred.direction);
+        addDirection(preferredDirection);
         if (state.hands[hand].present) addDirection(opposite(state.hands[hand].note.direction));
+        // Adjacent diagonal reversals retain the phrase's orientation when an
+        // entry from the previous segment makes its exact stroke unsuitable.
+        if (preferredDirection == 0 || preferredDirection == 4 || preferredDirection == 5) {
+            addDirection(4); addDirection(5);
+        } else if (preferredDirection == 1 || preferredDirection == 6 || preferredDirection == 7) {
+            addDirection(6); addDirection(7);
+        } else if (preferredDirection == 2) {
+            addDirection(4); addDirection(6);
+        } else if (preferredDirection == 3) {
+            addDirection(5); addDirection(7);
+        }
         addDirection(1); addDirection(0);
         if (preferred.direction == 8) addDirection(8);
         const int home = hand == 0 ? 1 : 2;
         const int preferredX = hand == preferred.hand ? preferred.x : 3-preferred.x;
-        QVector<QPoint> positions{{preferredX,preferred.y}, {home,1}};
+        QVector<QPoint> positions{{preferredX,preferred.y}, {home,qMin(1,preferred.y)}};
         if (state.hands[hand].present) positions.append({state.hands[hand].note.x,state.hands[hand].note.y});
+        positions.append({home,1});
         QSet<int> seenPositions;
         for (const auto &position : positions) {
             if (position.x() < hand*2 || position.x() > hand*2+1 || position.y() < 0 || position.y() > 2) continue;
@@ -126,7 +158,11 @@ bool advanceState(const SearchState &source, const BeatObject &note, double seco
         const double distance = length(entry-exit);
         const double allowance = dt*profile.maxConnectionSpeed+.15;
         if (distance > allowance+epsilon) return false;
-        cost += 1.2*distance/qMax(.15,allowance);
+        // Safe motion is part of the desired phrase. Penalising every unit of
+        // travel made an in-place reversal cheaper than any change of cell.
+        // Keep the hard speed limit, with a soft cost near its boundary only.
+        const double strain = qMax(0.0,(distance/qMax(.15,allowance)-.55)/.45);
+        cost += .8*strain*strain;
         if (previous.note.direction != 8 && note.direction != 8) {
             const double agreement = dot(cutVector(previous.note.direction),cutVector(note.direction));
             // Fast sequences need a reversal rather than an invisible reset.
@@ -135,8 +171,8 @@ bool advanceState(const SearchState &source, const BeatObject &note, double seco
         }
     }
     cost += note.color == preferred.hand ? 0.0 : 1.2;
-    cost += note.direction == preferred.direction ? 0.0 : 1.0;
-    cost += .18*(std::abs(note.x-(note.color == preferred.hand ? preferred.x : 3-preferred.x))
+    cost += note.direction == (note.color == preferred.hand ? preferred.direction : mirrored(preferred.direction)) ? 0.0 : 1.0;
+    cost += .85*(std::abs(note.x-(note.color == preferred.hand ? preferred.x : 3-preferred.x))
                   +std::abs(note.y-preferred.y));
     if (source.lastHand == note.color && seconds-source.lastSeconds < .6) cost += .6;
     *target = source;
@@ -339,7 +375,7 @@ bool LocalChartGenerator::generate(const GenerationRequest &request,const MusicA
             const QString key=segment.repeatGroup.isEmpty() ? QStringLiteral("segment:%1").arg(segmentIndex) : segment.repeatGroup;
             if (!themes.contains(key)) {
                 Theme theme;
-                theme.family=profile.rank<=3 ? 0 : energy>.8 ? 1 : energy>.5 ? 3 : 2;
+                theme.family=(segmentIndex+(energy>.8 ? 1 : energy>.5 ? 2 : 0))%4;
                 themes.insert(key,theme);
             }
             const Theme theme=themes.value(key);
@@ -359,7 +395,9 @@ bool LocalChartGenerator::generate(const GenerationRequest &request,const MusicA
                 notes.append(decision.note); noteTimes.append(selected[i].seconds);
                 usedHitBeats.insert(qRound64(decision.note.beat*1000000));
                 realised.append({decision.note.color,decision.note.direction,decision.note.x,decision.note.y});
-                if (!theme.actions.isEmpty() && (decision.note.color!=preferred[i].hand || decision.note.direction!=preferred[i].direction))
+                if (!theme.actions.isEmpty() && (decision.note.color!=preferred[i].hand
+                        || decision.note.direction!=preferred[i].direction
+                        || decision.note.x!=preferred[i].x || decision.note.y!=preferred[i].y))
                     ++repeatedAdaptations;
             }
             if (themes[key].actions.isEmpty() && !realised.isEmpty()) themes[key].actions=realised;
