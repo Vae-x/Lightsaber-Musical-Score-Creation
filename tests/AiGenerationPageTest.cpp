@@ -1,4 +1,5 @@
 #include "core/AiGenerationService.h"
+#include "core/AiRefinementService.h"
 #include "gui/AiRecognitionPage.h"
 #include "gui/EditorViews.h"
 #include "gui/GenerationPreviewDialog.h"
@@ -7,6 +8,7 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDir>
+#include <QDoubleSpinBox>
 #include <QFile>
 #include <QFont>
 #include <QLabel>
@@ -46,6 +48,35 @@ public:
         emit draftReady(draft);
     }
 };
+class FakeRefinementService final : public lmsc::AiRefinementService {
+public:
+    FakeRefinementService() : AiRefinementService(nullptr) {}
+    bool available = true;
+    QVector<lmsc::RefinementRequest> requests;
+    QStringList cancelledJobs, discardedJobs, resumedJobs;
+    lmsc::AiGenerationService::Status current;
+    bool isAvailable() const override { return available; }
+    lmsc::AiGenerationService::Status status() const override { return current; }
+    void refine(const lmsc::RefinementRequest &request) override { requests.append(request); current={}; current.jobId=request.generation.jobId; current.state=lmsc::AiGenerationService::Status::Running; }
+    void cancel(const QString &job) override { cancelledJobs.append(job); current.state=lmsc::AiGenerationService::Status::Paused; current.resumable=true; emit cancelled(job); }
+    void discard(const QString &job) override { discardedJobs.append(job); current={}; }
+    void resume(const QString &job) override { resumedJobs.append(job); current.state=lmsc::AiGenerationService::Status::Running; current.resumable=false; }
+    lmsc::RefinementResult result(const lmsc::RefinementRequest &request, bool more = true) {
+        lmsc::RefinementResult result; result.source=request; result.candidate.source=request.generation;
+        result.candidate.objects=request.baseline;
+        if (!result.candidate.objects.isEmpty()) result.candidate.objects.first().y=(result.candidate.objects.first().y+1)%3;
+        result.patch=lmsc::refinementDifference(request.baseline,result.candidate.objects);
+        result.stats=lmsc::refinementStatistics(result.patch,request.baseline);
+        result.processedSegments=QStringList{QStringLiteral("s1")};
+        result.processedRanges=QStringList{QStringLiteral("s1 · 2.000–8.000 秒")};
+        if (more) result.remainingSegments=QStringList{QStringLiteral("s2")}; result.resumable=more;
+        return result;
+    }
+    void finish(const lmsc::RefinementRequest &request, bool more = true) {
+        current.jobId=request.generation.jobId; current.state=lmsc::AiGenerationService::Status::Completed; current.resumable=more;
+        emit candidateReady(result(request,more));
+    }
+};
 }
 
 class AiGenerationPageTest : public QObject {
@@ -68,6 +99,12 @@ private slots:
     void switchingModesCancelsAndRejectsOldResults();
     void modelChangesPreserveLocalTasksAndDrafts();
     void inactiveBackendDestructionAndSharedBackendsAreSafe();
+    void hybridModeDefaultsToPlanningAndChangesSeed();
+    void refinementPreviewComparesRestoresAndPreservesIds();
+    void refinementCancelSettingsAndResumeRejectLateResults();
+    void refinementCallbacksMayDestroyPreview();
+    void refinementRejectsAlteredSource_data();
+    void refinementRejectsAlteredSource();
 private:
     lmsc::GenerationRequest context() const;
     void setup(lmsc::AiRecognitionPage &page, FakeGenerationService &service, bool newSong = true);
@@ -481,8 +518,9 @@ void AiGenerationPageTest::localModeIsDefaultAndDoesNotRequireModelConnection() 
     lmsc::AiRecognitionPage page;
     auto *mode = page.findChild<QComboBox *>(QStringLiteral("aiGenerationMode"));
     QVERIFY(mode);
-    QCOMPARE(mode->count(), 2);
-    QCOMPARE(mode->currentData().toInt(), int(lmsc::AiRecognitionPage::LocalQuick));
+    QCOMPARE(mode->count(), 3);
+    QCOMPARE(mode->currentData().toInt(), int(lmsc::AiRecognitionPage::Hybrid));
+    page.setGenerationMode(lmsc::AiRecognitionPage::LocalQuick);
     QCOMPARE(page.generationMode(), lmsc::AiRecognitionPage::LocalQuick);
     page.setLocalGenerationService(&local);
     page.setContext(m_audio, QStringLiteral("本地生成测试"), 120, 0.25, 16, false);
@@ -526,6 +564,7 @@ void AiGenerationPageTest::switchingModesCancelsAndRejectsOldResults() {
     lmsc::AiRecognitionPage page;
     page.setLocalGenerationService(&local);
     page.setGenerationService(&model);
+    page.setGenerationMode(lmsc::AiRecognitionPage::LocalQuick);
     page.setContext(m_audio, {}, 120, 0.25, 16, false);
     page.setGenerationContext(context(), true, false);
     auto *generate = page.findChild<QPushButton *>(QStringLiteral("aiGenerateButton"));
@@ -570,6 +609,7 @@ void AiGenerationPageTest::modelChangesPreserveLocalTasksAndDrafts() {
     lmsc::AiRecognitionPage page;
     page.setLocalGenerationService(&local);
     page.setGenerationService(&model);
+    page.setGenerationMode(lmsc::AiRecognitionPage::LocalQuick);
     page.setContext(m_audio, {}, 120, 0.25, 16, false);
     page.setGenerationContext(context(), true, false);
     auto *generate = page.findChild<QPushButton *>(QStringLiteral("aiGenerateButton"));
@@ -609,6 +649,7 @@ void AiGenerationPageTest::inactiveBackendDestructionAndSharedBackendsAreSafe() 
     lmsc::AiRecognitionPage page;
     page.setLocalGenerationService(&local);
     page.setGenerationService(model);
+    page.setGenerationMode(lmsc::AiRecognitionPage::LocalQuick);
     page.setContext(m_audio, {}, 120, 0.25, 16, false);
     page.setGenerationContext(context(), true, false);
     auto *generate = page.findChild<QPushButton *>(QStringLiteral("aiGenerateButton"));
@@ -643,6 +684,158 @@ void AiGenerationPageTest::inactiveBackendDestructionAndSharedBackendsAreSafe() 
     QVERIFY(generate->isEnabled());
     generate->click();
     QCOMPARE(fallback.requests.size(), 1);
+}
+void AiGenerationPageTest::hybridModeDefaultsToPlanningAndChangesSeed() {
+    FakeGenerationService hybrid, model;
+    lmsc::AiRecognitionPage page;
+    QCOMPARE(page.generationMode(), lmsc::AiRecognitionPage::Hybrid);
+    page.setHybridGenerationService(&hybrid);
+    page.setGenerationService(&model);
+    page.setContext(m_audio, QStringLiteral("混合编排"), 120, .25, 16, false);
+    page.setGenerationContext(context(), true, false);
+    auto generate=page.findChild<QPushButton *>("aiGenerateButton");
+    auto skip=page.findChild<QPushButton *>("aiSkipPlanning");
+    auto variation=page.findChild<QPushButton *>("aiChangeArrangement");
+    QSignalSpy skipped(&page,&lmsc::AiRecognitionPage::skipPlanningRequested);
+    QSignalSpy drafts(&page,&lmsc::AiRecognitionPage::generationDraftReady);
+    generate->click(); QCOMPARE(hybrid.requests.size(),1); QVERIFY(model.requests.isEmpty());
+    QCOMPARE(hybrid.requests.last().arrangementSeed,quint32(0)); QVERIFY(skip->isEnabled());
+    skip->click(); QCOMPARE(skipped.count(),1); QCOMPARE(skipped.first().first().toString(),hybrid.requests.last().jobId);
+    hybrid.finish(hybrid.requests.last(),QStringLiteral("有效初稿"));
+    page.invalidateGenerationForConnectionChange();
+    QVERIFY(page.findChild<QPushButton *>("aiViewCandidate")->isEnabled());
+    QVERIFY(page.findChild<QPlainTextEdit *>("aiRecognitionResult")->toPlainText().contains(QStringLiteral("有效初稿")));
+    QVERIFY(variation->isEnabled()); variation->click(); QCOMPARE(hybrid.requests.size(),2);
+    QCOMPARE(hybrid.requests.last().arrangementSeed,quint32(1));
+    const auto late=hybrid.requests.last(); page.invalidateGenerationForConnectionChange();
+    hybrid.finish(late,QStringLiteral("过期模型编排")); QCOMPARE(drafts.count(),1);
+}
+
+void AiGenerationPageTest::refinementPreviewComparesRestoresAndPreservesIds() {
+    FakeRefinementService service;
+    lmsc::GenerationDraft initial; initial.source=context(); initial.source.jobId="initial";
+    lmsc::BeatObject a; a.beat=2; a.x=0; a.y=1; a.direction=1;
+    lmsc::BeatObject b=a; b.id="candidate:0"; b.beat=4; b.color=1; b.x=3; b.direction=0;
+    initial.objects={a,b};
+    auto preview=new lmsc::GenerationPreviewDialog(initial,0,nullptr);
+    QPointer<lmsc::GenerationPreviewDialog> guard(preview);
+    preview->setRefinementService(&service); preview->resize(1080,760); preview->show();
+    QCOMPARE(preview->initialDraft().objects.at(1).id,QStringLiteral("candidate:0"));
+    QVERIFY(!preview->initialDraft().objects.at(0).id.isEmpty());
+    QVERIFY(preview->initialDraft().objects.at(0).id!=preview->initialDraft().objects.at(1).id);
+    preview->setRefinementSelection(2,10); preview->refineChart(); QCOMPARE(service.requests.size(),1);
+    const auto request=service.requests.last(); QVERIFY(request.selectedOnly);
+    QCOMPARE(request.startSeconds,2.0); QCOMPARE(request.endSeconds,10.0); QCOMPARE(request.maximumSegments,5);
+    QCOMPARE(request.baselineHash,lmsc::refinementBaselineHash(preview->initialDraft().objects));
+    QVERIFY(!preview->findChild<QPushButton *>("generationPreviewApply")->isEnabled());
+    service.finish(request);
+    QVERIFY(preview->hasRefinementPatch()); QCOMPARE(preview->draft().objects.first().y,2);
+    QVERIFY(preview->findChild<QLabel *>("generationRefinementStats")->text().contains(QStringLiteral("剩余 1")));
+    QVERIFY(preview->findChild<QLabel *>("generationRefinementStats")->text().contains(QStringLiteral("s1 · 2.000–8.000 秒")));
+    QTest::qWait(20); QVERIFY(preview->minimumSizeHint().height()<=760);
+    auto compare=preview->findChild<QComboBox *>("generationPreviewComparison");
+    compare->setCurrentIndex(0); QVERIFY(!preview->hasRefinementPatch()); QCOMPARE(preview->draft().objects.first().y,1);
+    compare->setCurrentIndex(1); QCOMPARE(preview->draft().objects.first().y,2);
+    const QString captures=qEnvironmentVariable("LMSC_HYBRID_CAPTURE_DIRECTORY");
+    if (!captures.isEmpty()) {
+        QVERIFY(QDir().mkpath(captures)); const auto mode=lmsc::ThemeManager::mode();
+        for (const QString theme : {QStringLiteral("light"),QStringLiteral("dark")}) {
+            lmsc::ThemeManager::apply(theme); QTest::qWait(100);
+            QVERIFY(preview->grab().save(QDir(captures).filePath("refinement-preview-"+theme+".png")));
+        }
+        lmsc::ThemeManager::apply(mode);
+    }
+    preview->restoreInitialDraft(); QVERIFY(!preview->hasRefinementPatch()); QCOMPARE(preview->draft().objects.first().y,1);
+    QVERIFY(service.discardedJobs.contains(request.generation.jobId));
+    preview->close(); QTRY_VERIFY(guard.isNull());
+}
+
+void AiGenerationPageTest::refinementCancelSettingsAndResumeRejectLateResults() {
+    FakeRefinementService service;
+    lmsc::GenerationDraft initial; initial.source=context(); initial.source.jobId="initial";
+    lmsc::BeatObject note; note.beat=2; note.x=0; note.y=1; note.direction=1; initial.objects={note};
+    auto preview=new lmsc::GenerationPreviewDialog(initial,1,nullptr);
+    QPointer<lmsc::GenerationPreviewDialog> guard(preview);
+    preview->setRefinementService(&service); QSignalSpy finished(preview,&lmsc::GenerationPreviewDialog::refinementCompleted);
+    preview->refineChart(); const auto cancelled=service.requests.last(); preview->cancelRefinement();
+    service.finish(cancelled); QCOMPARE(finished.count(),0); QVERIFY(!preview->hasRefinementPatch());
+    preview->refineChart(); const auto request=service.requests.last(); service.finish(request);
+    QCOMPARE(finished.count(),1); QVERIFY(preview->hasRefinementPatch());
+    emit service.requestFailed(request.generation.jobId,QStringLiteral("本轮请求超时"));
+    QVERIFY(preview->findChild<QLabel *>("generationPreviewStatus")->text().contains(QStringLiteral("本轮请求超时")));
+    QVERIFY(preview->hasRefinementPatch());
+    preview->resumeRefinement(); QCOMPARE(service.resumedJobs,QStringList{request.generation.jobId});
+    QVERIFY(preview->isRefining()); service.finish(request,false); QCOMPARE(finished.count(),2);
+    preview->refineChart(); const auto stale=service.requests.last();
+    preview->invalidateRefinementForConnectionChange(); QVERIFY(!preview->hasRefinementPatch());
+    service.finish(stale); QCOMPARE(finished.count(),2); QCOMPARE(preview->draft().objects.first().y,1);
+    preview->refineChart(); auto altered=service.result(service.requests.last()); ++altered.source.generation.documentRevision;
+    emit service.candidateReady(altered); QCOMPARE(finished.count(),2); QVERIFY(preview->isRefining());
+    preview->cancelRefinement(); preview->close(); QTRY_VERIFY(guard.isNull());
+}
+
+void AiGenerationPageTest::refinementCallbacksMayDestroyPreview() {
+    FakeRefinementService service;
+    lmsc::GenerationDraft initial; initial.source=context(); initial.source.jobId="initial";
+    lmsc::BeatObject note; note.beat=2; note.x=0; note.y=1; note.direction=1; initial.objects={note};
+    auto preview=new lmsc::GenerationPreviewDialog(initial,1,nullptr);
+    QPointer<lmsc::GenerationPreviewDialog> guard(preview); preview->setRefinementService(&service);
+    connect(preview,&lmsc::GenerationPreviewDialog::refinementCompleted,preview,[preview] { delete preview; });
+    preview->refineChart(); service.finish(service.requests.last()); QVERIFY(guard.isNull());
+    auto cancelledPreview=new lmsc::GenerationPreviewDialog(initial,1,nullptr);
+    guard=cancelledPreview; cancelledPreview->setRefinementService(&service); cancelledPreview->refineChart();
+    connect(cancelledPreview,&lmsc::GenerationPreviewDialog::cancelRefinementRequested,cancelledPreview,[cancelledPreview] { delete cancelledPreview; });
+    cancelledPreview->cancelRefinement(); QVERIFY(guard.isNull());
+    auto validatedPreview=new lmsc::GenerationPreviewDialog(initial,1,nullptr);
+    guard=validatedPreview;
+    validatedPreview->setSourceValidation([validatedPreview](const lmsc::GenerationRequest &) { delete validatedPreview; return true; });
+    QVERIFY(guard.isNull());
+}
+void AiGenerationPageTest::refinementRejectsAlteredSource_data() {
+    QTest::addColumn<int>("change");
+    struct Case { const char *name; int change; };
+    const Case cases[] = {{"same-count-different-bpm",0},{"same-count-different-beat",1},
+        {"different-pcm-rate",2},{"different-pcm-channels",3},{"different-hand-constraint",8},
+        {"analysis-only",11},{"different-arrangement",12},{"separate-candidate-source",13},
+        {"cached-result-different-seed",16},{"cached-result-different-types",17},{"cached-result-different-difficulty",18}};
+    for (const auto &item : cases) QTest::newRow(item.name) << item.change;
+}
+
+void AiGenerationPageTest::refinementRejectsAlteredSource() {
+    QFETCH(int, change);
+    FakeRefinementService service;
+    lmsc::GenerationDraft initial; initial.source=context(); initial.source.jobId="initial";
+    QVERIFY(initial.source.timeMap.configure(120,.25,{{8,90},{16,130}}));
+    auto arrangement=std::make_shared<lmsc::SongArrangementPlan>(); arrangement->summary=QStringLiteral("原规划");
+    initial.source.arrangement=arrangement; initial.arrangement=arrangement;
+    lmsc::BeatObject note; note.beat=2; note.x=0; note.y=1; note.direction=1; initial.objects={note};
+    auto preview=new lmsc::GenerationPreviewDialog(initial,1,nullptr);
+    QPointer<lmsc::GenerationPreviewDialog> guard(preview); preview->setRefinementService(&service);
+    QSignalSpy finished(preview,&lmsc::GenerationPreviewDialog::refinementCompleted);
+    preview->refineChart(); const auto request=service.requests.last(); auto altered=service.result(request);
+    auto &source=altered.source.generation;
+    switch (change) {
+    case 0: QVERIFY(source.timeMap.configure(120,.25,{{8,100},{16,130}})); break;
+    case 1: QVERIFY(source.timeMap.configure(120,.25,{{9,90},{16,130}})); break;
+    case 2: ++source.audio.sampleRate; break;
+    case 3: source.audio.channels=1; break;
+    case 8: source.profile.minSameHandGapSeconds+=.01; break;
+    case 11: source.analysisOnly=true; break;
+    case 12: { auto different=std::make_shared<lmsc::SongArrangementPlan>(*source.arrangement); different->summary=QStringLiteral("另一规划"); source.arrangement=different; break; }
+    case 13: altered.candidate.source.documentId=QStringLiteral("another-document"); break;
+    case 16: ++source.arrangementSeed; break;
+    case 17: source.allowedTypes=lmsc::DotType; break;
+    case 18: source.profile=lmsc::DifficultyProfile::forName("Hard"); break;
+    }
+    if (change!=13) altered.candidate.source=source;
+    // Equal job IDs and baseline hashes must not allow a changed tempo, PCM,
+    // difficulty constraint, or separately substituted candidate source.
+    emit service.candidateReady(altered);
+    QCOMPARE(finished.count(),0); QVERIFY(preview->isRefining()); QVERIFY(!preview->hasRefinementPatch());
+    QCOMPARE(preview->draft().objects.first().y,1);
+    preview->setRefinementResult(altered); QVERIFY(!preview->hasRefinementPatch());
+    service.finish(request,false); QCOMPARE(finished.count(),1); QVERIFY(preview->hasRefinementPatch());
+    preview->close(); QTRY_VERIFY(guard.isNull());
 }
 QTEST_MAIN(AiGenerationPageTest)
 #include "AiGenerationPageTest.moc"

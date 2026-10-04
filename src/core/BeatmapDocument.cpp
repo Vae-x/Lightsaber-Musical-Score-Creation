@@ -1,5 +1,6 @@
 #include "BeatmapDocument.h"
 #include "ProjectStore.h"
+#include "RefinementTypes.h"
 #include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDir>
@@ -1010,6 +1011,79 @@ bool BeatmapDocument::removeObjects(const QStringList &ids, QString *error) {
         if (entry.object.isProtected()) return fail(error, entry.object.protectedReason);
         seen.insert(id);
         changes.append({index, {entry.object, false}, {entry.object, true}});
+    }
+    return d->commit(selected, std::move(changes), error);
+}
+
+bool BeatmapDocument::applyRefinementPatch(const RefinementPatch &patch, const QString &difficultyId,
+                                         quint64 expectedRevision, QString *error) {
+    auto *selected = d->track();
+    if (!d->newSong || !selected || difficultyId != selected->descriptor.id
+            || selected->descriptor.characteristic != "Standard" || selected->v3
+            || selected->descriptor.version != "2.2.0" || !selected->time.changes().isEmpty())
+        return fail(error, QStringLiteral("AI 精修仅应用到当前新建工程的基础 Standard v2.2 谱面。"));
+    if (expectedRevision != d->revision)
+        return fail(error, QStringLiteral("工程已更改，精修结果已失效，请重新精修。"));
+    if (!selected->readOnly.isEmpty()) return fail(error, selected->readOnly);
+    if ((qint64(patch.updates.size()) + patch.removals.size() + patch.additions.size())
+            * sizeof(Impl::Change) > 16 * 1024 * 1024)
+        return fail(error, QStringLiteral("精修结果超过整批撤销上限，未应用。"));
+    QSet<QString> replaced;
+    QVector<Impl::Change> changes;
+    QVector<BeatObject> incoming;
+    for (const auto &object : patch.updates) {
+        const int index = selected->byId.value(object.id, -1);
+        if (index < 0 || selected->entries[index].deleted || replaced.contains(object.id))
+            return fail(error, QStringLiteral("精修包含重复或不存在的音符，未应用。"));
+        const auto &before = selected->entries[index].object;
+        if (before.isProtected()) return fail(error, before.protectedReason);
+        if (before.kind != ObjectKind::Note || object.kind != ObjectKind::Note
+                || object.duration != before.duration || object.width != before.width
+                || object.height != before.height || object.protectedReason != before.protectedReason
+                || object.preservedCustomData != before.preservedCustomData)
+            return fail(error, QStringLiteral("精修不能改变障碍、保护状态或原物件的自定义数据。"));
+        replaced.insert(object.id);
+        incoming.append(object);
+        if (!sameFields(object, before)) changes.append({index, {before, false}, {object, false}});
+    }
+    for (const auto &id : patch.removals) {
+        const int index = selected->byId.value(id, -1);
+        if (index < 0 || selected->entries[index].deleted || replaced.contains(id))
+            return fail(error, QStringLiteral("精修删除含重复或不存在的音符，未应用。"));
+        const auto &before = selected->entries[index].object;
+        if (before.isProtected()) return fail(error, before.protectedReason);
+        if (before.kind != ObjectKind::Note)
+            return fail(error, QStringLiteral("AI 精修不能删除炸弹或墙。"));
+        replaced.insert(id);
+        changes.append({index, {before, false}, {before, true}});
+    }
+    QVector<BeatObject> added;
+    QSet<QString> additionIds;
+    for (auto object : patch.additions) {
+        if (object.kind != ObjectKind::Note || object.isProtected() || !object.preservedCustomData.isEmpty())
+            return fail(error, QStringLiteral("AI 精修只能新增基础音符。"));
+        if (!object.id.isEmpty()) {
+            if (additionIds.contains(object.id)) return fail(error, QStringLiteral("精修新增标识重复，未应用。"));
+            for (const auto &track : d->tracks)
+                if (track.byId.contains(object.id)) return fail(error, QStringLiteral("精修新增标识与已有物件冲突，未应用。"));
+            additionIds.insert(object.id);
+        }
+        object.id = newId();
+        object.duration = 1; object.width = 1; object.height = 5;
+        incoming.append(object);
+        added.append(object);
+    }
+    if (!d->validate(*selected, incoming, replaced, error)) return false;
+    // All fallible checks precede entry allocation; the complete patch is one command.
+    for (const auto &object : added) {
+        Impl::Entry entry;
+        entry.object = entry.original = object;
+        entry.array = QStringLiteral("_notes");
+        entry.deleted = true;
+        const int index = selected->entries.size();
+        selected->entries.append(entry);
+        selected->byId.insert(object.id, index);
+        changes.append({index, {object, true}, {object, false}});
     }
     return d->commit(selected, std::move(changes), error);
 }

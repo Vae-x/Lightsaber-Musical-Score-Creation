@@ -2,6 +2,7 @@
 
 #include "BeatmapDocument.h"
 #include "PcmAudioSnapshot.h"
+#include "SongArrangementPlan.h"
 #include <QObject>
 #include <QFlags>
 #include <memory>
@@ -26,10 +27,14 @@ struct GenerationRequest {
     DifficultyProfile profile;
     GeneratedTypes allowedTypes = DirectionalType;
     bool analysisOnly = false;
+    std::shared_ptr<const SongArrangementPlan> arrangement;
+    quint32 arrangementSeed = 0;
 };
 struct GenerationMetrics {
     int directional = 0, dots = 0, bombs = 0, walls = 0;
     double averageNps = 0.0, peakNps = 0.0;
+    QVector<int> actionFamilyCounts;
+    int longestRepeatedPhraseRun = 0;
 };
 struct GenerationDraft {
     GenerationRequest source;
@@ -38,6 +43,7 @@ struct GenerationDraft {
     QStringList warnings;
     bool hasThemeWarnings = false;
     GenerationMetrics metrics;
+    std::shared_ptr<const SongArrangementPlan> arrangement;
 };
 class AiGenerationService : public QObject {
     Q_OBJECT

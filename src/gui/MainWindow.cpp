@@ -18,6 +18,9 @@
 #include "core/SongExporter.h"
 #include "core/AiTextTransport.h"
 #include "core/LocalAiGenerationService.h"
+#include "core/HybridAiGenerationService.h"
+#include "core/AiRefinementService.h"
+#include "core/BeatmapPlayabilityValidator.h"
 #include <QtConcurrent>
 #include <QAction>
 #include <QApplication>
@@ -147,6 +150,9 @@ MainWindow::MainWindow(QWidget *parent, const QString &settingsFile)
     m_aiTransport->configure(preferences);
     m_defaultGenerationService = new lmsc::LlmAiGenerationService(m_aiTransport, this);
     m_localGenerationService = new lmsc::LocalAiGenerationService(this);
+    m_hybridGenerationService = new lmsc::HybridAiGenerationService(m_aiTransport, this);
+    m_defaultRefinementService = new lmsc::AiRefinementService(m_aiTransport, this);
+    m_refinementService = m_defaultRefinementService;
     lmsc::ThemeManager::watchSystemChanges(qApp);
     setWindowIcon(QIcon(QStringLiteral(":/icons/app.png")));
     lmsc::WorkspacePaths::projectsDirectory();
@@ -223,6 +229,9 @@ MainWindow::MainWindow(QWidget *parent, const QString &settingsFile)
 MainWindow::~MainWindow() {
     m_aiPage->cancelRecognition();
     if (m_generationPreview) m_generationPreview->close();
+    if (m_refinementService && !m_refinementService->status().jobId.isEmpty())
+        m_refinementService->discard(m_refinementService->status().jobId);
+    m_cachedRefinement.reset(); m_cachedPreviewBaseline.reset();
     m_settingsPanel->discardChanges();
     m_mtp->cancel();
     m_mtpExport->cancel();
@@ -283,6 +292,11 @@ void MainWindow::buildEditor() {
         queueAudioTask([this, source] { m_audio->probeMedia(source); });
     });
     leftLayout->addWidget(new QLabel(tr("文件中可用的难度"), left));
+    m_refineCurrentChartButton = new QPushButton(tr("AI 精修当前曲谱"), left);
+    m_refineCurrentChartButton->setObjectName(QStringLiteral("refineCurrentChartButton"));
+    m_refineCurrentChartButton->setToolTip(tr("仅精修新歌工程中的 Standard v2.2.0 基础曲谱；先预览比较，确认后应用。"));
+    leftLayout->addWidget(m_refineCurrentChartButton);
+    connect(m_refineCurrentChartButton, &QPushButton::clicked, this, &MainWindow::refineCurrentChart);
     m_difficulties = new QListWidget(left);
     m_difficulties->setObjectName(QStringLiteral("difficultyList"));
     m_difficulties->setMinimumHeight(100);
@@ -524,6 +538,7 @@ void MainWindow::buildWorkspace() {
     m_aiPage = new lmsc::AiRecognitionPage(m_workspacePages);
     m_aiPage->setGenerationService(m_defaultGenerationService, m_defaultGenerationService);
     m_aiPage->setLocalGenerationService(m_localGenerationService, m_localGenerationService);
+    m_aiPage->setHybridGenerationService(m_hybridGenerationService, m_hybridGenerationService);
     m_workspacePages->addWidget(m_aiPage);
     m_settingsPanel = new lmsc::SettingsPanel(m_workspacePages, m_settingsFile, true);
     m_workspacePages->addWidget(m_settingsPanel);
@@ -542,6 +557,8 @@ void MainWindow::buildWorkspace() {
         if (!sameAiPreferences(m_generationPreferences, preferences)) {
             if (sameGenerationModel(m_generationPreferences, preferences)) m_aiPage->pauseGenerationForConnectionChange();
             else m_aiPage->invalidateGenerationForConnectionChange();
+            if (m_generationPreview) m_generationPreview->invalidateRefinementForConnectionChange();
+            m_cachedRefinement.reset();
             m_generationPreferences = preferences;
             m_aiTransport->configure(preferences);
             refreshRecognitionContext();
@@ -553,6 +570,9 @@ void MainWindow::buildWorkspace() {
     });
     connect(m_aiPage, &lmsc::AiRecognitionPage::generationDraftReady, this, &MainWindow::previewGeneratedChart);
     connect(m_aiPage, &lmsc::AiRecognitionPage::generationInvalidated, this, [this] {
+        m_cachedRefinement.reset(); m_cachedPreviewBaseline.reset();
+        if (m_refinementService && !m_refinementService->status().jobId.isEmpty())
+            m_refinementService->discard(m_refinementService->status().jobId);
         if (m_generationPreview) m_generationPreview->close();
     });
     navigation->setCurrentRow(0);
@@ -572,6 +592,9 @@ void MainWindow::selectWorkspacePage(int row) {
 
 void MainWindow::refreshRecognitionContext() {
     if (!m_aiPage) return;
+    // Decoding and queued audio tasks change readiness without refreshing the
+    // document. The editor's refinement entry follows the same live context.
+    m_refineCurrentChartButton->setEnabled(currentChartSupportsRefinement());
     const bool loaded = m_document->isLoaded();
     m_aiPage->setContext(loaded ? m_document->audioPath() : QString(),
                          loaded ? m_document->title() : QString(),
@@ -611,6 +634,21 @@ void MainWindow::setAiLocalGenerationService(lmsc::AiGenerationService *service)
     refreshRecognitionContext();
 }
 
+void MainWindow::setAiHybridGenerationService(lmsc::AiGenerationService *service) {
+    m_aiPage->setHybridGenerationService(service ? service : m_hybridGenerationService, m_hybridGenerationService);
+    m_aiPage->setGenerationMode(lmsc::AiRecognitionPage::Hybrid);
+    refreshRecognitionContext();
+}
+
+void MainWindow::setAiRefinementService(lmsc::AiRefinementService *service) {
+    m_refinementService = service ? service : m_defaultRefinementService;
+    m_cachedRefinement.reset();
+    if (m_generationPreview) {
+        m_generationPreview->invalidateRefinementForConnectionChange();
+        if (m_generationPreview) m_generationPreview->setRefinementService(m_refinementService);
+    }
+}
+
 bool MainWindow::generationSourceIsCurrent(const lmsc::GenerationRequest &source) const {
     if (m_busy || !m_document->isLoaded() || !isAudioReady()) return false;
     const auto audio = m_audio->pcmSnapshot();
@@ -620,6 +658,7 @@ bool MainWindow::generationSourceIsCurrent(const lmsc::GenerationRequest &source
         && source.audioRevision == audio.revision && source.audio.revision == audio.revision
         && source.audio.path == audio.path && source.audio.sourcePath == audio.sourcePath
         && source.audio.durationSeconds == audio.durationSeconds
+        && source.audio.sampleRate == audio.sampleRate && source.audio.channels == audio.channels
         && sameGenerationTiming(source.timeMap, m_document->timeMap());
 }
 
@@ -628,21 +667,93 @@ void MainWindow::previewGeneratedChart(const lmsc::GenerationDraft &draft) {
     if (m_workspacePages->currentWidget()!=m_aiPage) {
         statusBar()->showMessage(tr("AI 候选谱已生成，可返回 AI 页面查看。"),10000); return;
     }
+    openGenerationPreview(draft, false);
+}
+
+bool MainWindow::currentChartSupportsRefinement() const {
+    if (m_busy || !m_document->isLoaded() || !m_document->isNewSong() || !isAudioReady()
+            || !m_document->readOnlyReason().isEmpty() || !m_document->timeMap().changes().isEmpty()
+            || m_document->objects().isEmpty()) return false;
+    for (const auto &object : m_document->objects()) if (object.isProtected()) return false;
+    for (const auto &difficulty : m_document->difficulties())
+        if (difficulty.id == m_document->currentDifficultyId())
+            return difficulty.characteristic == QStringLiteral("Standard") && difficulty.version == QStringLiteral("2.2.0");
+    return false;
+}
+
+void MainWindow::refineCurrentChart() {
+    if (!currentChartSupportsRefinement()) return;
+    lmsc::GenerationDraft draft;
+    auto &source = draft.source;
+    source.jobId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    source.documentId = m_documentId; source.difficultyId = m_document->currentDifficultyId();
+    source.documentRevision = m_document->revision(); source.audio = m_audio->pcmSnapshot();
+    source.audioRevision = source.audio.revision; source.timeMap = m_document->timeMap();
+    for (const auto &difficulty : m_document->difficulties())
+        if (difficulty.id == source.difficultyId) source.profile = lmsc::DifficultyProfile::forName(difficulty.name);
+    source.allowedTypes = {};
+    draft.objects = m_document->objects();
+    for (const auto &object : draft.objects) {
+        if (object.kind == lmsc::ObjectKind::Bomb) source.allowedTypes |= lmsc::BombType;
+        else if (object.kind == lmsc::ObjectKind::Wall) source.allowedTypes |= lmsc::WallType;
+        else source.allowedTypes |= object.direction == 8 ? lmsc::DotType : lmsc::DirectionalType;
+    }
+    draft.metrics = lmsc::BeatmapPlayabilityValidator::metrics(draft.objects, source.timeMap, source.audio.durationSeconds);
+    draft.summary = tr("当前曲谱的精修快照；工程在确认应用前保持原样。");
+    if (m_cachedPreviewBaseline && m_cachedBaselineIsDocument
+            && generationSourceIsCurrent(m_cachedPreviewBaseline->source)
+            && lmsc::sameGenerationSource(m_cachedPreviewBaseline->source, draft.source, false)) draft = *m_cachedPreviewBaseline;
+    openGenerationPreview(draft, true);
+}
+
+void MainWindow::openGenerationPreview(const lmsc::GenerationDraft &requestedDraft, bool documentBaseline) {
+    if (!generationSourceIsCurrent(requestedDraft.source)) return;
+    auto draft = requestedDraft;
+    if (m_cachedPreviewBaseline && m_cachedBaselineIsDocument == documentBaseline
+            && m_cachedPreviewBaseline->source.jobId == draft.source.jobId
+            && generationSourceIsCurrent(m_cachedPreviewBaseline->source)
+            && lmsc::sameGenerationSource(m_cachedPreviewBaseline->source, draft.source, false)) draft = *m_cachedPreviewBaseline;
     if (m_generationPreview) m_generationPreview->close();
+    const bool sameBaseline = m_cachedPreviewBaseline && m_cachedBaselineIsDocument == documentBaseline
+        && generationSourceIsCurrent(m_cachedPreviewBaseline->source)
+        && lmsc::sameGenerationSource(m_cachedPreviewBaseline->source, draft.source, false)
+        && lmsc::refinementBaselineHash(m_cachedPreviewBaseline->objects) == lmsc::refinementBaselineHash(draft.objects);
+    if (!sameBaseline) {
+        if (m_refinementService && !m_refinementService->status().jobId.isEmpty())
+            m_refinementService->discard(m_refinementService->status().jobId);
+        m_cachedRefinement.reset(); m_cachedPreviewBaseline.reset();
+    }
     QString targetId;
     for (const auto &difficulty : m_document->difficulties())
         if (difficulty.name.compare(draft.source.profile.name,Qt::CaseInsensitive)==0) { targetId=difficulty.id; break; }
     auto preview = new lmsc::GenerationPreviewDialog(draft, m_document->objectCount(targetId), m_audio, this, targetId.isEmpty());
     m_generationPreview = preview;
-    connect(preview, &lmsc::GenerationPreviewDialog::applyRequested, this, [this, preview] {
+    m_cachedPreviewBaseline.reset(new lmsc::GenerationDraft(preview->initialDraft()));
+    m_cachedBaselineIsDocument = documentBaseline;
+    preview->setDocumentBaseline(documentBaseline);
+    preview->setSourceValidation([this](const lmsc::GenerationRequest &source) { return generationSourceIsCurrent(source); });
+    if (documentBaseline ? currentChartSupportsRefinement() : m_document->isNewSong())
+        preview->setRefinementService(m_refinementService);
+    if (m_loop->isChecked() && m_loopEnd > m_loopStart) preview->setRefinementSelection(m_loopStart, m_loopEnd);
+    if (m_cachedRefinement && lmsc::refinementBaselineHash(m_cachedRefinement->source.baseline)
+            == lmsc::refinementBaselineHash(preview->initialDraft().objects)) preview->setRefinementResult(*m_cachedRefinement);
+    connect(preview, &lmsc::GenerationPreviewDialog::refinementCompleted, this, [this](const lmsc::RefinementResult &result) {
+        if (generationSourceIsCurrent(result.source.generation)) m_cachedRefinement.reset(new lmsc::RefinementResult(result));
+    });
+    connect(preview, &lmsc::GenerationPreviewDialog::initialDraftRestored, this, [this] { m_cachedRefinement.reset(); });
+    connect(preview, &lmsc::GenerationPreviewDialog::applyRequested, this, [this, preview, documentBaseline] {
         const auto &draft = preview->draft();
         if (!m_document->isNewSong() || !generationSourceIsCurrent(draft.source)) {
             preview->showApplicationError(tr("当前歌曲或曲谱已改变，请关闭预览并重新生成。"));
             return;
         }
         QString error;
-        if (!m_document->applyGeneratedChart(draft.objects, draft.source.profile.name,
-                                           draft.source.profile.rank, draft.source.documentRevision, &error)) {
+        const bool applied = documentBaseline
+            ? preview->hasRefinementPatch() && m_document->applyRefinementPatch(preview->refinementResult().patch,
+                draft.source.difficultyId, draft.source.documentRevision, &error)
+            : m_document->applyGeneratedChart(draft.objects, draft.source.profile.name,
+                draft.source.profile.rank, draft.source.documentRevision, &error);
+        if (!applied) {
             preview->showApplicationError(error);
             return;
         }
@@ -652,9 +763,10 @@ void MainWindow::previewGeneratedChart(const lmsc::GenerationDraft &draft) {
         m_aiPage->showGenerationApplied();
         statusBar()->showMessage(tr("候选曲谱已应用，切换到曲谱编辑后可一次撤销。"), 10000);
     });
-    connect(preview, &lmsc::GenerationPreviewDialog::regenerateRequested, this, [this, preview] {
+    connect(preview, &lmsc::GenerationPreviewDialog::regenerateRequested, this, [this, preview, documentBaseline] {
         preview->close();
-        m_aiPage->generateAgain();
+        if (documentBaseline) { m_cachedRefinement.reset(); refineCurrentChart(); }
+        else m_aiPage->generateAgain();
     });
     preview->show();
 }
@@ -909,6 +1021,7 @@ void MainWindow::refreshDocument() {
     m_projectLabel->setText(project.isEmpty() ? tr("工程尚未保存") : QFileInfo(project).fileName());
     m_projectLabel->setToolTip(project);
     m_recropButton->setEnabled(!m_busy && m_document->isNewSong() && m_document->importSource().isAvailable());
+    m_refineCurrentChartButton->setEnabled(currentChartSupportsRefinement());
     m_difficulties->clear();
     for (const auto &difficulty : m_document->difficulties()) {
         auto item = new QListWidgetItem(difficulty.characteristic + " · " + difficulty.name, m_difficulties);

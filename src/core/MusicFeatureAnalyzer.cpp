@@ -6,6 +6,7 @@
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QMap>
+#include <QSet>
 #include <QtEndian>
 #include <QtMath>
 #include <algorithm>
@@ -58,7 +59,16 @@ QJsonObject MusicAnalysis::planningEvidence() const {
                       {"repeatGroup", segment.repeatGroup}, {"repeatConfidence", segment.repeatConfidence},
                       {"repeatReferenceSegment", segment.repeatReference < 0 ? 0 : segment.repeatReference+1}});
     }
-    return {{"durationSeconds", durationSeconds}, {"activeSeconds", activeSeconds}, {"blocks", blocks}};
+    QJsonArray shortPhrases;
+    for (const auto &phrase : phrases) {
+        shortPhrases.append(QJsonObject{{"phraseId", phrase.id}, {"segmentId", segments.value(phrase.segmentIndex).id},
+            {"startBeat", phrase.startBeat}, {"endBeat", phrase.endBeat}, {"energy", phrase.energy},
+            {"energyTrend", phrase.energyTrend}, {"hitDensity", phrase.hitDensity}, {"syncopation", phrase.syncopation},
+            {"restFraction", phrase.restFraction}, {"longestGapBeats", phrase.longestGapBeats},
+            {"accentStrength", phrase.accentStrength}, {"bands", QJsonArray{phrase.low, phrase.mid, phrase.high}}});
+    }
+    return {{"durationSeconds", durationSeconds}, {"activeSeconds", activeSeconds}, {"blocks", blocks},
+            {"phrases", shortPhrases}, {"bandMeaning", QStringLiteral("频带比例仅为编排线索，不代表乐器、歌词或旋律识别。")}};
 }
 
 QJsonObject MusicAnalysis::segmentEvidence(int index) const {
@@ -90,6 +100,73 @@ void MusicAnalysis::identifyRepeats() {
             }
         }
         if (segment.repeatReference<0) representatives.append(i);
+    }
+}
+
+void MusicAnalysis::rebuildPhrases(const TimeMap &timeMap) {
+    phrases.clear();
+    for (int block = 0; block < segments.size(); ++block) {
+        const auto &segment = segments[block];
+        int hits = 0, offbeat = 0;
+        for (int index : segment.anchors) {
+            if (index < 0 || index >= anchors.size() || anchors[index].kind != MusicAnchorKind::Hit) continue;
+            ++hits;
+            if (std::abs(anchors[index].beat - std::round(anchors[index].beat)) > 1e-6) ++offbeat;
+        }
+        // Busier/syncopated passages develop in four beats. Clearer sparse
+        // passages retain an eight-beat gesture instead of changing each note.
+        const double phraseBeats = hits && offbeat > hits * .22 ? 4.0 : 8.0;
+        for (double from = segment.startBeat; from < segment.endBeat - 1e-7; from += phraseBeats) {
+            MusicPhrase phrase;
+            phrase.id = QStringLiteral("p%1").arg(phrases.size());
+            phrase.segmentIndex = block;
+            phrase.startBeat = from; phrase.endBeat = qMin(from + phraseBeats, segment.endBeat);
+            phrase.startSeconds = timeMap.beatToSeconds(from);
+            phrase.endSeconds = timeMap.beatToSeconds(phrase.endBeat);
+            double weight = 0, previousHit = from;
+            QVector<double> firstStrengths, lastStrengths;
+            int activityCount = 0, hitCount = 0, syncCount = 0;
+            QSet<qint64> occupiedBeats;
+            for (int index : segment.anchors) {
+                if (index < 0 || index >= anchors.size()) continue;
+                const auto &anchor = anchors[index];
+                if (anchor.beat < from - 1e-7 || anchor.beat >= phrase.endBeat - 1e-7) continue;
+                phrase.anchors.append(index);
+                if (anchor.kind == MusicAnchorKind::Boundary) continue;
+                ++activityCount;
+                occupiedBeats.insert(qint64(std::floor(anchor.beat - from + 1e-7)));
+                phrase.energy += anchor.strength;
+                const double bandWeight = qMax(.02, anchor.strength);
+                phrase.low += anchor.low * bandWeight; phrase.mid += anchor.mid * bandWeight;
+                phrase.high += anchor.high * bandWeight; weight += bandWeight;
+                if (anchor.kind == MusicAnchorKind::Hit) {
+                    ++hitCount; phrase.accentStrength = qMax(phrase.accentStrength, anchor.strength);
+                    if (anchor.beat < (from + phrase.endBeat) * .5) firstStrengths.append(anchor.strength);
+                    else lastStrengths.append(anchor.strength);
+                    phrase.longestGapBeats = qMax(phrase.longestGapBeats, anchor.beat - previousHit);
+                    previousHit = anchor.beat;
+                    if (std::abs(anchor.beat - std::round(anchor.beat)) > 1e-6) ++syncCount;
+                }
+            }
+            phrase.longestGapBeats = qMax(phrase.longestGapBeats, phrase.endBeat - previousHit);
+            phrase.energy = activityCount ? phrase.energy / activityCount : 0;
+            // A single downbeat should not make every growing phrase look
+            // quieter. Compare the lower median attack strength of its halves
+            // so recurring strong beats do not dominate the trend estimate.
+            auto typical=[](QVector<double> strengths) {
+                if (strengths.isEmpty()) return 0.0;
+                std::sort(strengths.begin(),strengths.end()); return strengths[(strengths.size()-1)/2];
+            };
+            phrase.energyTrend = qBound(-1.0, typical(lastStrengths)-typical(firstStrengths), 1.0);
+            phrase.hitDensity = hitCount / qMax(.001, phrase.endSeconds - phrase.startSeconds);
+            phrase.syncopation = hitCount ? double(syncCount) / hitCount : 0;
+            phrase.restFraction = qBound(0.0, 1.0 - occupiedBeats.size() / qMax(1.0, std::ceil(phrase.endBeat - from)), 1.0);
+            const double bands = phrase.low + phrase.mid + phrase.high;
+            if (weight > 0 && bands > 1e-12) {
+                phrase.low /= bands; phrase.mid /= bands; phrase.high /= bands;
+            }
+            phrases.append(phrase);
+        }
     }
 }
 
@@ -304,6 +381,7 @@ bool MusicFeatureAnalyzer::analyze(const GenerationRequest &request, MusicAnalys
         cursor = next;
     }
     analysis->identifyRepeats();
+    analysis->rebuildPhrases(request.timeMap);
     if (hitFrames.isEmpty()) analysis->warnings.append(QStringLiteral("未找到可绑定当前拍格的可靠起音，请检查节拍对齐。"));
     if (progress) progress(100);
     return !stopped();

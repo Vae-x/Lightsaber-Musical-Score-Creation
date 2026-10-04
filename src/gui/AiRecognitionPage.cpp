@@ -1,5 +1,6 @@
 #include "AiRecognitionPage.h"
 #include "DiagnosticLogDialog.h"
+#include "core/HybridAiGenerationService.h"
 
 #include <QFileInfo>
 #include <QCheckBox>
@@ -83,11 +84,12 @@ AiRecognitionPage::AiRecognitionPage(QWidget *parent)
     m_serviceStatus = label({}, service);
     m_serviceStatus->setObjectName(QStringLiteral("aiServiceStatus"));
     serviceLayout->addWidget(m_serviceStatus);
-    serviceLayout->addWidget(label(tr("本地快速制谱在电脑上分析音乐并编排动作，无需模型连接或独立显卡。也可选择大语言模型制谱。分析可用于已有歌曲；自动制谱仅支持新建歌曲。"), service));
+    serviceLayout->addWidget(label(tr("AI 建议音乐段落和动作主题，本地编排完整初稿；试听后可选择重点和片段进行 AI 精修。也可使用纯本地或大语言模型制谱。自动制谱仅支持新建歌曲。"), service));
     auto modes = new QHBoxLayout;
     modes->addWidget(label(tr("生成方式"), service));
     m_mode = new QComboBox(service);
     m_mode->setObjectName(QStringLiteral("aiGenerationMode"));
+    m_mode->addItem(tr("AI 建议 + 本地编排"), Hybrid);
     m_mode->addItem(tr("本地快速制谱"), LocalQuick);
     m_mode->addItem(tr("大语言模型制谱"), LanguageModel);
     modes->addWidget(m_mode);
@@ -136,11 +138,16 @@ AiRecognitionPage::AiRecognitionPage(QWidget *parent)
     m_resume=new QPushButton(tr("继续生成"), service); m_resume->setObjectName("aiResumeGeneration"); actions->addWidget(m_resume);
     m_preview=new QPushButton(tr("查看候选谱"), service); m_preview->setObjectName("aiViewCandidate"); actions->addWidget(m_preview);
     m_logs=new QPushButton(tr("查看本次日志"), service); m_logs->setObjectName("aiViewLog"); actions->addWidget(m_logs);
+    m_skipPlanning=new QPushButton(tr("跳过 AI 建议"), service); m_skipPlanning->setObjectName("aiSkipPlanning");
+    m_changeArrangement=new QPushButton(tr("换一种编排"), service); m_changeArrangement->setObjectName("aiChangeArrangement");
     actions->addStretch();
     m_configure = new QPushButton(tr("配置 AI 连接"), service);
     m_configure->setObjectName(QStringLiteral("aiConfigureConnection"));
     actions->addWidget(m_configure);
     serviceLayout->addLayout(actions);
+    auto arrangementActions = new QHBoxLayout;
+    arrangementActions->addWidget(m_skipPlanning); arrangementActions->addWidget(m_changeArrangement);
+    arrangementActions->addStretch(); serviceLayout->addLayout(arrangementActions);
     m_status = label({}, service);
     m_status->setObjectName(QStringLiteral("aiRecognitionStatus"));
     serviceLayout->addWidget(m_status);
@@ -177,6 +184,14 @@ AiRecognitionPage::AiRecognitionPage(QWidget *parent)
     });
     connect(m_preview, &QPushButton::clicked, this, [this] { if (m_hasDraft) emit generationDraftReady(m_cachedDraft); });
     connect(m_logs, &QPushButton::clicked, this, [this] { showDiagnosticLog(this,m_lastGeneration.jobId); });
+    connect(m_skipPlanning, &QPushButton::clicked, this, [this] {
+        const QString jobId = m_pendingGeneration.jobId;
+        if (m_skipPlanning->isEnabled() && !jobId.isEmpty()) emit skipPlanningRequested(jobId);
+    });
+    connect(m_changeArrangement, &QPushButton::clicked, this, [this] {
+        if (!m_changeArrangement->isEnabled()) return;
+        ++m_arrangementSeed; startGeneration(false);
+    });
     connect(m_configure, &QPushButton::clicked, this, &AiRecognitionPage::configureConnectionRequested);
     connect(m_mode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
         const auto next = static_cast<GenerationMode>(m_mode->currentData().toInt());
@@ -312,13 +327,19 @@ void AiRecognitionPage::setService(AiRecognitionService *service) {
 void AiRecognitionPage::setGenerationService(AiGenerationService *service, AiGenerationService *fallback) {
     m_generationFallback = fallback;
     m_modelGenerationService = service;
-    if (!usesLocalGeneration()) activateGenerationService();
+    if (m_generationMode == LanguageModel) activateGenerationService();
 }
 
 void AiRecognitionPage::setLocalGenerationService(AiGenerationService *service, AiGenerationService *fallback) {
     m_localGenerationFallback = fallback;
     m_localGenerationService = service;
     if (usesLocalGeneration()) activateGenerationService();
+}
+
+void AiRecognitionPage::setHybridGenerationService(AiGenerationService *service, AiGenerationService *fallback) {
+    m_hybridGenerationFallback = fallback;
+    m_hybridGenerationService = service;
+    if (usesHybridGeneration()) activateGenerationService();
 }
 
 void AiRecognitionPage::setGenerationMode(GenerationMode mode) {
@@ -329,7 +350,9 @@ void AiRecognitionPage::setGenerationMode(GenerationMode mode) {
 void AiRecognitionPage::activateGenerationService(bool force) {
     auto service = usesLocalGeneration()
         ? (m_localGenerationService ? m_localGenerationService.data() : m_localGenerationFallback.data())
-        : (m_modelGenerationService ? m_modelGenerationService.data() : m_generationFallback.data());
+        : usesHybridGeneration()
+            ? (m_hybridGenerationService ? m_hybridGenerationService.data() : m_hybridGenerationFallback.data())
+            : (m_modelGenerationService ? m_modelGenerationService.data() : m_generationFallback.data());
     if (!force && m_generationService == service) { refreshControls(); showIdleStatus(); return; }
     invalidateGeneration();
     for (const auto &connection : m_generationConnections) disconnect(connection);
@@ -341,6 +364,14 @@ void AiRecognitionPage::activateGenerationService(bool force) {
                                                service, &AiGenerationService::generate));
         m_generationConnections.append(connect(this, &AiRecognitionPage::cancelGenerationRequested,
                                                service, &AiGenerationService::cancel));
+        if (auto hybrid = qobject_cast<HybridAiGenerationService *>(service)) {
+            m_generationConnections.append(connect(this, &AiRecognitionPage::skipPlanningRequested, hybrid, &HybridAiGenerationService::skipPlanning));
+            m_generationConnections.append(connect(hybrid, &HybridAiGenerationService::planReady, this,
+                [this, revision](const QString &jobId, const SongArrangementPlan &plan) {
+                    if (revision != m_generationServiceRevision || jobId.isEmpty() || jobId != m_pendingGeneration.jobId) return;
+                    m_result->setPlainText(plan.description());
+                }));
+        }
         m_generationConnections.append(connect(service, &AiGenerationService::draftReady, this,
             [this, revision](const GenerationDraft &draft) {
                 if (revision != m_generationServiceRevision || !acceptsGeneration(draft.source)) return;
@@ -460,18 +491,22 @@ bool AiRecognitionPage::acceptsGeneration(const GenerationRequest &source) const
         && source.profile.minSameHandGapSeconds == expected.profile.minSameHandGapSeconds
         && source.profile.maxConnectionSpeed == expected.profile.maxConnectionSpeed
         && source.profile.subdivision == expected.profile.subdivision && source.allowedTypes == expected.allowedTypes
-        && source.analysisOnly == expected.analysisOnly;
+        && source.analysisOnly == expected.analysisOnly && source.arrangementSeed == expected.arrangementSeed;
 }
 
 void AiRecognitionPage::startGeneration(bool analysisOnly) {
     refreshControls();
     if (analysisOnly ? !m_start->isEnabled() : !m_generate->isEnabled()) return;
+    QPointer<AiRecognitionPage> guard(this);
+    const auto revision = ++m_generationActionRevision;
     emit generationInvalidated();
+    if (!guard || revision != m_generationActionRevision) return;
     m_pendingGeneration = m_generationContext;
     m_pendingGeneration.jobId = QUuid::createUuid().toString(QUuid::WithoutBraces);
     m_pendingGeneration.profile = DifficultyProfile::forName(m_difficulty->currentData().toString());
     m_pendingGeneration.allowedTypes = selectedTypes();
     m_pendingGeneration.analysisOnly = analysisOnly;
+    m_pendingGeneration.arrangementSeed = m_arrangementSeed;
     m_lastGeneration=m_pendingGeneration; m_cachedDraft={}; m_hasDraft=false;
     m_result->clear();
     m_progress->setRange(0, 0);
@@ -482,8 +517,12 @@ void AiRecognitionPage::startGeneration(bool analysisOnly) {
 }
 
 void AiRecognitionPage::invalidateGeneration() {
+    ++m_generationActionRevision;
+    QPointer<AiRecognitionPage> guard(this);
     cancelRecognition();
+    if (!guard) return;
     if (m_generationService && !m_lastGeneration.jobId.isEmpty()) m_generationService->discard(m_lastGeneration.jobId);
+    if (!guard) return;
     m_lastGeneration={}; m_cachedDraft={}; m_hasDraft=false;
     m_result->clear();
     refreshControls();
@@ -494,7 +533,14 @@ void AiRecognitionPage::pauseGenerationForConnectionChange() {
 }
 
 void AiRecognitionPage::invalidateGenerationForConnectionChange() {
-    if (!usesLocalGeneration()) invalidateGeneration();
+    if (usesLocalGeneration()) return;
+    if (!usesHybridGeneration()) { invalidateGeneration(); return; }
+    QPointer<AiRecognitionPage> guard(this); cancelRecognition(); if (!guard) return;
+    const auto service = m_generationService;
+    const QString job = m_lastGeneration.jobId;
+    m_lastGeneration = m_hasDraft ? m_cachedDraft.source : GenerationRequest{};
+    if (service && !job.isEmpty()) service->discard(job);
+    if (guard) { refreshControls(); setStatus(m_hasDraft ? tr("AI 连接已改变，有效初稿已保留。") : tr("AI 连接已改变，可重新生成。")); }
 }
 
 void AiRecognitionPage::showGenerationApplied() {
@@ -530,9 +576,11 @@ void AiRecognitionPage::cancelRecognition() {
     setStatus(!contextId.isEmpty() ? tr("识别已取消。") : usesLocalGeneration()
         ? tr("本地任务已取消，可重新生成。") : tr("任务已停止，已完成进度保留。"));
     refreshControls();
+    QPointer<AiRecognitionPage> guard(this);
     if (!contextId.isEmpty()) emit cancelRequested(contextId);
+    if (!guard) return;
     if (!jobId.isEmpty()) emit cancelGenerationRequested(jobId);
-    refreshControls();
+    if (guard) refreshControls();
 }
 
 bool AiRecognitionPage::accepts(const QString &contextId) const {
@@ -568,11 +616,18 @@ void AiRecognitionPage::refreshControls() {
     m_progress->setVisible(isRecognizing() || !m_lastGeneration.jobId.isEmpty());
     m_configure->setEnabled((usesLocalGeneration() || !isRecognizing()) && !m_contextBusy);
     m_configure->setText(usesLocalGeneration() ? tr("模型连接设置（可选）") : tr("配置 AI 连接"));
+    m_skipPlanning->setVisible(usesHybridGeneration() && isRecognizing() && !m_pendingGeneration.analysisOnly);
+    m_skipPlanning->setEnabled(usesHybridGeneration() && isRecognizing() && !m_pendingGeneration.analysisOnly);
+    m_changeArrangement->setVisible(m_generationMode != LanguageModel);
+    m_changeArrangement->setEnabled(m_generate->isEnabled() && m_hasDraft);
     if (m_legacyOverride) {
         m_serviceStatus->setText(available ? tr("已连接音频分析服务") : tr("音频分析服务尚未接入。"));
     } else if (usesLocalGeneration()) {
         m_serviceStatus->setText(available ? tr("本地快速制谱已就绪 · 离线运行，无需配置模型连接")
             : tr("本地制谱服务尚未准备就绪。"));
+    } else if (usesHybridGeneration()) {
+        m_serviceStatus->setText(available ? tr("AI 整曲建议 + 本地编排 · 未配置模型时使用本地建议，可随时跳过 AI 规划")
+            : tr("混合编排服务尚未准备就绪。"));
     } else {
         m_serviceStatus->setText(available ? tr("已连接模型分析与编排服务")
             : tr("请先配置并保存模型连接，或完成账号授权。"));

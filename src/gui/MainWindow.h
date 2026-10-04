@@ -42,9 +42,12 @@ class AiGenerationService;
 class ConfiguredAiTextTransport;
 class LlmAiGenerationService;
 class LocalAiGenerationService;
+class HybridAiGenerationService;
+class AiRefinementService;
 class GenerationPreviewDialog;
 struct GenerationRequest;
 struct GenerationDraft;
+struct RefinementResult;
 }
 struct DocumentLoadResult {
     std::shared_ptr<lmsc::BeatmapDocument> document;
@@ -69,6 +72,8 @@ public:
     // Caller-owned local override; selects local mode. nullptr restores the
     // application's offline backend.
     void setAiLocalGenerationService(lmsc::AiGenerationService *service);
+    void setAiHybridGenerationService(lmsc::AiGenerationService *service);
+    void setAiRefinementService(lmsc::AiRefinementService *service);
 signals:
     void documentReady();
     void loadFailed(const QString &error);
@@ -81,6 +86,9 @@ private:
     void refreshRecognitionContext();
     bool generationSourceIsCurrent(const lmsc::GenerationRequest &source) const;
     void previewGeneratedChart(const lmsc::GenerationDraft &draft);
+    void openGenerationPreview(const lmsc::GenerationDraft &draft, bool documentBaseline);
+    void refineCurrentChart();
+    bool currentChartSupportsRefinement() const;
     void updateWorkspaceActions();
     void buildActions();
     void connectAudio();
@@ -126,6 +134,12 @@ private:
     lmsc::ConfiguredAiTextTransport *m_aiTransport = nullptr;
     lmsc::LlmAiGenerationService *m_defaultGenerationService = nullptr;
     lmsc::LocalAiGenerationService *m_localGenerationService = nullptr;
+    lmsc::HybridAiGenerationService *m_hybridGenerationService = nullptr;
+    lmsc::AiRefinementService *m_defaultRefinementService = nullptr;
+    QPointer<lmsc::AiRefinementService> m_refinementService;
+    std::unique_ptr<lmsc::RefinementResult> m_cachedRefinement;
+    std::unique_ptr<lmsc::GenerationDraft> m_cachedPreviewBaseline;
+    bool m_cachedBaselineIsDocument = false;
     QPointer<lmsc::GenerationPreviewDialog> m_generationPreview;
     QString m_documentId;
     lmsc::AppPreferences m_generationPreferences;
@@ -153,6 +167,7 @@ private:
     QDoubleSpinBox *m_bpm, *m_offset, *m_editBeat, *m_editDuration;
     QSpinBox *m_editX, *m_editY, *m_editWidth, *m_editHeight;
     QPushButton *m_playButton, *m_applyButton, *m_cancelButton, *m_calibrateButton, *m_estimateButton, *m_recropButton;
+    QPushButton *m_refineCurrentChartButton;
     QCheckBox *m_loop, *m_metronome;
     QProgressBar *m_progress;
     QSlider *m_seekSlider;

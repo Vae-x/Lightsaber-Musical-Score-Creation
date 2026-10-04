@@ -7,6 +7,7 @@
 #include <memory>
 
 namespace lmsc {
+struct RefinementPatch;
 
 enum class ObjectKind { Note, Bomb, Wall };
 
@@ -83,6 +84,8 @@ public:
     bool updateObject(const BeatObject &object, QString *error = nullptr);
     bool updateObjects(const QVector<BeatObject> &objects, QString *error = nullptr);
     bool removeObjects(const QStringList &ids, QString *error = nullptr);
+    bool applyRefinementPatch(const RefinementPatch &patch, const QString &difficultyId,
+                              quint64 expectedRevision, QString *error = nullptr);
     QVector<BeatObject> copyObjects(const QStringList &ids, QString *error = nullptr) const;
     bool pasteObjects(const QVector<BeatObject> &objects, double beatOffset,
                       int xOffset = 0, bool mirror = false, QString *error = nullptr);

@@ -18,7 +18,7 @@ namespace lmsc {
 class AiRecognitionPage : public QWidget {
     Q_OBJECT
 public:
-    enum GenerationMode { LocalQuick, LanguageModel };
+    enum GenerationMode { LocalQuick, LanguageModel, Hybrid };
     explicit AiRecognitionPage(QWidget *parent = nullptr);
     ~AiRecognitionPage() override;
 
@@ -31,6 +31,7 @@ public:
     // backend does not interrupt the selected mode or its candidate.
     void setGenerationService(AiGenerationService *service, AiGenerationService *fallback = nullptr);
     void setLocalGenerationService(AiGenerationService *service, AiGenerationService *fallback = nullptr);
+    void setHybridGenerationService(AiGenerationService *service, AiGenerationService *fallback = nullptr);
     void setGenerationMode(GenerationMode mode);
     GenerationMode generationMode() const { return m_generationMode; }
     void setGenerationContext(const GenerationRequest &context, bool newSong, bool busy);
@@ -52,6 +53,7 @@ signals:
     void cancelGenerationRequested(const QString &jobId);
     void generationDraftReady(const lmsc::GenerationDraft &draft);
     void generationInvalidated();
+    void skipPlanningRequested(const QString &jobId);
 
 private:
     void startRecognition();
@@ -64,6 +66,7 @@ private:
     GeneratedTypes selectedTypes() const;
     void activateGenerationService(bool force = false);
     bool usesLocalGeneration() const { return m_generationMode == LocalQuick; }
+    bool usesHybridGeneration() const { return m_generationMode == Hybrid; }
 
     UnavailableAiRecognitionService *m_unavailable;
     QPointer<AiRecognitionService> m_service;
@@ -73,14 +76,17 @@ private:
     QPointer<AiGenerationService> m_generationFallback;
     QPointer<AiGenerationService> m_localGenerationService;
     QPointer<AiGenerationService> m_localGenerationFallback;
+    QPointer<AiGenerationService> m_hybridGenerationService;
+    QPointer<AiGenerationService> m_hybridGenerationFallback;
     QVector<QMetaObject::Connection> m_generationConnections;
     GenerationRequest m_generationContext;
     GenerationRequest m_pendingGeneration;
     GenerationRequest m_lastGeneration;
     GenerationDraft m_cachedDraft;
     bool m_hasDraft = false;
-    GenerationMode m_generationMode = LocalQuick;
+    GenerationMode m_generationMode = Hybrid;
     quint64 m_generationServiceRevision = 0;
+    quint64 m_generationActionRevision = 0;
     bool m_newSong = false;
     bool m_legacyOverride = false;
     bool m_updatingOptions = false;
@@ -104,6 +110,8 @@ private:
     QCheckBox *m_directional, *m_dots, *m_bombs, *m_walls;
     QPushButton *m_cancel;
     QPushButton *m_resume, *m_preview, *m_logs;
+    QPushButton *m_skipPlanning, *m_changeArrangement;
+    quint32 m_arrangementSeed = 0;
     QPushButton *m_configure;
     QProgressBar *m_progress;
     QPlainTextEdit *m_result;

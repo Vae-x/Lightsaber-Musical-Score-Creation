@@ -9,6 +9,7 @@
 #include "gui/SongExportDialog.h"
 #include "core/AiTextTransport.h"
 #include "core/LocalAiGenerationService.h"
+#include "core/AiRefinementService.h"
 #include "core/AppInfo.h"
 #include "core/AppSettings.h"
 #include "core/AudioService.h"
@@ -91,6 +92,30 @@ public:
     void generate(const lmsc::GenerationRequest &request) override { requests.append(request); }
     void cancel(const QString &jobId) override { cancelledIds.append(jobId); emit cancelled(jobId); }
 };
+class MainRefinementService final : public lmsc::AiRefinementService {
+public:
+    MainRefinementService() : AiRefinementService(nullptr) {}
+    QVector<lmsc::RefinementRequest> requests;
+    QStringList cancelledJobs, discardedJobs, resumedJobs;
+    lmsc::AiGenerationService::Status current;
+    bool isAvailable() const override { return true; }
+    lmsc::AiGenerationService::Status status() const override { return current; }
+    void refine(const lmsc::RefinementRequest &request) override { requests.append(request); current={}; current.jobId=request.generation.jobId; current.state=lmsc::AiGenerationService::Status::Running; }
+    void cancel(const QString &job) override { cancelledJobs.append(job); current.state=lmsc::AiGenerationService::Status::Paused; current.resumable=true; emit cancelled(job); }
+    void discard(const QString &job) override { discardedJobs.append(job); current={}; }
+    void resume(const QString &job) override { resumedJobs.append(job); current.state=lmsc::AiGenerationService::Status::Running; current.resumable=false; }
+    void finish(const lmsc::RefinementRequest &request) {
+        lmsc::RefinementResult result; result.source=request; result.candidate.source=request.generation;
+        result.candidate.objects=request.baseline;
+        if (!result.candidate.objects.isEmpty()) result.candidate.objects.first().y=2;
+        result.patch=lmsc::refinementDifference(request.baseline,result.candidate.objects);
+        result.stats=lmsc::refinementStatistics(result.patch,request.baseline);
+        result.processedSegments=QStringList{QStringLiteral("s1")};
+        result.remainingSegments=QStringList{QStringLiteral("s2")}; result.resumable=true;
+        current.state=lmsc::AiGenerationService::Status::Completed; current.resumable=true;
+        emit candidateReady(result);
+    }
+};
 
 class ScopedHttpsUrlHandler {
 public:
@@ -158,6 +183,7 @@ private slots:
     void aiSuggestionsPreserveLoadedDocument();
     void aiGenerationPreviewAndAtomicApply();
     void localGenerationOfflinePreviewAndApply();
+    void existingNewSongRefinementIsAtomicAndReusable();
     void outputLimitSettingsReachGenerationTransport();
     void clickPlaceApplyUndoAndDifficulty();
     void protectedSelectionRejectsEntireDrag();
@@ -558,7 +584,8 @@ void MainWindowTest::localGenerationOfflinePreviewAndApply() {
     auto *actual = window.findChild<QComboBox *>(QStringLiteral("newSongDifficultySelector"));
     auto *candidate = window.findChild<QPushButton *>(QStringLiteral("aiViewCandidate"));
     QVERIFY(page && service && nav && generate && target && actual && candidate);
-    QCOMPARE(page->generationMode(), lmsc::AiRecognitionPage::LocalQuick);
+    QCOMPARE(page->generationMode(), lmsc::AiRecognitionPage::Hybrid);
+    page->setGenerationMode(lmsc::AiRecognitionPage::LocalQuick);
     QVERIFY(!QFile::exists(settingsFile()));
     nav->setCurrentRow(1);
     target->setCurrentIndex(target->findData(QStringLiteral("Hard")));
@@ -623,6 +650,70 @@ void MainWindowTest::localGenerationOfflinePreviewAndApply() {
     QVERIFY(source.open(QIODevice::ReadOnly));
     QCOMPARE(QCryptographicHash::hash(source.readAll(), QCryptographicHash::Sha256), hash);
     window.close();
+}
+
+void MainWindowTest::existingNewSongRefinementIsAtomicAndReusable() {
+    QString error;
+    lmsc::BeatmapDocument original;
+    QVERIFY2(original.createNew(QDir(m_song).filePath(QStringLiteral("song.ogg")),QStringLiteral("已有谱精修"),120,0,{},&error),qPrintable(error));
+    lmsc::BeatObject note; note.beat=2; note.x=0; note.y=0; note.direction=1;
+    QVERIFY2(original.addObject(note,&error),qPrintable(error));
+    const QString originalId=original.objects().first().id;
+    const QString project=m_temp.filePath(QStringLiteral("refinement-project/project.lmsc"));
+    QVERIFY2(original.saveProject(project,&error),qPrintable(error));
+    MainRefinementService service; MainWindow window(nullptr,settingsFile());
+    window.setTestMode(true); window.setAiRefinementService(&service); window.show();
+    QSignalSpy ready(&window,&MainWindow::documentReady); window.openPath(project);
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(),1,20000); QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(),20000);
+    auto entry=window.findChild<QPushButton *>(QStringLiteral("refineCurrentChartButton")); QVERIFY(entry && entry->isEnabled());
+    auto audio=window.findChild<AudioService *>(); QVERIFY(audio);
+    const QString audioPath=audio->pcmSnapshot().sourcePath;
+    QSignalSpy decoded(audio,&AudioService::audioReady);
+    audio->loadAudio(audioPath);
+    QVERIFY(!entry->isEnabled());
+    QTRY_COMPARE_WITH_TIMEOUT(decoded.count(),1,20000); QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(),20000);
+    QVERIFY(entry->isEnabled());
+    auto grid=window.findChild<GridEditor *>(); QVERIFY(grid);
+    auto currentY=[&] { emit grid->selectionChanged(QSet<QString>{originalId}); return field<QSpinBox>(window,QStringLiteral("层 (0–2)"))->value(); };
+    QCOMPARE(currentY(),0);
+    entry->click(); QPointer<lmsc::GenerationPreviewDialog> preview=window.findChild<lmsc::GenerationPreviewDialog *>();
+    QVERIFY(preview); QCOMPARE(preview->initialDraft().objects.first().id,originalId);
+    QVERIFY(!preview->findChild<QPushButton *>(QStringLiteral("generationPreviewApply"))->isEnabled());
+    preview->setRefinementSelection(0,4); preview->refineChart(); QCOMPARE(service.requests.size(),1);
+    const auto request=service.requests.last(); service.finish(request);
+    QCOMPARE(currentY(),0); QVERIFY(preview->hasRefinementPatch()); QCOMPARE(preview->draft().objects.first().y,2);
+    const QString captures=qEnvironmentVariable("LMSC_HYBRID_CAPTURE_DIRECTORY");
+    if (!captures.isEmpty()) {
+        QVERIFY(QDir().mkpath(captures)); const auto originalTheme=lmsc::ThemeManager::mode();
+        preview->resize(1080,760); window.resize(1080,760);
+        for (const QString theme : {QStringLiteral("light"),QStringLiteral("dark")}) {
+            lmsc::ThemeManager::apply(theme); QTest::qWait(100);
+            QVERIFY(preview->grab().save(QDir(captures).filePath("refinement-existing-"+theme+".png")));
+            auto nav=window.findChild<QListWidget *>(QStringLiteral("mainNavigation")); nav->setCurrentRow(1); QTest::qWait(50);
+            QVERIFY(window.grab().save(QDir(captures).filePath("hybrid-page-"+theme+".png"))); nav->setCurrentRow(0);
+        }
+        lmsc::ThemeManager::apply(originalTheme);
+    }
+    preview->close(); QTRY_VERIFY(preview.isNull());
+    QVERIFY(!service.discardedJobs.contains(request.generation.jobId));
+    entry->click(); preview=window.findChild<lmsc::GenerationPreviewDialog *>(); QVERIFY(preview);
+    QVERIFY(preview->hasRefinementPatch()); QCOMPARE(preview->draft().objects.first().y,2);
+    auto resume=preview->findChild<QPushButton *>(QStringLiteral("generationRefinementResume")); QVERIFY(resume->isEnabled());
+    resume->click(); QCOMPARE(service.resumedJobs,QStringList{request.generation.jobId}); service.finish(request);
+    preview->findChild<QPushButton *>(QStringLiteral("generationPreviewApply"))->click(); QTRY_VERIFY(preview.isNull());
+    QCOMPARE(objectCount(window),1); QCOMPARE(currentY(),2);
+    QAction *undo=nullptr,*redo=nullptr,*save=nullptr;
+    for (auto action : window.findChildren<QAction *>()) {
+        if (action->text()==QStringLiteral("撤销")) undo=action;
+        if (action->text()==QStringLiteral("重做")) redo=action;
+        if (action->text()==QStringLiteral("保存工程")) save=action;
+    }
+    QVERIFY(undo && redo && save); undo->trigger(); QCOMPARE(currentY(),0);
+    redo->trigger(); QCOMPARE(currentY(),2); save->trigger(); QTRY_VERIFY_WITH_TIMEOUT(save->isEnabled(),20000);
+    lmsc::BeatmapDocument reopened; QVERIFY2(reopened.loadProject(project,&error),qPrintable(error));
+    QCOMPARE(reopened.objects().first().id,originalId); QCOMPARE(reopened.objects().first().y,2);
+    window.openPath(m_song); QTRY_COMPARE_WITH_TIMEOUT(ready.count(),2,20000); QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(),20000);
+    QVERIFY(!entry->isEnabled()); window.close();
 }
 
 void MainWindowTest::aiGenerationPreviewAndAtomicApply() {

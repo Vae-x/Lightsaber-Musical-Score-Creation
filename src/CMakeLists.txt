@@ -41,6 +41,10 @@ add_library(lmsc_core STATIC
         core/AiGenerationService.cpp core/AiGenerationService.h
         core/LocalAiGenerationService.cpp core/LocalAiGenerationService.h
         core/LocalChartGenerator.cpp core/LocalChartGenerator.h
+        core/SongArrangementPlan.cpp core/SongArrangementPlan.h
+        core/HybridAiGenerationService.cpp core/HybridAiGenerationService.h
+        core/RefinementTypes.cpp core/RefinementTypes.h
+        core/AiRefinementService.cpp core/AiRefinementService.h
         core/MusicFeatureAnalyzer.cpp core/MusicFeatureAnalyzer.h
         core/BeatmapPlayabilityValidator.cpp core/BeatmapPlayabilityValidator.h
         core/ApiModelClient.cpp core/ApiModelClient.h
@@ -212,6 +216,15 @@ if (BUILD_TESTING)
     set_target_properties(local_generation_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
     add_test(NAME local_generation COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:local_generation_tests>")
     set_tests_properties(local_generation PROPERTIES TIMEOUT 180 LABELS "core;audio;generation")
+    foreach(LMSC_HYBRID_TEST IN ITEMS HybridGeneration AiRefinement RefinedChart)
+        string(REGEX REPLACE "([a-z])([A-Z])" "\\1_\\2" LMSC_HYBRID_NAME "${LMSC_HYBRID_TEST}")
+        string(TOLOWER "${LMSC_HYBRID_NAME}" LMSC_HYBRID_NAME)
+        add_executable(${LMSC_HYBRID_NAME}_tests "${LMSC_REPOSITORY_DIR}/tests/${LMSC_HYBRID_TEST}Test.cpp")
+        target_link_libraries(${LMSC_HYBRID_NAME}_tests PRIVATE lmsc_core Qt5::Test)
+        set_target_properties(${LMSC_HYBRID_NAME}_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+        add_test(NAME ${LMSC_HYBRID_NAME} COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:${LMSC_HYBRID_NAME}_tests>")
+        set_tests_properties(${LMSC_HYBRID_NAME} PROPERTIES TIMEOUT 180 LABELS "core;audio;ai;generation")
+    endforeach()
     add_executable(ai_generation_page_tests
             "${LMSC_REPOSITORY_DIR}/tests/AiGenerationPageTest.cpp"
             gui/AiRecognitionPage.cpp gui/AiRecognitionPage.h
