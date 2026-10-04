@@ -66,9 +66,11 @@ Result waitFor(MtpDeleteService &service, const std::function<void()> &start) {
     QObject::disconnect(prepared); QObject::disconnect(deleted); QObject::disconnect(error); QObject::disconnect(cancelled); return result;
 }
 const QString folderType = "27e2e392-a111-48e0-ab0c-e17705a05f85", fileType = "0085e0a6-8d34-45d7-bc5c-447e59c73d48";
+const QString unspecifiedType = "28d8d31e-249c-454e-aabc-34883168e634", unspecifiedFormat = "30000000-ae6c-4804-98ba-c57b46965fe7";
 QJsonObject object(const QString &id, const QString &parent, const QString &name, const QString &type, qint64 size = 0, bool storage = false) {
     return {{"Id", id}, {"Persistent", id + "-persistent"}, {"Parent", parent}, {"Name", name}, {"Type", type},
-        {"Category", storage ? QStringLiteral("23f05bbc-15de-4c2a-a55b-a9af5ce412ef") : QStringLiteral("00000000-0000-0000-0000-000000000000")}, {"Size", double(size)}};
+        {"Category", storage ? QStringLiteral("23f05bbc-15de-4c2a-a55b-a9af5ce412ef") : QStringLiteral("00000000-0000-0000-0000-000000000000")},
+        {"OriginalFileName", name}, {"Format", type == folderType ? QStringLiteral("30010000-ae6c-4804-98ba-c57b46965fe7") : unspecifiedFormat}, {"Size", double(size)}};
 }
 QJsonObject syntheticJob(const QString &cancelFile) {
     const auto segments = locator().value("segments").toArray(); QJsonArray objects;
@@ -87,6 +89,7 @@ QJsonObject syntheticJob(const QString &cancelFile) {
     objects.append(object("scores", "path-3", "scores.dat", fileType, 50));
     return {{"protocol", 1}, {"mode", "validate-delete"}, {"cancelFile", cancelFile}, {"planFile", QFileInfo(cancelFile).absolutePath() + "/plan.json"}, {"locator", locator()},
         {"gameId", "oasis"}, {"name", song().name}, {"objects", objects},
+        {"resourceData", QJsonObject{{"info", QString::fromLatin1(QByteArray(100, 'i').toBase64())}, {"chart", QString::fromLatin1(QByteArray(10, 'c').toBase64())}}},
         {"infoText", QStringLiteral("{\"_songFilename\":\"song.ogg\",\"_difficultyBeatmapSets\":[]}")}};
 }
 QJsonObject runHelper(const QString &helper, const QString &jobPath, QJsonObject job, int *exit) {
@@ -176,6 +179,32 @@ int main(int argc, char **argv) {
         && deleted.size() == 5 && deleted[deleted.size() - 2] == "info" && deleted.last() == "path-5"
         && remaining.contains("other-song") && remaining.contains("other-info") && remaining.contains("scores"),
         QStringLiteral("真实 helper 使用生产逻辑模拟非递归删除，Info 最后，其他歌曲与成绩不变：%1").arg(record.value("message").toString()));
+    auto unspecified = changeObject(changeObject(job, "info", "Type", unspecifiedType), "chart", "Type", unspecifiedType);
+    record = runHelper(helper, jobPath, unspecified, &exitCode);
+    check(exitCode == 0 && record.value("type") == "delete-validated" && record.value("deviceAccessed") == false,
+        QStringLiteral("未指定类型 .dat 在原文件名、文件格式、大小、默认流及无子项证据齐全时可删除：%1").arg(record.value("message").toString()));
+    for (const auto &invalidEvidence : {changeObject(unspecified, "info", "OriginalFileName", QString()),
+            changeObject(unspecified, "info", "OriginalFileName", QStringLiteral("other.dat")),
+            changeObject(unspecified, "info", "Format", QStringLiteral("00000000-0000-0000-0000-000000000000")),
+            changeObject(unspecified, "info", "Size", QStringLiteral("18446744073709551615")),
+            changeObject(unspecified, "info", "Category", QStringLiteral("23f05bbc-15de-4c2a-a55b-a9af5ce412ef"))}) {
+        record = runHelper(helper, jobPath, invalidEvidence, &exitCode);
+        check(exitCode == 1 && record.value("deletionStarted") == false,
+            QStringLiteral("未指定类型缺少原名、文件格式、已知大小或普通内容类别时拒绝"));
+    }
+    auto missingStream = unspecified; auto resourceData = missingStream.value("resourceData").toObject(); resourceData.remove("info");
+    missingStream.insert("resourceData", resourceData); record = runHelper(helper, jobPath, missingStream, &exitCode);
+    check(exitCode == 1 && record.value("deletionStarted") == false, QStringLiteral("无默认可读数据流的未指定虚拟对象不能删除"));
+    auto shortStream = unspecified; resourceData = shortStream.value("resourceData").toObject();
+    resourceData.insert("info", QString::fromLatin1(QByteArray(99, 'i').toBase64())); shortStream.insert("resourceData", resourceData);
+    record = runHelper(helper, jobPath, shortStream, &exitCode);
+    check(exitCode == 1 && record.value("deletionStarted") == false, QStringLiteral("默认文件流未读全不能作为实体文件证明"));
+    auto withChild = unspecified; auto proofObjects = withChild.value("objects").toArray();
+    proofObjects.append(object("virtual-child", "info", "child.dat", fileType, 1)); withChild.insert("objects", proofObjects);
+    record = runHelper(helper, jobPath, withChild, &exitCode);
+    check(exitCode == 1 && record.value("deletionStarted") == false, QStringLiteral("带子对象的未指定类型不能作为叶文件删除"));
+    auto changedProof = unspecified; changedProof.insert("mutation", "file-evidence"); record = runHelper(helper, jobPath, changedProof, &exitCode);
+    check(exitCode == 1 && record.value("deletionStarted") == false, QStringLiteral("确认后实体文件证明 SHA256 变化时拒绝删除"));
     for (const auto &mutation : {"persistent", "size", "info", "new-file", "plan-token", "plan-file", "during-delete", "during-disconnect"}) {
         auto changed = job; changed.insert("mutation", mutation); record = runHelper(helper, jobPath, changed, &exitCode);
         check(exitCode == 1 && record.value("type") == "error", QStringLiteral("生产逻辑拒绝确认后的变化或断连：%1").arg(mutation));

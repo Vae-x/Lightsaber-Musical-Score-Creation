@@ -114,6 +114,7 @@ namespace Lmsc.Wpd {
             ClientName = new PropertyKey(Clients, 2), Access = new PropertyKey(Clients, 9);
         public static Guid Folder = new Guid("27E2E392-A111-48E0-AB0C-E17705A05F85"),
             GenericFile = new Guid("0085E0A6-8D34-45D7-BC5C-447E59C73D48"),
+            Unspecified = new Guid("28D8D31E-249C-454E-AABC-34883168E634"),
             Audio = new Guid("4AD2C85E-5E2D-45E5-8864-4F229E3C6CF0"),
             Image = new Guid("EF2107D5-A52A-4243-A26B-62D4176D7603"),
             Document = new Guid("680ADF52-950A-4041-9B41-65E393648155"),
@@ -124,10 +125,11 @@ namespace Lmsc.Wpd {
     }
     internal sealed class DeviceObject {
         public DeviceObject() { }
-        public string Id, Persistent, Name, Parent; public Guid Type, Category;
+        public string Id, Persistent, Name, Parent, OriginalFileName, FileEvidenceSha256; public Guid Type, Category, Format;
         public ulong Size;
         public bool IsFolder { get { return Type == Keys.Folder; } }
-        public bool IsFile { get { return Type == Keys.GenericFile || Type == Keys.Audio || Type == Keys.Image || Type == Keys.Document || Type == Keys.Video; } }
+        public bool IsKnownFile { get { return Type == Keys.GenericFile || Type == Keys.Audio || Type == Keys.Image || Type == Keys.Document || Type == Keys.Video; } }
+        public bool IsFile { get { return IsKnownFile || (Type == Keys.Unspecified && !String.IsNullOrEmpty(FileEvidenceSha256)); } }
     }
     internal sealed class DeviceSession : IDisposable {
         IDevice device; IContent content; IProperties properties; IResources resources;
@@ -153,10 +155,12 @@ namespace Lmsc.Wpd {
             check(); IValues values; properties.GetValues(id, IntPtr.Zero, out values);
             try {
                 var item = new DeviceObject { Id = id, Persistent = StringValue(values, ref Keys.Persistent),
-                    Name = StringValue(values, ref Keys.FileName), Parent = StringValue(values, ref Keys.Parent) };
+                    OriginalFileName = StringValue(values, ref Keys.FileName), Parent = StringValue(values, ref Keys.Parent) };
+                item.Name = item.OriginalFileName;
                 if (item.Name.Length == 0) item.Name = StringValue(values, ref Keys.Name);
                 values.GetGuidValue(ref Keys.Type, out item.Type); values.GetGuidValue(ref Keys.Category, out item.Category);
-                if (item.IsFile && values.GetUnsignedLargeIntegerValue(ref Keys.Size, out item.Size) < 0)
+                values.GetGuidValue(ref Keys.Format, out item.Format);
+                if ((item.IsKnownFile || item.Type == Keys.Unspecified) && values.GetUnsignedLargeIntegerValue(ref Keys.Size, out item.Size) < 0)
                     item.Size = UInt64.MaxValue;
                 return item;
             } finally { Release(values); }
@@ -262,6 +266,25 @@ namespace Lmsc.Wpd {
             } finally { Marshal.FreeCoTaskMem(read); Release(stream); }
         }
         public static string Hex(byte[] hash) { return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant(); }
+        public string FileEvidence(DeviceObject item) {
+            check(); IStream stream; uint optimal = 0; resources.GetStream(item.Id, ref Keys.Resource, 0, ref optimal, out stream);
+            IntPtr read = Marshal.AllocCoTaskMem(4);
+            try {
+                byte[] buffer = new byte[65536]; ulong count = 0;
+                using (SHA256 hash = SHA256.Create()) {
+                    while (true) {
+                        check(); Marshal.WriteInt32(read, 0); stream.Read(buffer, buffer.Length, read);
+                        int bytes = Marshal.ReadInt32(read);
+                        if (bytes < 0 || bytes > buffer.Length) throw new IOException("未指定类型资源返回无效字节数。");
+                        if (bytes == 0) break; count += (uint)bytes;
+                        if (count > item.Size) throw new IOException("未指定类型资源大小与原文件声明不一致。");
+                        hash.TransformBlock(buffer, 0, bytes, null, 0);
+                    }
+                    if (count != item.Size) throw new IOException("未指定类型资源无法完整只读核对。");
+                    hash.TransformFinalBlock(new byte[0], 0, 0); return Hex(hash.Hash);
+                }
+            } finally { Marshal.FreeCoTaskMem(read); Release(stream); }
+        }
         public string InfoHash(string id) {
             check(); IStream stream; uint optimal = 0; resources.GetStream(id, ref Keys.Resource, 0, ref optimal, out stream);
             IntPtr read = Marshal.AllocCoTaskMem(4);
@@ -538,10 +561,22 @@ namespace Lmsc.Wpd {
         }
         static DeviceObject CopyObject(DeviceObject item) {
             return new DeviceObject { Id = item.Id, Persistent = item.Persistent, Parent = item.Parent, Name = item.Name,
-                Type = item.Type, Category = item.Category, Size = item.Size };
+                Type = item.Type, Category = item.Category, Size = item.Size, Format = item.Format,
+                OriginalFileName = item.OriginalFileName, FileEvidenceSha256 = item.FileEvidenceSha256 };
+        }
+        static void ProveFile(DeviceObject item, Func<string, List<DeviceObject>> children, Func<DeviceObject, string> evidence) {
+            if (item.Type != Keys.Unspecified) return;
+            // UNSPECIFIED 可能是虚拟对象，不能仅凭类型允许删除。必须证明为无子项的实体文件。
+            if (!RemoteName(item.OriginalFileName) || item.OriginalFileName != item.Name || item.Format != Keys.FileFormat
+                || item.Category != Guid.Empty || item.Size > 8UL * 1024 * 1024 * 1024 || children(item.Id).Count != 0)
+                throw new IOException("未指定类型对象缺少原文件名、文件格式、已知大小或无子项证明，不能作为歌曲资源删除。");
+            string proof = evidence(item);
+            if (proof == null || !Regex.IsMatch(proof, "^[a-f0-9]{64}$"))
+                throw new IOException("未指定类型对象缺少可完整读取的默认文件资源，拒绝删除。");
+            item.FileEvidenceSha256 = proof;
         }
         static DeleteSnapshot Snapshot(IDictionary<string, object> job, string deviceId, string deviceName,
-            Func<string, List<DeviceObject>> children, Func<string, string> infoHash) {
+            Func<string, List<DeviceObject>> children, Func<string, string> infoHash, Func<DeviceObject, string> evidence) {
             string[] segments = DeleteSegments(job); var locator = Object(job["locator"]);
             if (deviceName != Text(locator, "device")) throw new IOException("连接设备名称与所选歌曲不一致。");
             var result = new DeleteSnapshot { DeviceId = deviceId, DeviceName = deviceName, GameId = Text(job, "gameId"), Segments = segments };
@@ -564,6 +599,7 @@ namespace Lmsc.Wpd {
             walk = delegate(DeviceObject folder, int depth) {
                 Check(); if (depth > 20) throw new IOException("歌曲资源子目录超过 20 层，未开始删除。");
                 var items = children(folder.Id); ValidateChildren(folder.Id, items);
+                foreach (var item in items) ProveFile(item, children, evidence);
                 var infos = items.Where(item => item.Name.Equals("Info.dat", StringComparison.OrdinalIgnoreCase)).ToList();
                 if (depth == 0) {
                     if (infos.Count != 1 || !infos[0].IsFile) throw new IOException("所选目录缺少唯一 Info.dat，不能当作歌曲删除。");
@@ -588,7 +624,8 @@ namespace Lmsc.Wpd {
         }
         static bool SameObject(DeviceObject first, DeviceObject second) {
             return first.Id == second.Id && first.Persistent == second.Persistent && first.Parent == second.Parent
-                && first.Name == second.Name && first.Type == second.Type && first.Category == second.Category && first.Size == second.Size;
+                && first.Name == second.Name && first.Type == second.Type && first.Category == second.Category && first.Size == second.Size
+                && first.Format == second.Format && first.OriginalFileName == second.OriginalFileName && first.FileEvidenceSha256 == second.FileEvidenceSha256;
         }
         static void SameSnapshot(DeleteSnapshot expected, DeleteSnapshot actual) {
             if (expected.DeviceId != actual.DeviceId || expected.DeviceName != actual.DeviceName || expected.GameId != actual.GameId
@@ -624,7 +661,7 @@ namespace Lmsc.Wpd {
         }
         static void ApplyDeletion(DeleteSnapshot plan, Func<string, List<DeviceObject>> children,
             Func<string, DeviceObject> get, Action<string> delete, Func<string, string> infoHash,
-            Action<int, int> progress) {
+            Func<DeviceObject, string> evidence, Action<int, int> progress) {
             var remaining = plan.Objects.ToDictionary(item => item.Id, StringComparer.Ordinal);
             string songId = plan.Chain.Last().Id; remaining.Add(songId, plan.Chain.Last());
             var order = plan.Objects.Where(item => item.Id != plan.InfoId).Reverse().ToList();
@@ -637,11 +674,15 @@ namespace Lmsc.Wpd {
                     var actual = ExactChild(children, ancestor.Parent, ancestor.Name);
                     if (!SameObject(ancestor, actual)) throw new IOException("删除期间原歌曲路径已变化，已停止后续删除。");
                 }
-                if (!SameObject(item, get(item.Id))) throw new IOException("删除期间歌曲资源标识已变化，已停止后续删除。");
+                var actualItem = get(item.Id); ProveFile(actualItem, children, evidence);
+                if (!SameObject(item, actualItem)) throw new IOException("删除期间歌曲资源标识已变化，已停止后续删除。");
                 var siblings = children(item.Parent); ValidateChildren(item.Parent, siblings);
                 if (item.Id != songId) {
                     var expected = remaining.Values.Where(value => value.Parent == item.Parent).ToList();
-                    if (siblings.Count != expected.Count || siblings.Any(value => !remaining.ContainsKey(value.Id) || !SameObject(value, remaining[value.Id])))
+                    if (siblings.Count != expected.Count || siblings.Any(value => !remaining.ContainsKey(value.Id)))
+                        throw new IOException("删除期间目录内容已变化，已停止后续删除。");
+                    foreach (var sibling in siblings) ProveFile(sibling, children, evidence);
+                    if (siblings.Any(value => !SameObject(value, remaining[value.Id])))
                         throw new IOException("删除期间目录内容已变化，已停止后续删除。");
                 } else if (!siblings.Any(value => SameObject(value, item))) throw new IOException("删除期间歌曲目录已变化。");
                 if (item.IsFolder && children(item.Id).Count != 0) throw new IOException("删除期间新增了歌曲资源，拒绝删除非空目录。");
@@ -660,12 +701,12 @@ namespace Lmsc.Wpd {
             if (matches.Count != 1) throw new IOException("所选 PICO 未连接或存在同名设备，请刷新后重新选择。");
             var device = matches[0];
             using (var session = new DeviceSession(device.Key, !prepare, Check)) {
-                var current = Snapshot(job, device.Key, device.Value, session.Children, session.InfoHash);
+                var current = Snapshot(job, device.Key, device.Value, session.Children, session.InfoHash, session.FileEvidence);
                 if (prepare) { WritePlan(job, current); return; }
                 var original = ReadPlan(job); SameSnapshot(original, current);
                 location = device.Value + "\\" + String.Join("\\", segments);
                 Check(); Record(new { type = "deleting", locator = locator });
-                ApplyDeletion(original, session.Children, session.Get, session.DeleteSingle, session.InfoHash,
+                ApplyDeletion(original, session.Children, session.Get, session.DeleteSingle, session.InfoHash, session.FileEvidence,
                     delegate(int done, int count) { Record(new { type = "progress", message = "正在删除所选歌曲并核对", percent = Math.Min(99, done * 100 / count) }); });
                 Record(new { type = "deleted", locator = locator, verified = true });
             }
@@ -682,8 +723,17 @@ namespace Lmsc.Wpd {
             };
             string infoText = Text(job, "infoText"); ValidateInfo(infoText);
             Func<string, string> infoHash = id => { using (SHA256 hash = SHA256.Create()) return DeviceSession.Hex(hash.ComputeHash(Encoding.UTF8.GetBytes(infoText))); };
+            object resourceValue; IDictionary<string, object> resourceData = job.TryGetValue("resourceData", out resourceValue)
+                ? Object(resourceValue) : new Dictionary<string, object>();
+            Func<DeviceObject, string> evidence = item => {
+                object encoded;
+                if (!resourceData.TryGetValue(item.Id, out encoded) || !(encoded is string)) throw new IOException("合成默认文件资源不可读。");
+                byte[] bytes = Convert.FromBase64String((string)encoded);
+                if ((ulong)bytes.LongLength != item.Size) throw new IOException("合成默认文件资源大小与声明不一致。");
+                using (SHA256 hash = SHA256.Create()) return DeviceSession.Hex(hash.ComputeHash(bytes));
+            };
             string deviceName = Text(Object(job["locator"]), "device");
-            var plan = Snapshot(job, "synthetic-device", deviceName, children, infoHash);
+            var plan = Snapshot(job, "synthetic-device", deviceName, children, infoHash, evidence);
             job["planToken"] = WritePlan(job, plan);
             if (mutation == "plan-token") job["planToken"] = new String('0', 64);
             if (mutation == "plan-file") File.AppendAllText(PlanPath(job), " ");
@@ -691,8 +741,12 @@ namespace Lmsc.Wpd {
             if (mutation == "persistent") objects.Single(item => item.Id == plan.Chain.Last().Id).Persistent += "-changed";
             if (mutation == "size") objects.First(item => item.Id == plan.InfoId).Size++;
             if (mutation == "info") infoText += " ";
+            if (mutation == "file-evidence") {
+                byte[] bytes = Convert.FromBase64String((string)resourceData[plan.InfoId]); bytes[0] ^= 1;
+                resourceData[plan.InfoId] = Convert.ToBase64String(bytes);
+            }
             if (mutation == "new-file") objects.Add(new DeviceObject { Id = "new-file", Persistent = "new-file", Parent = plan.Chain.Last().Id, Name = "new.dat", Type = Keys.GenericFile });
-            var current = Snapshot(job, "synthetic-device", deviceName, children, infoHash); SameSnapshot(plan, current);
+            var current = Snapshot(job, "synthetic-device", deviceName, children, infoHash, evidence); SameSnapshot(plan, current);
             var deletedIds = new List<string>();
             ApplyDeletion(plan, children, id => objects.Single(item => item.Id == id), id => {
                 if (children(id).Count != 0) throw new IOException("合成删除拒绝递归。");
@@ -701,7 +755,7 @@ namespace Lmsc.Wpd {
                 if (mutation == "during-cancel" && deletes == 1) File.WriteAllText(cancelFile, "cancel");
                 if (mutation == "during-delete" && deletes == 1)
                     objects.Add(new DeviceObject { Id = "during-file", Persistent = "during-file", Parent = plan.Chain.Last().Id, Name = "new.dat", Type = Keys.GenericFile });
-            }, infoHash, delegate(int done, int count) { });
+            }, infoHash, evidence, delegate(int done, int count) { });
             Record(new { type = "delete-validated", files = plan.Files, bytes = plan.Bytes, objects = deletes, outsideObjects = objects.Count,
                 remainingIds = objects.Select(item => item.Id).ToArray(), deletedIds = deletedIds, deviceAccessed = false });
         }
