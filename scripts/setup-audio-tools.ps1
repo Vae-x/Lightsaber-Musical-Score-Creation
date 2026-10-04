@@ -1,7 +1,7 @@
 param([string]$ProjectDirectory = (Split-Path -Parent $PSScriptRoot))
 $ErrorActionPreference = 'Stop'
 $audioWorkspace = [IO.Path]::GetFullPath($ProjectDirectory)
-$audioBuildDirectory = Join-Path $audioWorkspace 'build-audio-tools'
+$audioBuildDirectory = Join-Path $audioWorkspace 'build\tools\ffmpeg'
 $audioToolDirectory = Join-Path $audioWorkspace 'third_party\ffmpeg'
 $audioAsset = 'ffmpeg-n9.0.2-17-g2a571b6068-win64-lgpl-shared-9.0.zip'
 $audioUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/$audioAsset"
