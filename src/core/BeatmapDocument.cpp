@@ -25,7 +25,7 @@ bool fail(QString *error, const QString &message) {
 bool sameFields(const BeatObject &a, const BeatObject &b) {
     return a.kind == b.kind && a.beat == b.beat && a.x == b.x && a.y == b.y &&
            a.color == b.color && a.direction == b.direction && a.duration == b.duration &&
-           a.width == b.width && a.height == b.height;
+           a.width == b.width && a.height == b.height && a.preservedCustomData == b.preservedCustomData;
 }
 bool finite(double value) { return std::isfinite(value); }
 bool integral(const QJsonValue &value) {
@@ -47,9 +47,11 @@ int mirroredDirection(int direction) {
     return direction >= 0 && direction <= 8 ? mirror[direction] : direction;
 }
 QJsonObject objectJson(const BeatObject &object) {
-    return {{"id", object.id}, {"kind", int(object.kind)}, {"beat", object.beat}, {"x", object.x},
+    QJsonObject json{{"id", object.id}, {"kind", int(object.kind)}, {"beat", object.beat}, {"x", object.x},
             {"y", object.y}, {"color", object.color}, {"direction", object.direction},
             {"duration", object.duration}, {"width", object.width}, {"height", object.height}};
+    if (!object.preservedCustomData.isEmpty()) json.insert("preservedCustomData", object.preservedCustomData);
+    return json;
 }
 BeatObject objectFromJson(const QJsonObject &json) {
     BeatObject object;
@@ -63,6 +65,7 @@ BeatObject objectFromJson(const QJsonObject &json) {
     object.duration = json.value("duration").toDouble(1);
     object.width = json.value("width").toInt(1);
     object.height = json.value("height").toInt(5);
+    object.preservedCustomData = json.value("preservedCustomData").toObject();
     return object;
 }
 QString normalizedManifest(const QString &path) {
@@ -109,6 +112,54 @@ QJsonObject recognizedEditorTiming(QJsonObject custom, double baseBpm) {
         if (harmless) custom.remove(key);
     }
     return custom;
+}
+bool staticColorData(const QJsonValue &value, const QString &colorKey) {
+    if (!value.isObject()) return false;
+    const auto custom = value.toObject();
+    if (custom.isEmpty()) return true;
+    if (custom.size() != 1 || !custom.value(colorKey).isArray()) return false;
+    const auto color = custom.value(colorKey).toArray();
+    if (color.size() != 3 && color.size() != 4) return false;
+    for (const auto &component : color)
+        if (!component.isDouble() || !finite(component.toDouble()) ||
+            component.toDouble() < 0.0 || component.toDouble() > 1.0) return false;
+    return true;
+}
+bool safePreservedCustomData(const QJsonObject &fields) {
+    for (auto it = fields.begin(); it != fields.end(); ++it) {
+        if (it.key() == "_customData") {
+            if (!staticColorData(it.value(), "_color")) return false;
+        } else if (it.key() == "customData") {
+            if (!staticColorData(it.value(), "color")) return false;
+        } else return false;
+    }
+    return true;
+}
+bool colorDataForSchema(QJsonObject *fields, bool v3) {
+    if (!safePreservedCustomData(*fields)) return false;
+    const auto oldColor = fields->value("_customData").toObject().value("_color");
+    const auto newColor = fields->value("customData").toObject().value("color");
+    if (!oldColor.isUndefined() && !newColor.isUndefined() && oldColor != newColor) return false;
+    const auto color = oldColor.isUndefined() ? newColor : oldColor;
+    if (color.isUndefined()) { *fields = QJsonObject{}; return true; }
+    *fields = QJsonObject{{v3 ? "customData" : "_customData", QJsonObject{{v3 ? "color" : "_color", color}}}};
+    return true;
+}
+bool modernType10Light(const QJsonObject &event, const QString &version) {
+    // Type 10 meant BPM changes in old v2 schemas. From v2.5 it is a light
+    // lane, while BPM events use type 100 and _floatValue instead.
+    // https://bsmg.wiki/mapping/map-format/lightshow.html#type
+    if ((version != QStringLiteral("2.5.0") && version != QStringLiteral("2.6.0")) ||
+        !integral(event.value("_type")) || !integral(event.value("_value")) ||
+        event.value("_value").toInt() < 0 || event.value("_value").toInt() > 12 ||
+        !event.value("_time").isDouble() || !finite(event.value("_time").toDouble()) ||
+        event.value("_time").toDouble() < 0.0) return false;
+    if (event.contains("_floatValue") && (!event.value("_floatValue").isDouble() ||
+        !finite(event.value("_floatValue").toDouble()) || event.value("_floatValue").toDouble() < 0.0)) return false;
+    for (const auto &key : {QStringLiteral("_customData"), QStringLiteral("customData")})
+        if (event.contains(key) && !event.value(key).isObject()) return false;
+    return timingExtension(event.value("_customData").toObject(), {}).isEmpty() &&
+           timingExtension(event.value("customData").toObject(), {}).isEmpty();
 }
 }
 
@@ -296,10 +347,12 @@ bool BeatmapDocument::Impl::parseTrack(Track *selected, QString *error) {
             if (!event.value(beatKey).isDouble() || !event.value(bpmKey).isDouble())
                 selected->readOnly = QStringLiteral("BPM 事件缺少可解释的数值，难度受保护。" );
             changes.append({event.value(beatKey).toDouble(-1), event.value(bpmKey).toDouble(-1)});
-        } else if (event.value("_type").toInt() == 10 || event.value("_type").toInt() == 14 || event.value("_type").toInt() == 15) {
+        } else if ((event.value("_type").toInt() == 10 && !modernType10Light(event, selected->descriptor.version)) ||
+                   event.value("_type").toInt() == 14 || event.value("_type").toInt() == 15) {
             // Type 14/15 are rotation, not ordinary flat-track editing.
             if (event.value("_type").toInt() == 10)
-                selected->readOnly = QStringLiteral("谱面含旧版 type 10 变速事件，首版无法可靠解释并按原样保护。" );
+                selected->readOnly = QStringLiteral("%1._events 含旧版或无法确认的 type 10 时间/灯光事件，无法可靠换算；另存工程会保留原数据，不会解除保护。")
+                        .arg(selected->descriptor.filename);
             else if (event.value("_type").toInt() == 14 || event.value("_type").toInt() == 15)
                 selected->readOnly = QStringLiteral("谱面含旋转轨道事件，首版按原样保留并禁止基础编辑。" );
         }
@@ -390,8 +443,17 @@ bool BeatmapDocument::Impl::parseTrack(Track *selected, QString *error) {
             if (wall && (!integral(json.value(selected->v3 ? "w" : "_width")) ||
                          (selected->v3 && (!integral(json.value("h")) || !integral(json.value("y"))))))
                 object.protectedReason = QStringLiteral("墙含异常或扩展尺寸。" );
-            if (!json.value("_customData").toObject().isEmpty() || !json.value("customData").toObject().isEmpty())
-                object.protectedReason = QStringLiteral("物件带模组或动画数据，首版保留并保护。" );
+            for (const auto &customKey : {QStringLiteral("_customData"), QStringLiteral("customData")}) {
+                if (!json.contains(customKey)) continue;
+                const auto custom = json.value(customKey);
+                if (staticColorData(custom, customKey.startsWith('_') ? "_color" : "color")) {
+                    if (!custom.toObject().isEmpty()) object.preservedCustomData.insert(customKey, custom);
+                } else {
+                    const QStringList fields = custom.toObject().keys();
+                    object.protectedReason = QStringLiteral("物件的 %1%2 含未支持或类型异常的模组/动画数据，原样保留并保护；另存工程不会解除保护。")
+                            .arg(customKey, fields.isEmpty() ? QString() : "." + fields.join(", "));
+                }
+            }
             if (selected->v3 && object.kind == ObjectKind::Note && json.value("a").toDouble() != 0.0)
                 object.protectedReason = QStringLiteral("音符使用扩展切割角度，首版保护。" );
             if (!wall && selected->endpoints.contains(cell(object.beat, object.x, object.y)))
@@ -420,6 +482,8 @@ bool BeatmapDocument::Impl::validate(const Track &selected, const QVector<BeatOb
             occupied.insert(cell(entry.object.beat, entry.object.x, entry.object.y));
     for (const auto &object : objects) {
         if (object.isProtected()) return fail(error, object.protectedReason);
+        if (!safePreservedCustomData(object.preservedCustomData))
+            return fail(error, QStringLiteral("复制或恢复数据含未支持的物件扩展，操作未执行。"));
         if (!finite(object.beat) || object.beat < 0 || object.beat > 10000000.0 || object.x < 0 || object.x > 3 || object.y < 0 || object.y > 2)
             return fail(error, QStringLiteral("拍数必须非负，位置必须在 4×3 网格内。"));
         if (object.kind == ObjectKind::Note) {
@@ -560,6 +624,9 @@ QJsonObject BeatmapDocument::Impl::merged(const Track &selected) const {
             const auto &o = entry.object;
             const auto &before = entry.original;
             const bool added = entry.index < 0;
+            if (added)
+                for (auto it = o.preservedCustomData.begin(); it != o.preservedCustomData.end(); ++it)
+                    rawObject.insert(it.key(), it.value());
             auto put = [&rawObject, added](const QString &field, double value, double original) {
                 if (added || value != original) rawObject.insert(field, value);
             };
@@ -704,14 +771,19 @@ bool BeatmapDocument::Impl::restoreState(const QJsonObject &state, QString *erro
         QSet<QString> seen;
         for (const auto &value : edits) {
             const auto edit = value.toObject();
+            if (edit.contains("preservedCustomData") && !edit.value("preservedCustomData").isObject())
+                return fail(error, QStringLiteral("恢复数据的物件扩展类型异常。"));
             BeatObject object = objectFromJson(edit);
+            if (!safePreservedCustomData(object.preservedCustomData))
+                return fail(error, QStringLiteral("恢复数据含未支持的物件扩展。"));
             if (seen.contains(object.id)) return fail(error, QStringLiteral("恢复数据有重复物件 ID。"));
             seen.insert(object.id);
             const int index = edit.value("index").toInt(-2);
             if (index >= 0) {
                 const int e = it->byId.value(object.id, -1);
                 if (e < 0 || it->entries[e].array != edit.value("array").toString() || it->entries[e].index != index ||
-                    it->entries[e].object.isProtected() || it->entries[e].object.kind != object.kind)
+                    it->entries[e].object.isProtected() || it->entries[e].object.kind != object.kind ||
+                    it->entries[e].object.preservedCustomData != object.preservedCustomData)
                     return fail(error, QStringLiteral("恢复数据试图修改受保护或不存在的物件。"));
                 replaced.insert(object.id);
             } else if (index != -1 || it->byId.contains(object.id) || object.id.isEmpty())
@@ -915,6 +987,8 @@ bool BeatmapDocument::updateObjects(const QVector<BeatObject> &objects, QString 
         const auto &entry = selected->entries[index];
         if (entry.object.isProtected()) return fail(error, entry.object.protectedReason);
         if (entry.object.kind != object.kind) return fail(error, QStringLiteral("不能通过属性更改物件类型。"));
+        if (entry.object.preservedCustomData != object.preservedCustomData)
+            return fail(error, QStringLiteral("基础属性编辑不能改变原物件的自定义颜色数据。"));
         ids.insert(object.id);
         if (!sameFields(object, entry.object)) changes.append({index, {entry.object, false}, {object, false}});
     }
@@ -970,7 +1044,11 @@ bool BeatmapDocument::pasteObjects(const QVector<BeatObject> &objects, double be
         for (const auto &difficulty : d->tracks) {
             const int source = difficulty.byId.value(object.id, -1);
             if (source >= 0 && difficulty.entries[source].object.isProtected()) return fail(error, difficulty.entries[source].object.protectedReason);
+            if (source >= 0 && difficulty.entries[source].object.preservedCustomData != object.preservedCustomData)
+                return fail(error, QStringLiteral("复制数据与原物件的自定义颜色不一致，操作未执行。"));
         }
+        if (!colorDataForSchema(&object.preservedCustomData, selected->v3))
+            return fail(error, QStringLiteral("复制数据含未支持或冲突的物件扩展，操作未执行。"));
         object.id = newId();
         object.beat += beatOffset;
         if (mirror) {
@@ -1059,7 +1137,11 @@ bool BeatmapDocument::applyGeneratedChart(const QVector<BeatObject> &objects,
             const int source = track.byId.value(object.id, -1);
             if (source >= 0 && track.entries[source].object.isProtected())
                 return fail(error, track.entries[source].object.protectedReason);
+            if (source >= 0 && track.entries[source].object.preservedCustomData != object.preservedCustomData)
+                return fail(error, QStringLiteral("生成数据与原物件的自定义颜色不一致，操作未执行。"));
         }
+        if (!colorDataForSchema(&object.preservedCustomData, selected->v3))
+            return fail(error, QStringLiteral("生成数据含未支持或冲突的物件扩展，操作未执行。"));
         object.id = newId();
         if (object.kind == ObjectKind::Bomb) { object.color = 0; object.direction = 8; }
     }

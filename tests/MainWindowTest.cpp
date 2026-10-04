@@ -13,6 +13,7 @@
 #include "core/AppSettings.h"
 #include "core/AudioService.h"
 #include "core/MtpImportService.h"
+#include "core/MtpDeleteService.h"
 #include "core/ProjectStore.h"
 #include <QtTest>
 #include <QAction>
@@ -23,6 +24,7 @@
 #include <QDesktopServices>
 #include <QDoubleSpinBox>
 #include <QFileDialog>
+#include <QFileSystemModel>
 #include <QFormLayout>
 #include <QIcon>
 #include <QJsonArray>
@@ -48,6 +50,7 @@
 #include <QToolButton>
 #include <QUrl>
 #include <QTreeWidget>
+#include <QTreeView>
 #include <QTreeWidgetItemIterator>
 #include <QTabWidget>
 #include <QMimeData>
@@ -163,6 +166,8 @@ private slots:
     void importDryHands();
     void importHeadsetThroughDialog();
     void unifiedImportAndExportDialogs();
+    void deleteHeadsetSongThroughDialog_data();
+    void deleteHeadsetSongThroughDialog();
     void deviceExportThroughDialog_data();
     void deviceExportThroughDialog();
     void trackFramebufferUsesLoadedObjects();
@@ -850,9 +855,10 @@ void MainWindowTest::unifiedImportAndExportDialogs() {
     dialog.show();
     auto localButton = dialog.findChild<QPushButton *>("importComputerSong");
     auto deviceButton = dialog.findChild<QPushButton *>("importHeadsetSong");
+    auto deleteButton = dialog.findChild<QPushButton *>("deleteHeadsetSong");
     auto tabs = dialog.findChild<QTabWidget *>("songImportTabs");
     auto tree = dialog.findChild<QTreeWidget *>("mtpSongTree");
-    QVERIFY(localButton && deviceButton && tabs && tree);
+    QVERIFY(localButton && deviceButton && deleteButton && tabs && tree);
     dialog.setLocalPath(m_song);
     QVERIFY(localButton->isEnabled());
     dialog.setLocalPath(m_temp.path());
@@ -876,13 +882,14 @@ void MainWindowTest::unifiedImportAndExportDialogs() {
     MtpSongEntry empty = root; empty.gameName = QStringLiteral("光之乐团"); empty.gameId = "lightband";
     dialog.populateSongs({root, song, empty, other});
     QCOMPARE(tree->topLevelItemCount(), 1); QCOMPARE(tree->topLevelItem(0)->childCount(), 2);
-    tree->setCurrentItem(tree->topLevelItem(0)); QVERIFY(!deviceButton->isEnabled());
+    tree->setCurrentItem(tree->topLevelItem(0)); QVERIFY(!deviceButton->isEnabled()); QVERIFY(!deleteButton->isEnabled());
+    tree->setCurrentItem(tree->topLevelItem(0)->child(0)); QVERIFY(!deleteButton->isEnabled());
     QTreeWidgetItem *leaf = nullptr;
     for (QTreeWidgetItemIterator iterator(tree); *iterator; ++iterator)
         if ((*iterator)->data(0, Qt::UserRole).isValid()) { leaf = *iterator; break; }
-    QVERIFY(leaf); tree->setCurrentItem(leaf); QVERIFY(deviceButton->isEnabled());
+    QVERIFY(leaf); tree->setCurrentItem(leaf); QVERIFY(deviceButton->isEnabled()); QVERIFY(deleteButton->isEnabled());
     auto search = dialog.findChild<QLineEdit *>("mtpSongSearch");
-    search->setText(QStringLiteral("不存在的歌曲")); QVERIFY(tree->topLevelItem(0)->isHidden()); QVERIFY(!deviceButton->isEnabled());
+    search->setText(QStringLiteral("不存在的歌曲")); QVERIFY(tree->topLevelItem(0)->isHidden()); QVERIFY(!deviceButton->isEnabled()); QVERIFY(!deleteButton->isEnabled());
     search->setText(QStringLiteral("电子音乐")); QVERIFY(!tree->topLevelItem(0)->isHidden());
     search->clear();
 
@@ -914,7 +921,9 @@ void MainWindowTest::unifiedImportAndExportDialogs() {
         }
     }
     dialog.resize(600, 430); exportDialog.resize(540, 400); QTest::qWait(10);
+    QCOMPARE(dialog.size(), QSize(600, 430));
     QVERIFY(dialog.findChild<QPushButton *>("importHeadsetSong")->isVisible());
+    QVERIFY(deleteButton->isVisible());
     QVERIFY(exportDialog.findChild<QPushButton *>("confirmSongExport")->isVisible());
     exportDialog.close(); dialog.close(); lmsc::ThemeManager::apply(QStringLiteral("dark"));
     SongImportDialog localSelection(&importer);
@@ -922,6 +931,163 @@ void MainWindowTest::unifiedImportAndExportDialogs() {
     localSelection.findChild<QPushButton *>("importComputerSong")->click();
     QCOMPARE(localSelection.result(), int(QDialog::Accepted)); QCOMPARE(localSelection.localPath(), zip);
     QVERIFY(!localSelection.fromDevice());
+}
+
+void MainWindowTest::deleteHeadsetSongThroughDialog_data() {
+    QTest::addColumn<QString>("resultMode");
+    QTest::newRow("cancel-default-confirmation") << QStringLiteral("confirmation-cancel");
+    QTest::newRow("safe-cancel-preparation") << QStringLiteral("prepare-cancel");
+    QTest::newRow("preparation-failure-requires-refresh") << QStringLiteral("prepare-failure");
+    QTest::newRow("verified-deletion-and-refresh") << QStringLiteral("success");
+    QTest::newRow("partial-failure-requires-refresh") << QStringLiteral("delete-failure");
+}
+
+void MainWindowTest::deleteHeadsetSongThroughDialog() {
+    QFETCH(QString, resultMode);
+    const QString captureDirectory = qEnvironmentVariable("LMSC_CAPTURE_DEVICE_DELETE");
+    if (!captureDirectory.isEmpty()) QVERIFY(QDir().mkpath(captureDirectory));
+    const QString work = m_temp.filePath("mtp-delete-ui-" + resultMode);
+    QVERIFY(QDir().mkpath(work));
+    const QString callsPath = QDir(work).filePath("calls.txt");
+    const QString deleteHelper = QDir(work).filePath("mock-delete.ps1");
+    QFile script(deleteHelper); QVERIFY(script.open(QIODevice::WriteOnly));
+    QString body = QStringLiteral(
+        "param([string]$JobPath)\n$ErrorActionPreference='Stop'\n[Console]::OutputEncoding=New-Object Text.UTF8Encoding($false)\n"
+        "$job=[IO.File]::ReadAllText($JobPath)|ConvertFrom-Json\n"
+        "function Send($v){[Console]::WriteLine(($v|ConvertTo-Json -Depth 12 -Compress))}\n"
+        "[IO.File]::AppendAllText((Join-Path $PSScriptRoot 'calls.txt'),$job.mode+[Environment]::NewLine)\n"
+        "if($job.mode -eq 'delete-prepare'){\n");
+    if (resultMode == "prepare-failure")
+        body += QStringLiteral("Send @{type='error';message='模拟歌曲已被替换';deletionStarted=$false};exit 1\n");
+    else if (resultMode == "prepare-cancel")
+        body += QStringLiteral("Send @{type='progress';message='正在只读检查模拟歌曲';percent=0};while(-not [IO.File]::Exists($job.cancelFile)){Start-Sleep -Milliseconds 20};Send @{type='cancelled'};exit 2\n");
+    else
+        body += QStringLiteral("[IO.File]::WriteAllText($job.planFile,'{}');Send @{type='prepared';locator=$job.locator;files=3;bytes=123;planToken=('a'*64)};exit 0\n");
+    body += QStringLiteral("}\nSend @{type='deleting';locator=$job.locator}\nSend @{type='progress';message='正在删除模拟歌曲';percent=0}\nStart-Sleep -Milliseconds 350\n");
+    if (resultMode == "success")
+        body += QStringLiteral("Send @{type='deleted';locator=$job.locator;verified=$true};exit 0\n");
+    else
+        body += QStringLiteral("Send @{type='error';message='模拟删除期间断开连接';deletionStarted=$true};exit 1\n");
+    script.write(QByteArray::fromHex("efbbbf") + body.toUtf8()); script.close();
+
+    const QString importHelper = QDir(work).filePath("mock-list.ps1");
+    QFile listScript(importHelper); QVERIFY(listScript.open(QIODevice::WriteOnly));
+    listScript.write(QByteArray::fromHex("efbbbf") + QStringLiteral(
+        "$ErrorActionPreference='Stop'\n[Console]::OutputEncoding=New-Object Text.UTF8Encoding($false)\n"
+        "[IO.File]::AppendAllText((Join-Path $PSScriptRoot 'calls.txt'),'list'+[Environment]::NewLine)\n"
+        "[Console]::WriteLine((@{type='songs';songs=@(@{name='星穹绿洲';deviceName='PICO Neo 3';storageName='内部共享存储空间';gameId='oasis';gameName='星穹绿洲';isSong=$false;categorySegments=@();location='内部共享存储空间/SoulTopia/BeatNote/Custom';locator=@{device='PICO Neo 3';segments=@('内部共享存储空间','SoulTopia','BeatNote','Custom')}})}|ConvertTo-Json -Depth 12 -Compress))\n").toUtf8());
+    listScript.close();
+    MtpImportService importer; importer.setScriptPath(importHelper);
+    SongImportDialog dialog(&importer); dialog.setLocalPath(m_song);
+    auto deleteService = dialog.deleteService(); deleteService->setHelperPath(deleteHelper);
+    QSignalSpy deleted(deleteService, &MtpDeleteService::songDeleted);
+    QSignalSpy failed(deleteService, &MtpDeleteService::errorOccurred);
+    QSignalSpy cancelled(deleteService, &MtpDeleteService::cancelled);
+    QSignalSpy refreshed(&importer, &MtpImportService::songsListed);
+    MtpSongEntry root; root.isSong = false; root.deviceName = "PICO Neo 3";
+    root.gameId = "oasis"; root.gameName = QStringLiteral("星穹绿洲"); root.storageName = QStringLiteral("内部共享存储空间");
+    MtpSongEntry song = root; song.isSong = true;
+    song.name = QStringLiteral("合成歌曲 <b>| $(abc) %5"); song.categorySegments = QStringList{QStringLiteral("测试分类")};
+    song.location = root.storageName + QStringLiteral("/SoulTopia/BeatNote/Custom/测试分类/") + song.name;
+    song.locator = QString::fromUtf8(QJsonDocument(QJsonObject{{"device", root.deviceName}, {"segments", QJsonArray{
+        root.storageName, "SoulTopia", "BeatNote", "Custom", QStringLiteral("测试分类"), song.name}}}).toJson(QJsonDocument::Compact));
+    dialog.populateSongs({root, song}); dialog.show();
+    auto tabs = dialog.findChild<QTabWidget *>("songImportTabs"); tabs->setCurrentIndex(1);
+    auto tree = dialog.findChild<QTreeWidget *>("mtpSongTree");
+    auto deleteButton = dialog.findChild<QPushButton *>("deleteHeadsetSong");
+    auto importButton = dialog.findChild<QPushButton *>("importHeadsetSong");
+    auto refreshButton = dialog.findChild<QPushButton *>("refreshHeadsetSongs");
+    auto localButton = dialog.findChild<QPushButton *>("importComputerSong");
+    auto cancelButton = dialog.findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Cancel);
+    auto status = dialog.findChild<QLabel *>("mtpImportStatus");
+    QVERIFY(tree && deleteButton && importButton && refreshButton && localButton && cancelButton && status);
+    for (QTreeWidgetItemIterator iterator(tree); *iterator; ++iterator)
+        if ((*iterator)->data(0, Qt::UserRole).isValid()) { tree->setCurrentItem(*iterator); break; }
+    QVERIFY(deleteButton->isEnabled());
+    if (!captureDirectory.isEmpty() && resultMode == "success") {
+        for (const auto &theme : {QStringLiteral("dark"), QStringLiteral("light")}) {
+            lmsc::ThemeManager::apply(theme); dialog.resize(880, 610); QTest::qWait(30);
+            QVERIFY(dialog.grab().save(QDir(captureDirectory).filePath("device-browser-" + theme + ".png")));
+            dialog.resize(600, 430); QTest::qWait(30);
+            QCOMPARE(dialog.size(), QSize(600, 430));
+            QVERIFY(deleteButton->isVisible());
+            QVERIFY(dialog.rect().contains(QRect(deleteButton->mapTo(&dialog, QPoint()), deleteButton->size())));
+            QVERIFY(dialog.grab().save(QDir(captureDirectory).filePath("device-browser-" + theme + "-minimum.png")));
+        }
+        lmsc::ThemeManager::apply(QStringLiteral("dark"));
+    }
+    int phase = 0; bool inspectedConfirmation = false, guardedCommit = false;
+    QTimer driver; driver.setInterval(10);
+    connect(&driver, &QTimer::timeout, &dialog, [&] {
+        if (resultMode == "prepare-cancel" && phase == 0 && QFileInfo::exists(callsPath) && deleteService->isBusy()) {
+            QVERIFY(cancelButton->isEnabled()); phase = 1; dialog.reject(); return;
+        }
+        auto confirmation = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+        if (phase == 0 && confirmation && confirmation->objectName() == QStringLiteral("confirmHeadsetSongDeletion")) {
+            inspectedConfirmation = true; phase = 1;
+            QCOMPARE(confirmation->textFormat(), Qt::PlainText);
+            QVERIFY(confirmation->text().contains(song.name));
+            QVERIFY(confirmation->text().contains(QStringLiteral("此电脑\\") + song.deviceName + QLatin1Char('\\') + QDir::toNativeSeparators(song.location)));
+            QVERIFY(confirmation->text().contains(QStringLiteral("文件：3 个")));
+            QCOMPARE(confirmation->defaultButton(), qobject_cast<QPushButton *>(confirmation->button(QMessageBox::Cancel)));
+            QCOMPARE(confirmation->button(QMessageBox::Cancel)->text(), QStringLiteral("取消"));
+            if (!captureDirectory.isEmpty() && resultMode == "success") {
+                for (const auto &theme : {QStringLiteral("dark"), QStringLiteral("light")}) {
+                    lmsc::ThemeManager::apply(theme); QApplication::processEvents();
+                    QVERIFY(confirmation->grab().save(QDir(captureDirectory).filePath("delete-confirmation-" + theme + ".png")));
+                }
+                lmsc::ThemeManager::apply(QStringLiteral("dark"));
+            }
+            if (resultMode == "confirmation-cancel") QTest::keyClick(confirmation, Qt::Key_Escape);
+            else { phase = 2; confirmation->findChild<QPushButton *>("confirmDeleteHeadsetSong")->click(); }
+        } else if (phase == 2 && deleteService->isBusy()) {
+            QVERIFY(!deleteButton->isEnabled()); QVERIFY(!importButton->isEnabled()); QVERIFY(!refreshButton->isEnabled());
+            QVERIFY(!localButton->isEnabled()); QVERIFY(!cancelButton->isEnabled()); QVERIFY(!tree->isEnabled());
+            dialog.reject(); QVERIFY(dialog.isVisible()); dialog.done(QDialog::Accepted); QVERIFY(dialog.isVisible());
+            dialog.accept(); QVERIFY(dialog.isVisible()); QTest::keyClick(&dialog, Qt::Key_Escape); QVERIFY(dialog.isVisible());
+            QVERIFY(!dialog.close()); QVERIFY(dialog.isVisible());
+            QMimeData mime; mime.setUrls({QUrl::fromLocalFile(m_song)});
+            QDragEnterEvent drag(QPoint(12, 12), Qt::CopyAction, &mime, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(&dialog, &drag); QVERIFY(!drag.isAccepted());
+            QDropEvent drop(QPointF(12, 12), Qt::CopyAction, &mime, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(&dialog, &drop); QVERIFY(!drop.isAccepted()); QCOMPARE(tabs->currentIndex(), 1);
+            const QString zip = QDir(work).filePath("guard.zip");
+            QFile zipFile(zip); QVERIFY(zipFile.open(QIODevice::WriteOnly)); zipFile.write("PK"); zipFile.close();
+            dialog.setLocalPath(zip); QVERIFY(!localButton->isEnabled()); localButton->click(); QVERIFY(dialog.isVisible());
+            auto localTree = dialog.findChild<QTreeView *>("localSongTree");
+            auto files = qobject_cast<QFileSystemModel *>(localTree->model()); QVERIFY(files);
+            QVERIFY(QMetaObject::invokeMethod(localTree, "doubleClicked", Qt::DirectConnection, Q_ARG(QModelIndex, files->index(zip))));
+            QVERIFY(dialog.isVisible()); guardedCommit = true; phase = 3;
+        }
+    });
+    driver.start(); deleteButton->click();
+    if (resultMode == "confirmation-cancel") {
+        QTRY_VERIFY_WITH_TIMEOUT(inspectedConfirmation, 10000);
+        QTRY_VERIFY_WITH_TIMEOUT(!deleteService->isBusy() && deleteButton->isEnabled(), 10000);
+        QCOMPARE(deleted.count(), 0); QCOMPARE(failed.count(), 0); QCOMPARE(refreshed.count(), 0); QVERIFY(dialog.isVisible());
+    } else if (resultMode == "prepare-cancel") {
+        QTRY_COMPARE_WITH_TIMEOUT(cancelled.count(), 1, 10000);
+        QVERIFY(!dialog.isVisible()); QVERIFY(!inspectedConfirmation); QCOMPARE(deleted.count(), 0);
+    } else if (resultMode == "success") {
+        QTRY_COMPARE_WITH_TIMEOUT(deleted.count(), 1, 10000);
+        QTRY_COMPARE_WITH_TIMEOUT(refreshed.count(), 1, 10000);
+        QVERIFY(inspectedConfirmation && guardedCommit); QCOMPARE(failed.count(), 0);
+        QVERIFY(status->text().contains(QStringLiteral("已删除头显歌曲"))); QVERIFY(!deleteButton->isEnabled());
+    } else {
+        QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 10000);
+        QCOMPARE(deleted.count(), 0); QCOMPARE(refreshed.count(), 0); QCOMPARE(tree->topLevelItemCount(), 0);
+        QVERIFY(refreshButton->isEnabled()); QVERIFY(!deleteButton->isEnabled()); QVERIFY(!importButton->isEnabled());
+        QVERIFY(status->text().contains(QStringLiteral("重新刷新")));
+        if (resultMode == "delete-failure") { QVERIFY(inspectedConfirmation && guardedCommit); QVERIFY(status->text().contains(QStringLiteral("可能残留部分内容"))); }
+        else QVERIFY(!inspectedConfirmation);
+    }
+    driver.stop(); QVERIFY(!deleteService->isBusy());
+    QFile calls(callsPath); QVERIFY(calls.open(QIODevice::ReadOnly));
+    const QStringList operations = QString::fromUtf8(calls.readAll()).split(QRegularExpression("[\\r\\n]+"), QString::SkipEmptyParts);
+    QCOMPARE(operations.count(QStringLiteral("delete-prepare")), 1);
+    QCOMPARE(operations.count(QStringLiteral("delete")), (resultMode == "success" || resultMode == "delete-failure") ? 1 : 0);
+    QCOMPARE(operations.count(QStringLiteral("list")), resultMode == "success" ? 1 : 0);
+    dialog.close();
 }
 
 void MainWindowTest::deviceExportThroughDialog_data() {

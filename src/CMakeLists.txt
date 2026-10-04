@@ -48,7 +48,8 @@ add_library(lmsc_core STATIC
         core/CodexAccountClient.cpp core/CodexAccountClient.h
         core/WorkspacePaths.cpp core/WorkspacePaths.h
         core/MtpImportService.cpp core/MtpImportService.h
-        core/MtpExportService.cpp core/MtpExportService.h)
+        core/MtpExportService.cpp core/MtpExportService.h
+        core/MtpDeleteService.cpp core/MtpDeleteService.h)
 target_include_directories(lmsc_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(lmsc_core PUBLIC Qt5::Core Qt5::Multimedia Qt5::Network Qt5::Concurrent)
 if (WIN32)
@@ -272,6 +273,16 @@ if (BUILD_TESTING)
     set_target_properties(mtp_export_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
     add_test(NAME mtp_export_service COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:mtp_export_tests>")
     set_tests_properties(mtp_export_service PROPERTIES TIMEOUT 90 LABELS "mtp"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_executable(mtp_delete_tests "${LMSC_REPOSITORY_DIR}/tests/MtpDeleteTest.cpp")
+    target_link_libraries(mtp_delete_tests PRIVATE lmsc_core)
+    if (TARGET lmsc_wpd_helper)
+        add_dependencies(mtp_delete_tests lmsc_wpd_helper)
+    endif ()
+    set_target_properties(mtp_delete_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_test(NAME mtp_delete_service COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:mtp_delete_tests>"
+            --helper "${LMSC_WPD_HELPER}")
+    set_tests_properties(mtp_delete_service PROPERTIES TIMEOUT 90 LABELS "mtp"
             WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
     add_executable(workspace_paths_tests "${LMSC_REPOSITORY_DIR}/tests/WorkspacePathsTest.cpp")
     target_link_libraries(workspace_paths_tests PRIVATE lmsc_core)

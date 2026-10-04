@@ -21,6 +21,9 @@ struct BeatObject {
     double duration = 1.0;
     int width = 1;
     int height = 5;
+    // Only validated static Chroma colors; copied with an object and persisted in
+    // project edits. Other custom data stays in the protected original JSON.
+    QJsonObject preservedCustomData;
     QString protectedReason;
     bool isProtected() const { return !protectedReason.isEmpty(); }
 };

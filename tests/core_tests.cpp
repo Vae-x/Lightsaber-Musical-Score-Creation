@@ -204,6 +204,218 @@ void editorTimingTests(const QString &root) {
     require(shuffle.loadSong(shuffleFolder, &error) && !shuffle.readOnlyReason().isEmpty() &&
             !shuffle.addObject(BeatObject{}, &error), "legacy shuffle remains protected");
 }
+void modernLightingAndColorTests(const QString &root) {
+    QString error;
+    const QJsonObject note2{{"_time", 1}, {"_lineIndex", 0}, {"_lineLayer", 0}, {"_type", 0}, {"_cutDirection", 1}};
+    for (const QString &version : {QStringLiteral("2.5.0"), QStringLiteral("2.6.0")}) {
+        auto ordinary = note2, endpoint = note2;
+        endpoint.insert("_time", 2); endpoint.insert("_lineIndex", 1);
+        const QJsonArray events{QJsonObject{{"_time", 0}, {"_type", 10}, {"_value", 1}, {"_floatValue", 1},
+                                           {"_customData", QJsonObject{{"_color", QJsonArray{0.3, 0.7, 1.0, 1.0}}}}},
+                                QJsonObject{{"_time", 2}, {"_type", 11}, {"_value", 7}, {"_floatValue", 0.8}},
+                                QJsonObject{{"_time", 4}, {"_type", 100}, {"_value", 0}, {"_floatValue", 60}}};
+        QJsonObject map{{"_version", version}, {"_notes", QJsonArray{ordinary, endpoint}}, {"_obstacles", QJsonArray{}},
+                        {"_events", events}, {"unknown", QJsonObject{{"kept", true}}}};
+        if (version == "2.6.0")
+            map.insert("_sliders", QJsonArray{QJsonObject{{"_headTime", 2}, {"_headLineIndex", 1}, {"_headLineLayer", 0},
+                                                        {"_tailTime", 3}, {"_tailLineIndex", 2}, {"_tailLineLayer", 0}}});
+        const QString folder = QDir(root).filePath("modern-lighting-" + version);
+        song(folder, map);
+        BeatmapDocument document;
+        require(document.loadSong(folder, &error), "modern type 10 load version=" + version + ": " + error);
+        require(document.readOnlyReason().isEmpty(), "modern type 10 is lighting version=" + version +
+                " reason=" + document.readOnlyReason());
+        require(std::abs(document.timeMap().beatToSeconds(8) - 6.0) < 1e-10, "type 100 still applies its BPM; type 10 light does not retime objects");
+        require(!document.objects()[0].isProtected(), "ordinary modern v2 note is editable");
+        if (version == "2.6.0") {
+            require(document.objects()[1].isProtected(), "modern lighting exemption keeps v2 arc endpoint protection");
+            auto forged = document.objects()[1]; forged.protectedReason.clear();
+            require(!document.updateObjects({document.objects()[0], forged}, &error) &&
+                    !document.removeObjects({forged.id}, &error) &&
+                    document.copyObjects({forged.id}, &error).isEmpty() &&
+                    !document.pasteObjects({forged}, 8, 0, false, &error), "protected endpoint cannot bypass batch/copy/paste after modern lighting exemption");
+        }
+        auto edit = document.objects()[0]; edit.direction = 6;
+        require(document.updateObject(edit, &error) && document.undo(), "modern lighting edit/undo");
+        const QString undone = QDir(root).filePath("modern-lighting-undo-" + version);
+        require(document.exportSong(undone, &error), error); compareFolders(folder, undone);
+        require(document.redo(), "modern lighting redo");
+        const QString saved = QDir(root).filePath("modern-lighting-project-" + version + "/project.lmsc");
+        require(document.saveProject(saved, &error), error);
+        BeatmapDocument reopened;
+        require(reopened.loadProject(saved, &error) && reopened.readOnlyReason().isEmpty() &&
+                reopened.objects()[0].direction == 6 && !reopened.objects()[0].isProtected(), "modern lighting project remains editable after save/reopen");
+        const QString output = QDir(root).filePath("modern-lighting-export-" + version);
+        require(reopened.exportSong(output, &error), error);
+        auto expected = map; auto notes = expected.value("_notes").toArray();
+        auto edited = notes[0].toObject(); edited.insert("_cutDirection", 6); notes[0] = edited; expected.insert("_notes", notes);
+        QJsonObject actual;
+        require(ProjectStore::readJson(QDir(output).filePath("Expert.dat"), &actual, &error) && actual == expected,
+                "modern light/BPM/advanced/unknown fields are unchanged while one direction changes");
+        require(hash(QDir(folder).filePath("song.ogg")) == hash(QDir(output).filePath("song.ogg")), "lighting fix keeps audio bytes");
+    }
+    for (const QString &version : {QStringLiteral("2.0.0"), QStringLiteral("2.2.0"), QStringLiteral("2.4.0"),
+                                  QStringLiteral("2.5.0"), QStringLiteral("2.6.0-unknown"), QStringLiteral("2.6"),
+                                  QStringLiteral("2.7.0")}) {
+        const QString folder = QDir(root).filePath("ambiguous-type10-" + version);
+        song(folder, {{"_version", version}, {"_notes", QJsonArray{note2}}, {"_obstacles", QJsonArray{}},
+                      {"_events", QJsonArray{QJsonObject{{"_time", 2}, {"_type", 10}, {"_value", version == "2.5.0" ? 128 : 1}}}}});
+        BeatmapDocument document;
+        require(document.loadSong(folder, &error) && !document.readOnlyReason().isEmpty() &&
+                !document.updateObject(document.objects()[0], &error), "old or non-light type 10 remains protected");
+    }
+    const QVector<QJsonValue> invalidLightValues{QStringLiteral("1"), 1.5, -1, 13};
+    for (int i = 0; i < invalidLightValues.size(); ++i) {
+        const QString folder = QDir(root).filePath("invalid-modern-type10-" + QString::number(i));
+        song(folder, {{"_version", "2.6.0"}, {"_notes", QJsonArray{note2}}, {"_obstacles", QJsonArray{}},
+                      {"_events", QJsonArray{QJsonObject{{"_time", 0}, {"_type", 10}, {"_value", invalidLightValues[i]}}}}});
+        BeatmapDocument document;
+        require(document.loadSong(folder, &error) && !document.readOnlyReason().isEmpty(), "malformed type 10 remains protected");
+    }
+    const QVector<QJsonValue> invalidLightCustom{QJsonArray{QJsonObject{{"_BPM", 180}}},
+                                                QStringLiteral("unknown"), QJsonValue(QJsonValue::Null), true};
+    for (int i = 0; i < invalidLightCustom.size(); ++i) {
+        for (const QString &key : {QStringLiteral("_customData"), QStringLiteral("customData")}) {
+            const QString folder = QDir(root).filePath("invalid-light-container-" + key + QString::number(i));
+            song(folder, {{"_version", "2.6.0"}, {"_notes", QJsonArray{note2}}, {"_obstacles", QJsonArray{}},
+                          {"_events", QJsonArray{QJsonObject{{"_time", 0}, {"_type", 10}, {"_value", 1}, {key, invalidLightCustom[i]}}}}});
+            BeatmapDocument document;
+            require(document.loadSong(folder, &error) && !document.readOnlyReason().isEmpty() &&
+                    !document.updateObject(document.objects()[0], &error), "type 10 with malformed custom container remains protected");
+        }
+    }
+
+    for (const bool v3 : {false, true}) {
+        const QString prefix = v3 ? "static-color-v3" : "static-color-v2";
+        const QString dataKey = v3 ? "customData" : "_customData", colorKey = v3 ? "color" : "_color";
+        const QString noteKey = v3 ? "colorNotes" : "_notes";
+        QJsonObject colored = v3 ? QJsonObject{{"b", 1}, {"x", 0}, {"y", 0}, {"c", 0}, {"d", 1}, {"a", 0}} : note2;
+        const QJsonObject palette{{colorKey, QJsonArray{0.1, 0.6, 1.0, 0.5}}};
+        colored.insert(dataKey, palette);
+        auto animated = colored; animated.insert(v3 ? "b" : "_time", 2);
+        auto animation = palette; animation.insert(v3 ? "track" : "_track", "linked-animation"); animated.insert(dataKey, animation);
+        QJsonObject wall = v3 ? QJsonObject{{"b", 3}, {"x", 2}, {"y", 0}, {"d", 1}, {"w", 1}, {"h", 5}} :
+                                   QJsonObject{{"_time", 3}, {"_lineIndex", 2}, {"_type", 0}, {"_duration", 1}, {"_width", 1}};
+        wall.insert(dataKey, QJsonObject{{colorKey, QJsonArray{0.2, 0.3, 0.9}}});
+        const QString wallKey = v3 ? "obstacles" : "_obstacles";
+        QJsonObject map{{v3 ? "version" : "_version", v3 ? "3.3.0" : "2.6.0"},
+                        {noteKey, QJsonArray{colored, animated}}, {wallKey, QJsonArray{wall}},
+                        {v3 ? "bpmEvents" : "_events", QJsonArray{}}, {"unknown", QJsonArray{1, 2, 3}}};
+        const QString folder = QDir(root).filePath(prefix); song(folder, map);
+        require(ProjectStore::writeJson(QDir(folder).filePath("Hard.dat"), map3(), &error), error);
+        auto metadata = info(); auto sets = metadata.value("_difficultyBeatmapSets").toArray();
+        auto set = sets[0].toObject(); auto charts = set.value("_difficultyBeatmaps").toArray();
+        charts.append(QJsonObject{{"_difficulty", "Hard"}, {"_difficultyRank", 5}, {"_beatmapFilename", "Hard.dat"}});
+        set.insert("_difficultyBeatmaps", charts); sets[0] = set; metadata.insert("_difficultyBeatmapSets", sets);
+        require(ProjectStore::writeJson(QDir(folder).filePath("Info.dat"), metadata, &error), error);
+        BeatmapDocument document;
+        require(document.loadSong(folder, &error) && document.readOnlyReason().isEmpty(), error);
+        const auto baseline = document.objects();
+        require(!baseline[0].isProtected() && baseline[1].isProtected() && !baseline[2].isProtected(), "only valid static RGB(A) is editable; animation remains protected");
+        auto bad = baseline[0]; bad.preservedCustomData.insert(dataKey, animation);
+        require(!document.updateObject(bad, &error) && !document.pasteObjects({bad}, 8, 0, false, &error), "opaque color carry cannot inject tracks through update or paste");
+        bad = baseline[0]; bad.preservedCustomData = {}; bad.direction = 6;
+        require(!document.updateObject(bad, &error), "basic editing cannot erase preserved colors");
+        auto ordinary = baseline[0]; ordinary.direction = 6;
+        auto advanced = baseline[1]; advanced.protectedReason.clear();
+        require(!document.updateObjects({ordinary, advanced}, &error) &&
+                !document.mirrorObjects({ordinary.id, advanced.id}, &error) &&
+                !document.removeObjects({ordinary.id, advanced.id}, &error) &&
+                document.copyObjects({advanced.id}, &error).isEmpty() &&
+                !document.pasteObjects({advanced}, 8, 0, false, &error), "colored object mixed batches never bypass animation protection");
+        require(document.updateObject(ordinary, &error) && document.undo(), error);
+        const QString undone = QDir(root).filePath(prefix + "-undo");
+        require(document.exportSong(undone, &error), error); compareFolders(folder, undone);
+        require(document.redo() && document.mirrorObjects({ordinary.id}, &error) && document.undo(), "color data survives redo and mirror/undo");
+        auto wallEdit = document.objects()[2]; wallEdit.duration = 1.25;
+        require(document.updateObject(wallEdit, &error), "colored wall edit");
+        const auto copied = document.copyObjects({ordinary.id}, &error);
+        require(copied.size() == 1 && copied[0].preservedCustomData == ordinary.preservedCustomData &&
+                document.pasteObjects(copied, 8, 0, false, &error), "copy/paste retains static color fields");
+        require(document.removeObjects({wallEdit.id}, &error) && document.undo(), "colored wall delete/undo");
+        const QString saved = QDir(root).filePath(prefix + "-project/project.lmsc");
+        require(document.saveProject(saved, &error), error);
+        BeatmapDocument reopened;
+        require(reopened.loadProject(saved, &error) && reopened.readOnlyReason().isEmpty() &&
+                reopened.objects().size() == 4 && !reopened.objects()[0].isProtected(), "static color edits and pasted colors survive project reopen");
+        const QString output = QDir(root).filePath(prefix + "-export"); require(reopened.exportSong(output, &error), error);
+        QJsonObject actual; require(ProjectStore::readJson(QDir(output).filePath("Expert.dat"), &actual, &error), error);
+        auto expected = map; auto notes = expected.value(noteKey).toArray();
+        auto edited = notes[0].toObject(); edited.insert(v3 ? "d" : "_cutDirection", 6); notes[0] = edited;
+        auto pasted = edited; pasted.insert(v3 ? "b" : "_time", 9);
+        if (!v3) pasted.remove("unknown");
+        notes.append(pasted); expected.insert(noteKey, notes);
+        auto walls = expected.value(wallKey).toArray(); auto editedWall = walls[0].toObject();
+        editedWall.insert(v3 ? "d" : "_duration", 1.25); walls[0] = editedWall; expected.insert(wallKey, walls);
+        require(actual == expected, "basic color edit/paste changes only intended basic fields and preserves original colors and animation JSON");
+        for (const QString &file : {QStringLiteral("song.ogg"), QStringLiteral("Hard.dat"), QStringLiteral("Info.dat")})
+            require(hash(QDir(folder).filePath(file)) == hash(QDir(output).filePath(file)), "colors preserve audio, other difficulty and metadata bytes");
+        require(reopened.setDifficulty(reopened.difficulties()[1].id, &error), error);
+        const auto crossCopy = copied;
+        require(reopened.pasteObjects(crossCopy, 16, 0, false, &error), "static palette copies between v2/v3 tracks");
+        const QString crossOutput = QDir(root).filePath(prefix + "-cross-export"); require(reopened.exportSong(crossOutput, &error), error);
+        QJsonObject cross; require(ProjectStore::readJson(QDir(crossOutput).filePath("Hard.dat"), &cross, &error), error);
+        const auto crossNote = cross.value("colorNotes").toArray().last().toObject();
+        require(crossNote.value("customData").toObject().value("color") == palette.value(colorKey) &&
+                !crossNote.contains("_customData"), "cross-schema palette uses target schema without losing color");
+
+        QJsonObject manifest; require(ProjectStore::readJson(saved, &manifest, &error), error);
+        const auto unmodifiedManifest = manifest;
+        auto difficulties = manifest.value("difficulties").toArray(); auto chart = difficulties[0].toObject();
+        auto edits = chart.value("edits").toArray();
+        bool forgedAddition = false;
+        for (int i = 0; i < edits.size(); ++i) {
+            auto edit = edits[i].toObject(); if (edit.value("index").toInt() != -1) continue;
+            edit.insert("preservedCustomData", QJsonObject{{dataKey, animation}}); edits[i] = edit; forgedAddition = true; break;
+        }
+        require(forgedAddition, "forged project has pasted object fixture");
+        chart.insert("edits", edits); difficulties[0] = chart; manifest.insert("difficulties", difficulties);
+        require(ProjectStore::writeJson(saved, manifest, &error), error);
+        BeatmapDocument forgedProject;
+        require(!forgedProject.loadProject(saved, &error), "project load cannot inject animation through preserved colors");
+        manifest = unmodifiedManifest; difficulties = manifest.value("difficulties").toArray();
+        chart = difficulties[0].toObject(); edits = chart.value("edits").toArray();
+        bool changedOriginalColor = false;
+        for (int i = 0; i < edits.size(); ++i) {
+            auto edit = edits[i].toObject(); if (edit.value("index").toInt() != 0 || edit.value("array").toString() != noteKey) continue;
+            edit.insert("preservedCustomData", QJsonObject{{dataKey, QJsonObject{{colorKey, QJsonArray{1.0, 0.0, 0.0}}}}});
+            edits[i] = edit; changedOriginalColor = true; break;
+        }
+        require(changedOriginalColor, "forged existing-color edit fixture");
+        chart.insert("edits", edits); difficulties[0] = chart; manifest.insert("difficulties", difficulties);
+        require(ProjectStore::writeJson(saved, manifest, &error) && !forgedProject.loadProject(saved, &error),
+                "project restore cannot replace original static colors through forged edit records");
+    }
+    const QVector<QJsonValue> invalidColors{QStringLiteral("pointReference"), QJsonArray{1, 0}, QJsonArray{1, 0, 0, 1, 0},
+                                          QJsonArray{1, QStringLiteral("0"), 0}, QJsonArray{1, 0, QJsonValue(QJsonValue::Null)},
+                                          QJsonArray{1, 0, -1}, QJsonArray{1, 0, 2}};
+    for (int i = 0; i < invalidColors.size(); ++i) {
+        auto note = note2; note.insert("_customData", QJsonObject{{"_color", invalidColors[i]}});
+        const QString folder = QDir(root).filePath("invalid-static-color-" + QString::number(i));
+        song(folder, {{"_version", "2.6.0"}, {"_notes", QJsonArray{note}}, {"_obstacles", QJsonArray{}}, {"_events", QJsonArray{}}});
+        BeatmapDocument document;
+        require(document.loadSong(folder, &error) && document.objects()[0].isProtected() &&
+                !document.updateObject(document.objects()[0], &error), "malformed, animated or out-of-range color remains protected");
+    }
+    const QVector<QJsonValue> unsupportedCustom{
+        QJsonValue(QJsonValue::Null), QJsonArray{}, QStringLiteral("unknown"), true,
+        QJsonObject{{"_color", QJsonArray{1, 0, 0}}, {"_animation", QJsonObject{}}},
+        QJsonObject{{"_color", QJsonArray{1, 0, 0}}, {"_position", QJsonArray{0, 0}}},
+        QJsonObject{{"_color", QJsonArray{1, 0, 0}}, {"_interactable", false}}};
+    for (int i = 0; i < unsupportedCustom.size(); ++i) {
+        auto note = note2; note.insert("_customData", unsupportedCustom[i]);
+        const QString folder = QDir(root).filePath("unsupported-object-custom-" + QString::number(i));
+        song(folder, {{"_version", "2.6.0"}, {"_notes", QJsonArray{note}}, {"_obstacles", QJsonArray{}}, {"_events", QJsonArray{}}});
+        BeatmapDocument document;
+        require(document.loadSong(folder, &error) && document.objects()[0].isProtected(), "malformed custom container and color with advanced fields remain protected");
+        const QString saved = QDir(root).filePath("unsupported-object-project-" + QString::number(i));
+        require(document.saveProject(saved, &error), error);
+        BeatmapDocument reopened;
+        require(reopened.loadProject(saved, &error) && reopened.objects()[0].isProtected(), "save/reopen retains custom data protection");
+        const QString output = QDir(root).filePath("unsupported-object-export-" + QString::number(i));
+        require(reopened.exportSong(output, &error), error); compareFolders(folder, output);
+    }
+}
 void unitTests(const QString &root) {
     TimeMap time;
     QString error;
@@ -295,6 +507,7 @@ void unitTests(const QString &root) {
     require(unknown.loadSong(unknownTiming, &error) && !unknown.readOnlyReason().isEmpty(), "unknown time protection");
     require(!unknown.addObject(BeatObject{}, &error), "unknown timing cannot edit");
     editorTimingTests(root);
+    modernLightingAndColorTests(root);
 
     BeatmapDocument fresh;
     require(fresh.createNew(QDir(original).filePath("song.ogg"), "New song", 135, 0.4, {}, &error), error);
@@ -527,7 +740,8 @@ void existingProjectRegression(const QString &manifestPath, const QString &root)
         BeatmapDocument document;
         require(document.loadProject(copiedManifest, &error) && document.setDifficulty(difficulty.id, &error), error);
         require(document.readOnlyReason().isEmpty(), "local difficulty remains locked: " + document.readOnlyReason());
-        require(difficulty.version.startsWith("3."), "local regression requires v3 chart");
+        require(difficulty.version.startsWith("2.") || difficulty.version.startsWith("3."), "local regression requires v2/v3 chart");
+        const bool v3 = difficulty.version.startsWith("3.");
         BeatObject edit;
         bool found = false;
         for (const auto &object : document.objects()) if (object.kind == ObjectKind::Note && !object.isProtected()) {
@@ -540,6 +754,18 @@ void existingProjectRegression(const QString &manifestPath, const QString &root)
         require(document.exportSong(undone, &error), error);
         compareFolders(originalAssets, undone);
         require(document.redo(), "local basic edit redo");
+        BeatObject coloredEdit;
+        bool coloredFound = false;
+        for (const auto &object : document.objects())
+            if (!object.isProtected() && !object.preservedCustomData.isEmpty() && object.id != edit.id) {
+                coloredEdit = object; coloredFound = true; break;
+            }
+        if (coloredFound) {
+            if (coloredEdit.kind == ObjectKind::Wall) coloredEdit.duration += 0.125;
+            else if (coloredEdit.kind == ObjectKind::Note) coloredEdit.direction = (coloredEdit.direction + 1) % 9;
+            else coloredEdit.beat += 0.125;
+            require(document.updateObject(coloredEdit, &error), "local static-color object is editable: " + error);
+        }
         const QString savedPath = QDir(root).filePath("existing-saved-" + QString::number(index) + "/project.lmsc");
         require(document.saveProject(savedPath, &error), error);
         BeatmapDocument reopened;
@@ -548,6 +774,15 @@ void existingProjectRegression(const QString &manifestPath, const QString &root)
         for (const auto &object : reopened.objects())
             if (object.id == edit.id && object.direction == edit.direction) restored = true;
         require(restored, "local project saved basic edit survives reopen");
+        if (coloredFound) {
+            bool colorRestored = false;
+            for (const auto &object : reopened.objects())
+                if (object.id == coloredEdit.id && !object.isProtected() &&
+                    object.preservedCustomData == coloredEdit.preservedCustomData &&
+                    object.duration == coloredEdit.duration && object.direction == coloredEdit.direction &&
+                    object.beat == coloredEdit.beat) colorRestored = true;
+            require(colorRestored, "local project retains editable color object and original color after reopen");
+        }
         const QString output = QDir(root).filePath("existing-edited-" + QString::number(index));
         require(reopened.exportSong(output, &error), error);
         for (const auto &relative : ProjectStore::files(originalAssets)) if (relative != difficulty.filename)
@@ -556,19 +791,24 @@ void existingProjectRegression(const QString &manifestPath, const QString &root)
         QJsonObject oldMap, newMap;
         require(ProjectStore::readJson(QDir(originalAssets).filePath(difficulty.filename), &oldMap, &error) &&
                 ProjectStore::readJson(QDir(output).filePath(difficulty.filename), &newMap, &error), error);
-        const auto oldNotes = oldMap.value("colorNotes").toArray(), newNotes = newMap.value("colorNotes").toArray();
-        require(oldNotes.size() == newNotes.size(), "local edit note count unchanged");
-        int changed = 0;
-        for (int i = 0; i < oldNotes.size(); ++i) if (oldNotes[i] != newNotes[i]) {
-            ++changed;
-            auto a = oldNotes[i].toObject(), b = newNotes[i].toObject(); a.remove("d"); b.remove("d");
-            require(a == b, "local edit changed more than one direction field");
-        }
-        require(changed == 1, "local edit changes exactly one basic note");
-        oldMap.remove("colorNotes"); newMap.remove("colorNotes");
-        require(oldMap == newMap, "local edit altered custom timing, unknown JSON or advanced arrays");
+        auto expected = oldMap;
+        const auto replaceBasicField = [&expected](const BeatObject &object, const QString &field, double value) {
+            const auto parts = object.id.split(':');
+            require(parts.size() == 3, "local color-object identifier");
+            const QString array = parts[1]; const int row = parts[2].toInt();
+            auto rows = expected.value(array).toArray(); auto rawObject = rows[row].toObject();
+            rawObject.insert(field, value); rows[row] = rawObject; expected.insert(array, rows);
+        };
+        replaceBasicField(edit, v3 ? "d" : "_cutDirection", edit.direction);
+        if (coloredFound)
+            replaceBasicField(coloredEdit, coloredEdit.kind == ObjectKind::Wall ? (v3 ? "d" : "_duration") :
+                              coloredEdit.kind == ObjectKind::Note ? (v3 ? "d" : "_cutDirection") : (v3 ? "b" : "_time"),
+                              coloredEdit.kind == ObjectKind::Wall ? coloredEdit.duration :
+                              coloredEdit.kind == ObjectKind::Note ? coloredEdit.direction : coloredEdit.beat);
+        require(expected == newMap, "local edit changes only chosen basic fields; colors, timing, unknown JSON and advanced arrays stay identical");
         QTextStream(stdout) << "PASS local chart " << difficulty.filename
-                            << ": editable, undo byte-identical, redo/save/reopen/export, only one direction changed\n";
+                            << ": editable, undo byte-identical, redo/save/reopen/export, only chosen basic fields changed; static-color edit "
+                            << (coloredFound ? "verified" : "not present") << "\n";
     }
     require(ProjectStore::files(original) == sourceFiles, "local source project file set unchanged");
     for (const auto &relative : sourceFiles) {

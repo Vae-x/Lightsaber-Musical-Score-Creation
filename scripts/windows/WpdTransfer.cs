@@ -1,4 +1,4 @@
-// GPL-3.0-or-later. 仅新增软件自身分类中的歌曲，不含删除、覆盖或修改已有对象的入口。
+// GPL-3.0-or-later. 导出只新增自身分类中的歌曲；删除需独立预备清单和逐首确认。
 // COM GUID、PROPERTYKEY 与方法顺序依据 Microsoft win32metadata 的
 // PortableDeviceApi.h / PortableDeviceTypes.h / PortableDevice.h。
 // https://learn.microsoft.com/windows/win32/api/portabledeviceapi/nf-portabledeviceapi-iportabledevicecontent-createobjectwithpropertiesanddata
@@ -47,6 +47,13 @@ namespace Lmsc.Wpd {
         void Transfer(out IResources resources);
         void CreateObjectWithPropertiesOnly(IValues values, out IntPtr objectId);
         void CreateObjectWithPropertiesAndData(IValues values, out IStream stream, ref uint bufferSize, out IntPtr cookie);
+        [PreserveSig] int Delete(uint options, IVariants objectIds, ref IVariants results);
+    }
+    [ComImport, Guid("89b2e422-4f1b-4316-bcef-a44afea83eb3"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IVariants {
+        void GetCount(out uint count); void GetAt(uint index, out PropVariant value);
+        void Add(ref PropVariant value); void GetType(out ushort type); void ChangeType(ushort type);
+        void Clear(); void RemoveAt(uint index);
     }
     [ComImport, Guid("10ece955-cf41-4728-bfa0-41eedf1bbf19"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     internal interface IObjectIds {
@@ -107,13 +114,20 @@ namespace Lmsc.Wpd {
             ClientName = new PropertyKey(Clients, 2), Access = new PropertyKey(Clients, 9);
         public static Guid Folder = new Guid("27E2E392-A111-48E0-AB0C-E17705A05F85"),
             GenericFile = new Guid("0085E0A6-8D34-45D7-BC5C-447E59C73D48"),
+            Audio = new Guid("4AD2C85E-5E2D-45E5-8864-4F229E3C6CF0"),
+            Image = new Guid("EF2107D5-A52A-4243-A26B-62D4176D7603"),
+            Document = new Guid("680ADF52-950A-4041-9B41-65E393648155"),
+            Video = new Guid("9261B03C-3D78-4519-85E3-02C5E1F50BB9"),
             Storage = new Guid("23F05BBC-15DE-4C2A-A55B-A9AF5CE412EF"),
             FolderFormat = new Guid("30010000-AE6C-4804-98BA-C57B46965FE7"),
             FileFormat = new Guid("30000000-AE6C-4804-98BA-C57B46965FE7");
     }
     internal sealed class DeviceObject {
+        public DeviceObject() { }
         public string Id, Persistent, Name, Parent; public Guid Type, Category;
+        public ulong Size;
         public bool IsFolder { get { return Type == Keys.Folder; } }
+        public bool IsFile { get { return Type == Keys.GenericFile || Type == Keys.Audio || Type == Keys.Image || Type == Keys.Document || Type == Keys.Video; } }
     }
     internal sealed class DeviceSession : IDisposable {
         IDevice device; IContent content; IProperties properties; IResources resources;
@@ -142,6 +156,8 @@ namespace Lmsc.Wpd {
                     Name = StringValue(values, ref Keys.FileName), Parent = StringValue(values, ref Keys.Parent) };
                 if (item.Name.Length == 0) item.Name = StringValue(values, ref Keys.Name);
                 values.GetGuidValue(ref Keys.Type, out item.Type); values.GetGuidValue(ref Keys.Category, out item.Category);
+                if (item.IsFile && values.GetUnsignedLargeIntegerValue(ref Keys.Size, out item.Size) < 0)
+                    item.Size = UInt64.MaxValue;
                 return item;
             } finally { Release(values); }
         }
@@ -246,15 +262,60 @@ namespace Lmsc.Wpd {
             } finally { Marshal.FreeCoTaskMem(read); Release(stream); }
         }
         public static string Hex(byte[] hash) { return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant(); }
+        public string InfoHash(string id) {
+            check(); IStream stream; uint optimal = 0; resources.GetStream(id, ref Keys.Resource, 0, ref optimal, out stream);
+            IntPtr read = Marshal.AllocCoTaskMem(4);
+            try {
+                using (var data = new MemoryStream()) {
+                    byte[] buffer = new byte[65536];
+                    while (true) {
+                        check(); Marshal.WriteInt32(read, 0); stream.Read(buffer, buffer.Length, read);
+                        int count = Marshal.ReadInt32(read); if (count < 0 || count > buffer.Length) throw new IOException("Info.dat 回读大小无效。");
+                        if (count == 0) break; data.Write(buffer, 0, count);
+                        if (data.Length > 16 * 1024 * 1024) throw new IOException("Info.dat 超过安全核对限制。");
+                    }
+                    byte[] bytes = data.ToArray();
+                    // 无效 Info 不能证明这是歌曲目录，拒绝删除。
+                    string text = new UTF8Encoding(false, true).GetString(bytes).TrimStart('\ufeff');
+                    Program.ValidateInfo(text);
+                    using (SHA256 hash = SHA256.Create()) return Hex(hash.ComputeHash(bytes));
+                }
+            } finally { Marshal.FreeCoTaskMem(read); Release(stream); }
+        }
+        public void DeleteSingle(string id) {
+            check(); IVariants ids = (IVariants)Activator.CreateInstance(Type.GetTypeFromCLSID(new Guid("08a99e2f-6d6d-4b80-af5a-baf2bcbe4cb9")));
+            IVariants results = null; var value = new PropVariant { vt = 31, pointer = Marshal.StringToCoTaskMemUni(id) };
+            try {
+                ids.Add(ref value);
+                // 不使用递归删除：新出现的子对象不能被未经核对地一起删除。
+                int hr = content.Delete(0, ids, ref results);
+                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+                if (hr != 0) throw new IOException("设备未完整删除所选对象，请刷新检查。");
+                if (results != null) {
+                    uint count; results.GetCount(out count);
+                    if (count != 1) throw new IOException("设备删除结果数量不匹配。");
+                    PropVariant result; results.GetAt(0, out result);
+                    if (result.vt != 10 || unchecked((int)result.unsignedValue) != 0) throw new IOException("设备返回对象删除失败。");
+                }
+            } finally { Marshal.FreeCoTaskMem(value.pointer); Release(results); Release(ids); }
+        }
         public void Dispose() {
             Release(resources); resources = null; Release(properties); properties = null; Release(content); content = null;
             if (device != null) { try { device.Close(); } catch { } Release(device); device = null; }
         }
     }
     internal sealed class FileEntry { public string Path, Sha256; public long Size; public FileStream Stream; }
+    internal sealed class DeleteSnapshot {
+        public DeleteSnapshot() { }
+        public string DeviceId, DeviceName, GameId, InfoId, InfoSha256;
+        public string[] Segments;
+        public List<DeviceObject> Chain = new List<DeviceObject>(), Objects = new List<DeviceObject>();
+        public int Files; public long Bytes;
+    }
     internal static class Program {
         static readonly JavaScriptSerializer Json = new JavaScriptSerializer { MaxJsonLength = 16 * 1024 * 1024, RecursionLimit = 64 };
-        static string cancelFile, location = "";
+        static string cancelFile, location = "", jobDirectory = "";
+        static bool deletionStarted;
         static readonly Dictionary<string, string[]> Games = new Dictionary<string, string[]> {
             { "oasis", new[] { "SoulTopia", "BeatNote", "Custom" } },
             { "lightband", new[] { "Android", "data", "com.StarRiverVR.LightBand", "files", "CustomMusic" } }
@@ -430,6 +491,220 @@ namespace Lmsc.Wpd {
                 }
             } finally { foreach (var entry in entries) entry.Stream.Dispose(); }
         }
+        internal static void ValidateInfo(string text) {
+            var parsed = Object(Json.DeserializeObject(text));
+            // 删除只需要确认 Info 是歌曲入口；不修改或转换任何引用。
+            bool audio = !String.IsNullOrEmpty(Text(parsed, "_songFilename")) || !String.IsNullOrEmpty(Text(parsed, "songFilename"));
+            object audioValue, charts;
+            if (!audio && parsed.TryGetValue("audio", out audioValue) && audioValue is IDictionary<string, object>)
+                audio = !String.IsNullOrEmpty(Text((IDictionary<string, object>)audioValue, "songFilename"));
+            bool beatmaps = (parsed.TryGetValue("_difficultyBeatmapSets", out charts) || parsed.TryGetValue("difficultyBeatmaps", out charts))
+                && charts is IEnumerable && !(charts is string) && !(charts is IDictionary);
+            if (!audio || !beatmaps)
+                throw new IOException("Info.dat 未声明歌曲音频或谱面，不能据此删除目录。");
+        }
+        static bool RemoteName(string name) {
+            return !String.IsNullOrWhiteSpace(name) && name != "." && name != ".."
+                && name.All(character => character != '/' && character != '\\' && !Char.IsControl(character));
+        }
+        static string[] DeleteSegments(IDictionary<string, object> job) {
+            var locator = Object(job["locator"]); object parts;
+            if (!RemoteName(Text(locator, "device")) || !locator.TryGetValue("segments", out parts)
+                || !(parts is IEnumerable) || parts is string) throw new IOException("所选歌曲定位无效。");
+            var segments = ((IEnumerable)parts).Cast<object>().Select(value => value as string).ToArray();
+            string game = Text(job, "gameId");
+            if (!Games.ContainsKey(game) || segments.Length < Games[game].Length + 2 || segments.Length > Games[game].Length + 21
+                || segments.Any(part => !RemoteName(part)) || !segments.Skip(1).Take(Games[game].Length).SequenceEqual(Games[game])
+                || segments.Last() != Text(job, "name")) throw new IOException("只能删除受支持游戏目录内的单首歌曲，不能删除游戏根或分类。");
+            return segments;
+        }
+        static void ValidateChildren(string parent, List<DeviceObject> children) {
+            if (children.Count > 10000) throw new IOException("设备单层对象超过 10000 个。");
+            var ids = new HashSet<string>(StringComparer.Ordinal); var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var item in children) {
+                if (String.IsNullOrEmpty(item.Id) || item.Parent != parent || !RemoteName(item.Name)
+                    || !ids.Add(item.Id) || !names.Add(item.Name)) throw new IOException("设备目录定位不一致、名称无效或含重复对象，请刷新。");
+            }
+        }
+        static DeviceObject ExactChild(Func<string, List<DeviceObject>> children, string parent, string name) {
+            var items = children(parent); ValidateChildren(parent, items);
+            var match = items.SingleOrDefault(item => String.Equals(item.Name, name, StringComparison.Ordinal));
+            if (match == null) throw new IOException("原歌曲路径已变化或目录缺失，请重新刷新。");
+            return match;
+        }
+        static void Identity(DeviceObject item) {
+            if (String.IsNullOrEmpty(item.Persistent) || String.IsNullOrEmpty(item.Id) || String.IsNullOrEmpty(item.Parent))
+                throw new IOException("设备对象未提供稳定定位信息，无法安全删除。");
+        }
+        static DeviceObject CopyObject(DeviceObject item) {
+            return new DeviceObject { Id = item.Id, Persistent = item.Persistent, Parent = item.Parent, Name = item.Name,
+                Type = item.Type, Category = item.Category, Size = item.Size };
+        }
+        static DeleteSnapshot Snapshot(IDictionary<string, object> job, string deviceId, string deviceName,
+            Func<string, List<DeviceObject>> children, Func<string, string> infoHash) {
+            string[] segments = DeleteSegments(job); var locator = Object(job["locator"]);
+            if (deviceName != Text(locator, "device")) throw new IOException("连接设备名称与所选歌曲不一致。");
+            var result = new DeleteSnapshot { DeviceId = deviceId, DeviceName = deviceName, GameId = Text(job, "gameId"), Segments = segments };
+            DeviceObject current = ExactChild(children, "DEVICE", segments[0]);
+            if (current.Category != Keys.Storage) throw new IOException("所选路径不是设备存储根。");
+            Identity(current); result.Chain.Add(CopyObject(current));
+            int rootEnd = Games[result.GameId].Length;
+            for (int index = 1; index < segments.Length; ++index) {
+                if (index > rootEnd) {
+                    var ancestorChildren = children(current.Id); ValidateChildren(current.Id, ancestorChildren);
+                    if (ancestorChildren.Any(item => item.Name.Equals("Info.dat", StringComparison.OrdinalIgnoreCase)))
+                        throw new IOException("所选路径位于另一首歌曲内部，拒绝删除嵌套目录。");
+                }
+                current = ExactChild(children, current.Id, segments[index]); Identity(current);
+                if (!current.IsFolder || current.Category == Keys.Storage) throw new IOException("歌曲路径包含非目录或存储对象。");
+                result.Chain.Add(CopyObject(current));
+            }
+            var visited = new HashSet<string>(result.Chain.Select(item => item.Id), StringComparer.Ordinal);
+            Action<DeviceObject, int> walk = null;
+            walk = delegate(DeviceObject folder, int depth) {
+                Check(); if (depth > 20) throw new IOException("歌曲资源子目录超过 20 层，未开始删除。");
+                var items = children(folder.Id); ValidateChildren(folder.Id, items);
+                var infos = items.Where(item => item.Name.Equals("Info.dat", StringComparison.OrdinalIgnoreCase)).ToList();
+                if (depth == 0) {
+                    if (infos.Count != 1 || !infos[0].IsFile) throw new IOException("所选目录缺少唯一 Info.dat，不能当作歌曲删除。");
+                    result.InfoId = infos[0].Id;
+                } else if (infos.Count != 0) throw new IOException("歌曲目录内包含另一首歌曲入口，拒绝一次删除多首歌曲。");
+                foreach (var item in items.OrderBy(value => value.Name, StringComparer.Ordinal)) {
+                    Identity(item);
+                    if (!visited.Add(item.Id) || item.Category == Keys.Storage || (!item.IsFolder && !item.IsFile))
+                        throw new IOException("歌曲资源含未知、重复或非普通内容对象，未开始删除。");
+                    if (result.Objects.Count >= 10000) throw new IOException("歌曲资源超过 10000 个对象，未开始删除。");
+                    result.Objects.Add(CopyObject(item));
+                    if (item.IsFolder) walk(item, depth + 1);
+                    else {
+                        if (item.Size > 8UL * 1024 * 1024 * 1024 || (ulong)result.Bytes + item.Size > 8UL * 1024 * 1024 * 1024)
+                            throw new IOException("歌曲资源大小未知或超过 8 GiB，未开始删除。");
+                        result.Files++; result.Bytes += (long)item.Size;
+                    }
+                }
+            };
+            walk(current, 0); result.InfoSha256 = infoHash(result.InfoId);
+            return result;
+        }
+        static bool SameObject(DeviceObject first, DeviceObject second) {
+            return first.Id == second.Id && first.Persistent == second.Persistent && first.Parent == second.Parent
+                && first.Name == second.Name && first.Type == second.Type && first.Category == second.Category && first.Size == second.Size;
+        }
+        static void SameSnapshot(DeleteSnapshot expected, DeleteSnapshot actual) {
+            if (expected.DeviceId != actual.DeviceId || expected.DeviceName != actual.DeviceName || expected.GameId != actual.GameId
+                || !expected.Segments.SequenceEqual(actual.Segments) || expected.InfoId != actual.InfoId || expected.InfoSha256 != actual.InfoSha256
+                || expected.Files != actual.Files || expected.Bytes != actual.Bytes || expected.Chain.Count != actual.Chain.Count
+                || expected.Objects.Count != actual.Objects.Count) throw new IOException("确认后的设备歌曲已变化，未继续删除，请重新刷新并确认。");
+            for (int index = 0; index < expected.Chain.Count; ++index)
+                if (!SameObject(expected.Chain[index], actual.Chain[index])) throw new IOException("确认后的歌曲路径对象已变化，未继续删除。");
+            for (int index = 0; index < expected.Objects.Count; ++index)
+                if (!SameObject(expected.Objects[index], actual.Objects[index])) throw new IOException("确认后的歌曲资源已变化，未继续删除。");
+        }
+        static string PlanPath(IDictionary<string, object> job) {
+            string path = Path.GetFullPath(Text(job, "planFile"));
+            if (!String.Equals(Path.GetDirectoryName(path), jobDirectory, StringComparison.OrdinalIgnoreCase)
+                || Path.GetFileName(path) != "plan.json") throw new IOException("歌曲预备清单必须位于独立任务目录。");
+            NoLinks(jobDirectory); return path;
+        }
+        static string WritePlan(IDictionary<string, object> job, DeleteSnapshot plan) {
+            byte[] bytes = Encoding.UTF8.GetBytes(Json.Serialize(plan));
+            using (var file = new FileStream(PlanPath(job), FileMode.CreateNew, FileAccess.Write, FileShare.Read)) file.Write(bytes, 0, bytes.Length);
+            string token; using (SHA256 hash = SHA256.Create()) token = DeviceSession.Hex(hash.ComputeHash(bytes));
+            Record(new { type = "prepared", locator = Object(job["locator"]), files = plan.Files, bytes = plan.Bytes, planToken = token });
+            return token;
+        }
+        static DeleteSnapshot ReadPlan(IDictionary<string, object> job) {
+            string path = PlanPath(job); var file = new FileInfo(path);
+            if (!file.Exists || file.Length > 16 * 1024 * 1024 || (file.Attributes & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("原歌曲预备清单缺失或无效。");
+            byte[] bytes = File.ReadAllBytes(path);
+            using (SHA256 hash = SHA256.Create()) if (DeviceSession.Hex(hash.ComputeHash(bytes)) != Text(job, "planToken"))
+                throw new IOException("歌曲预备清单已变化，请重新核对并确认。");
+            return Json.Deserialize<DeleteSnapshot>(Encoding.UTF8.GetString(bytes));
+        }
+        static void ApplyDeletion(DeleteSnapshot plan, Func<string, List<DeviceObject>> children,
+            Func<string, DeviceObject> get, Action<string> delete, Func<string, string> infoHash,
+            Action<int, int> progress) {
+            var remaining = plan.Objects.ToDictionary(item => item.Id, StringComparer.Ordinal);
+            string songId = plan.Chain.Last().Id; remaining.Add(songId, plan.Chain.Last());
+            var order = plan.Objects.Where(item => item.Id != plan.InfoId).Reverse().ToList();
+            order.Add(plan.Objects.Single(item => item.Id == plan.InfoId)); order.Add(plan.Chain.Last());
+            int deleted = 0;
+            foreach (var item in order) {
+                Check();
+                // 每次重新解析所有祖先，防止歌曲被移动或原位置被替换。
+                foreach (var ancestor in plan.Chain) {
+                    var actual = ExactChild(children, ancestor.Parent, ancestor.Name);
+                    if (!SameObject(ancestor, actual)) throw new IOException("删除期间原歌曲路径已变化，已停止后续删除。");
+                }
+                if (!SameObject(item, get(item.Id))) throw new IOException("删除期间歌曲资源标识已变化，已停止后续删除。");
+                var siblings = children(item.Parent); ValidateChildren(item.Parent, siblings);
+                if (item.Id != songId) {
+                    var expected = remaining.Values.Where(value => value.Parent == item.Parent).ToList();
+                    if (siblings.Count != expected.Count || siblings.Any(value => !remaining.ContainsKey(value.Id) || !SameObject(value, remaining[value.Id])))
+                        throw new IOException("删除期间目录内容已变化，已停止后续删除。");
+                } else if (!siblings.Any(value => SameObject(value, item))) throw new IOException("删除期间歌曲目录已变化。");
+                if (item.IsFolder && children(item.Id).Count != 0) throw new IOException("删除期间新增了歌曲资源，拒绝删除非空目录。");
+                if (remaining.ContainsKey(plan.InfoId) && infoHash(plan.InfoId) != plan.InfoSha256)
+                    throw new IOException("删除期间 Info.dat 已变化，已停止后续删除。");
+                Check(); deletionStarted = true; delete(item.Id); remaining.Remove(item.Id); deleted++;
+                if (children(item.Parent).Any(value => value.Id == item.Id)) throw new IOException("设备未确认对象消失，已停止后续删除。");
+                progress(deleted, order.Count);
+            }
+            if (children(plan.Chain.Last().Parent).Any(item => item.Id == songId || item.Name == plan.Segments.Last()))
+                throw new IOException("删除结束后歌曲目录仍存在，不能报告完成。");
+        }
+        static void DeleteSong(IDictionary<string, object> job, bool prepare) {
+            string[] segments = DeleteSegments(job); var locator = Object(job["locator"]);
+            var matches = Devices().Where(candidate => String.Equals(candidate.Value, Text(locator, "device"), StringComparison.Ordinal)).ToList();
+            if (matches.Count != 1) throw new IOException("所选 PICO 未连接或存在同名设备，请刷新后重新选择。");
+            var device = matches[0];
+            using (var session = new DeviceSession(device.Key, !prepare, Check)) {
+                var current = Snapshot(job, device.Key, device.Value, session.Children, session.InfoHash);
+                if (prepare) { WritePlan(job, current); return; }
+                var original = ReadPlan(job); SameSnapshot(original, current);
+                location = device.Value + "\\" + String.Join("\\", segments);
+                Check(); Record(new { type = "deleting", locator = locator });
+                ApplyDeletion(original, session.Children, session.Get, session.DeleteSingle, session.InfoHash,
+                    delegate(int done, int count) { Record(new { type = "progress", message = "正在删除所选歌曲并核对", percent = Math.Min(99, done * 100 / count) }); });
+                Record(new { type = "deleted", locator = locator, verified = true });
+            }
+        }
+        // 使用同一套枚举、边界与快照代码验证合成目录，不访问或修改任何设备。
+        static void ValidateDelete(IDictionary<string, object> job) {
+            var objects = Json.Deserialize<List<DeviceObject>>(Json.Serialize(job["objects"]));
+            if (objects.Count > 10100 || objects.Any(item => item == null) || objects.Select(item => item.Id).Distinct(StringComparer.Ordinal).Count() != objects.Count)
+                throw new IOException("合成对象清单无效。");
+            int deletes = 0; string mutation = Text(job, "mutation");
+            Func<string, List<DeviceObject>> children = parent => {
+                if (mutation == "during-disconnect" && deletes > 0) throw new IOException("合成设备断连。");
+                return objects.Where(item => item.Parent == parent).ToList();
+            };
+            string infoText = Text(job, "infoText"); ValidateInfo(infoText);
+            Func<string, string> infoHash = id => { using (SHA256 hash = SHA256.Create()) return DeviceSession.Hex(hash.ComputeHash(Encoding.UTF8.GetBytes(infoText))); };
+            string deviceName = Text(Object(job["locator"]), "device");
+            var plan = Snapshot(job, "synthetic-device", deviceName, children, infoHash);
+            job["planToken"] = WritePlan(job, plan);
+            if (mutation == "plan-token") job["planToken"] = new String('0', 64);
+            if (mutation == "plan-file") File.AppendAllText(PlanPath(job), " ");
+            plan = ReadPlan(job);
+            if (mutation == "persistent") objects.Single(item => item.Id == plan.Chain.Last().Id).Persistent += "-changed";
+            if (mutation == "size") objects.First(item => item.Id == plan.InfoId).Size++;
+            if (mutation == "info") infoText += " ";
+            if (mutation == "new-file") objects.Add(new DeviceObject { Id = "new-file", Persistent = "new-file", Parent = plan.Chain.Last().Id, Name = "new.dat", Type = Keys.GenericFile });
+            var current = Snapshot(job, "synthetic-device", deviceName, children, infoHash); SameSnapshot(plan, current);
+            var deletedIds = new List<string>();
+            ApplyDeletion(plan, children, id => objects.Single(item => item.Id == id), id => {
+                if (children(id).Count != 0) throw new IOException("合成删除拒绝递归。");
+                if (Text(job, "deleteFailure") == "first") throw new IOException("合成驱动拒绝删除。");
+                objects.RemoveAll(item => item.Id == id); deletes++; deletedIds.Add(id);
+                if (mutation == "during-cancel" && deletes == 1) File.WriteAllText(cancelFile, "cancel");
+                if (mutation == "during-delete" && deletes == 1)
+                    objects.Add(new DeviceObject { Id = "during-file", Persistent = "during-file", Parent = plan.Chain.Last().Id, Name = "new.dat", Type = Keys.GenericFile });
+            }, infoHash, delegate(int done, int count) { });
+            Record(new { type = "delete-validated", files = plan.Files, bytes = plan.Bytes, objects = deletes, outsideObjects = objects.Count,
+                remainingIds = objects.Select(item => item.Id).ToArray(), deletedIds = deletedIds, deviceAccessed = false });
+        }
         [STAThread] static int Main(string[] args) {
             Console.OutputEncoding = new UTF8Encoding(false);
             try {
@@ -438,20 +713,24 @@ namespace Lmsc.Wpd {
                 string jobPath = Path.GetFullPath(args[1]); var task = new FileInfo(jobPath);
                 if (!task.Exists || task.Length > 16 * 1024 * 1024) throw new IOException("任务文件缺失或超过限制。");
                 var job = Object(Json.DeserializeObject(File.ReadAllText(jobPath, Encoding.UTF8)));
+                jobDirectory = Path.GetDirectoryName(jobPath);
                 if (Convert.ToInt32(job["protocol"]) != 1) throw new IOException("不支持的设备导出协议。");
                 cancelFile = Path.GetFullPath(Text(job, "cancelFile"));
                 if (!String.Equals(Path.GetDirectoryName(cancelFile), Path.GetDirectoryName(jobPath), StringComparison.OrdinalIgnoreCase)) throw new IOException("取消标志必须位于任务目录。");
                 Check(); string mode = Text(job, "mode");
                 if (mode == "list") List();
                 else if (mode == "upload") Upload(job);
+                else if (mode == "delete-prepare") DeleteSong(job, true);
+                else if (mode == "delete") DeleteSong(job, false);
+                else if (mode == "validate-delete") ValidateDelete(job);
                 else if (mode == "validate") {
                     string folder = Path.GetFullPath(Text(job, "localFolder")).TrimEnd(Path.DirectorySeparatorChar);
                     var entries = Validate(folder, job);
                     try { Record(new { type = "validated", files = entries.Count }); }
                     finally { foreach (var entry in entries) entry.Stream.Dispose(); }
                 } else throw new IOException("未知设备导出任务。"); return 0;
-            } catch (OperationCanceledException) { Record(new { type = "cancelled", location = location }); return 2; }
-            catch (Exception error) { Record(new { type = "error", message = "设备导出失败：" + error.Message, location = location }); return 1; }
+            } catch (OperationCanceledException) { Record(new { type = "cancelled", location = location, deletionStarted = deletionStarted }); return 2; }
+            catch (Exception error) { Record(new { type = "error", message = "设备操作失败：" + error.Message, location = location, deletionStarted = deletionStarted }); return 1; }
         }
     }
 }
