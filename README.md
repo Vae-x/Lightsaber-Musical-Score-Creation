@@ -8,6 +8,8 @@
 
 生成与精修现整合在曲谱编辑页：生成结果直接作为工作草稿，使用同一网格、轨道、时间轴和属性工具编辑，确认后一次应用到正式谱。工作草稿及初稿、精修前版本随工程保存，重开可续编；导出仅使用已确认的正式谱。工程保存为 v2，继续读取旧 v1 工程，旧版程序无法读取 v2。
 
+源码提供独立的 [InfernoSaber 现成模型试用工具](docs/InfernoSaber本地试用.md)，默认在 E 盘准备隔离推理环境。使用已有工程生成 Hard、Expert 的本地对照和模型候选，输出检查报告及歌曲 ZIP，可导入曲谱编辑页继续试听和修改。现成模型仍有动作约束不通过的情况，候选需要编辑及头显试玩；本轮未接入应用按钮或公开便携包。
+
 ## 下载与快速开始
 
 **[下载 v0.5.0 Windows 便携版](https://github.com/Vae-x/Lightsaber-Musical-Score-Creation/releases/tag/v0.5.0)** · [全部版本](https://github.com/Vae-x/Lightsaber-Musical-Score-Creation/releases)

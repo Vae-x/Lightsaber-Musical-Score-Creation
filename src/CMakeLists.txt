@@ -60,6 +60,11 @@ if (WIN32)
     target_link_libraries(lmsc_core PRIVATE crypt32 winhttp)
 endif ()
 
+# A console-only, local comparison harness; it never opens or writes a GUI project.
+add_executable(lmsc_generation_trial app/GenerationTrial.cpp)
+target_link_libraries(lmsc_generation_trial PRIVATE lmsc_core)
+set_target_properties(lmsc_generation_trial PROPERTIES OUTPUT_NAME "lmsc-generation-trial")
+
 add_executable(src WIN32
         app/main.cpp
         gui/MainWindow.cpp
@@ -219,6 +224,15 @@ if (BUILD_TESTING)
     set_target_properties(local_generation_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
     add_test(NAME local_generation COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:local_generation_tests>")
     set_tests_properties(local_generation PROPERTIES TIMEOUT 180 LABELS "core;audio;generation")
+    add_executable(generation_trial_tests "${LMSC_REPOSITORY_DIR}/tests/GenerationTrialTest.cpp")
+    target_link_libraries(generation_trial_tests PRIVATE lmsc_core Qt5::Test)
+    target_compile_definitions(generation_trial_tests PRIVATE
+            LMSC_TRIAL_EXECUTABLE="$<TARGET_FILE:lmsc_generation_trial>"
+            LMSC_TRIAL_TOOLS="${LMSC_AUDIO_TOOLS_DIR}/bin")
+    add_dependencies(generation_trial_tests lmsc_generation_trial)
+    set_target_properties(generation_trial_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_test(NAME generation_trial COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:generation_trial_tests>")
+    set_tests_properties(generation_trial PROPERTIES TIMEOUT 180 LABELS "core;audio;generation")
     foreach(LMSC_HYBRID_TEST IN ITEMS HybridGeneration AiRefinement RefinedChart)
         string(REGEX REPLACE "([a-z])([A-Z])" "\\1_\\2" LMSC_HYBRID_NAME "${LMSC_HYBRID_TEST}")
         string(TOLOWER "${LMSC_HYBRID_NAME}" LMSC_HYBRID_NAME)

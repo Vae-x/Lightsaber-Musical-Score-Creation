@@ -1,0 +1,119 @@
+# InfernoSaber 本地试用
+
+本轮先复用现成模型生成候选谱，比较音乐跟随、动作变化、手感和耗时，再决定是否接入“光剑曲谱制作”的编辑工作区。无需训练新模型。安装脚本准备隔离环境，不会复制头显歌曲、下载模型、生成谱面或写入设备。
+
+采用 [InfernoSaber](https://github.com/fred-brenner/InfernoSaber---BeatSaber-Automapper) 的 MIT 许可代码，固定提交 `60780a5acda4da67d0c67d01a4705719a77a91e2`。模型来自作者的 [BierHerr/InfernoSaber](https://huggingface.co/BierHerr/InfernoSaber)，模型分支、修订及文件校验另行记录，不能仅凭“文件数量足够”视为下载完整。上游介绍与演示属于项目资料，尚不构成本软件或两款头显游戏的验收结果。
+
+## 目录与隔离范围
+
+| 位置 | 用途 |
+| --- | --- |
+| `E:/lmsc-infernosaber-runtime/miniforge/` | 独立 Miniforge |
+| `E:/lmsc-infernosaber-runtime/env/` | Python 3.10 和推理依赖 |
+| `E:/lmsc-infernosaber-runtime/source/` | 固定提交的上游源码；保持未修改 |
+| `E:/lmsc-infernosaber-runtime/conda-pkgs/`、`pip-cache/` | 隔离环境的依赖下载缓存 |
+| `E:/lmsc-infernosaber-runtime/pip-wheels/` | 可选的完整依赖轮子缓存；已知 TensorFlow 大包校验后直接复用 |
+| 本仓库 `build/infernosaber-trial/` | 安装器、校验、安装日志、模型、每次试用的临时输入及候选结果 |
+
+歌曲、模型、运行日志和生成产物保留在本机，不提交或推送 Git。模型不会跟随公开便携包发布。本阶段只使用电脑上的输入副本，头显仍通过本软件已有的明确导出流程操作。
+
+安装不加入系统 PATH、不注册默认 Python、不执行 `conda init`；只在安装进程内设置依赖路径，退出时恢复环境变量。Windows 原生 TensorFlow 2.15 的本轮试用使用 CPU；官方原生 Windows GPU 支持止于 2.10，详见 [TensorFlow 安装说明](https://www.tensorflow.org/install/pip)。当前笔记本已有的 PyTorch/CUDA 环境不承担本次推理，也不被修改。
+
+## 准备环境
+
+在仓库根目录的 PowerShell 执行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-infernosaber-trial.ps1
+```
+
+默认运行目录为 `E:/lmsc-infernosaber-runtime`。如需要另一块盘，可以在首次安装时追加 `-RuntimeDirectory 'D:/lmsc-infernosaber-runtime'`。运行目录必须是绝对路径，不能是盘符根，不能包含空格或非 ASCII 字符，也不能经过目录链接。已有目录若没有本脚本的所有权标记，会直接停止，保留其中内容。
+
+脚本核对 [Miniforge 官方固定发行版](https://github.com/conda-forge/miniforge/releases/tag/26.7.2-0) 的 SHA256 后才执行安装；已缓存且校验匹配的安装器会复用。Conda 只使用 `conda-forge`，其中安装 Python 3.10、NumPy 1.26.4、aubio 0.4.9 和 pydub 0.25.1；其余核心依赖从 PyPI 安装。不会安装上游网页界面的 Gradio 或在线视频下载工具 yt-dlp。
+
+约 148 MB 的安装器优先使用已有 Python 3.10 或更新版本进行分块续传与整体 SHA256 核对；只复用下载函数，不下载模型或安装系统 Python，并跳过 Windows Store 的 Python 别名。没有合适的既有 Python 时，回退为单流下载，每次超时 600 秒，最多尝试三次；小型校验文件超时 60 秒。失败的分块、临时文件和校验不符的安装器保留供诊断。单流回退不能续传，重试会重新下载；损坏的完整缓存不会自动覆盖或删除。
+
+核心版本固定为 TensorFlow 2.15.1、Keras 2.15.0、keras-tcn 3.5.4、SciPy 1.13.1、scikit-learn 1.3.2、librosa 0.11.0、ffmpy 0.5.0、huggingface-hub 0.29.3，其他核心依赖也在运行目录的 `requirements-trial.txt` 中列明。优先复用本仓库已有 FFmpeg；缺少完整的 ffmpeg/ffprobe 时才在独立 Conda 环境补齐。
+
+已缓存的 `tensorflow_intel-2.15.1-cp310-cp310-win_amd64.whl` 会核对固定 PyPI 发行版的大小和 SHA256，再作为明确的本地安装输入，避免重复下载。校验失败保留文件并停止。环境安装失败后可以重跑，继续复用已经通过校验的安装器与依赖缓存。
+
+只有包依赖检查、真实 TCN 前向计算、aubio 调用、FFmpeg 启动以及上游推理模块导入全部成功，才写入 `runtime-ready.json`。该标记只表示环境准备成功；仍须分别验证模型加载、歌曲生成、格式导入、完整安全检查和实际游玩。
+
+成功后保存以下信息，供重现和排错：
+
+- `environment-info.json`：实际 Python、系统、包版本和 TensorFlow 设备。
+- `requirements-freeze.txt`、`conda-explicit.txt`：此次实际解析的完整依赖。
+- `runtime-ready.json`：源码提交、Python/FFmpeg 路径与安装日志位置。
+
+脚本支持重复执行，复用有效安装和下载缓存，但不会删除部分安装或覆盖上游的本地修改。此前推理生成的 Python 字节码缓存可以保留，不能把它误判为用户修改的源码；其他源码修改仍会阻止安装。同一运行目录有互斥锁，不能同时启动两次安装。网络失败可直接重试；若提示部分 Miniforge、环境或源码目录无法验证，应先检查对应日志和保留内容，不要删除歌曲或工程来排错。
+
+## 本地生成与检查
+
+环境安装完成后下载固定模型。默认只下载音符推理所需的七个文件，跳过体积较大的灯光模型；每个文件核对作者发布的 SHA256，全部通过后才记录缓存完成。断线时保留分块文件，重跑同一命令可续传：
+
+```powershell
+& 'E:/lmsc-infernosaber-runtime/env/python.exe' .\scripts\fetch-infernosaber-models.py `
+    --cache .\build\infernosaber-trial\models
+```
+
+`easy_15` 固定修订为 `e04b14ad772a4e091a0df65780ddc4011f43409b`，`expert_15` 为 `0cfd41f330f47eba81106684255a916934da3ae7`。默认试用仅比较普通方向和 Dot 音符，关闭炸弹、墙和滑条；灯光生成只在内存中按固定源码位置跳过，上游检出文件保持完整。需要完整灯光缓存时可显式使用下载器的 `--with-lighting`，本轮对照仍使用音符模式。
+
+安装脚本与试用命令分开。先运行试用脚本的帮助，确认当前参数：
+
+```powershell
+& 'E:/lmsc-infernosaber-runtime/env/python.exe' .\scripts\infernosaber_trial.py --help
+```
+
+Python 试用命令协调模型推理与本软件的核心命令行检查。核心工具分别提供 `describe`、`local`、`check`，负责读取工程信息、生成纯本地对照以及验证候选结果。使用经过校验的本地模型，禁止在运行时偷偷联网补下载。每次生成使用新任务目录与输入副本；保护原音频、原歌曲 ZIP、编辑工程和此前输出。输入文件名会在临时目录内规范化，不需要重命名原文件。
+
+核心工具由 CMake 目标 `lmsc_generation_trial` 编译得到，文件为 `build/release/src/lmsc-generation-trial.exe`，Debug 对应 `build/debug/src/`。准备好完整模型后，可以用已有 `.lmsc` 工程进行一首歌曲的对照试用；先将示例工程路径替换为实际路径：
+
+```powershell
+$trialWorkspace = (Get-Location).Path
+$trialProject = Join-Path $trialWorkspace 'projects/示例歌曲/project.lmsc'
+$trialOutput = Join-Path $trialWorkspace ('build/infernosaber-trial/run-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+& 'E:/lmsc-infernosaber-runtime/env/python.exe' .\scripts\infernosaber_trial.py run `
+    --workspace $trialWorkspace `
+    --core-cli (Join-Path $trialWorkspace 'build/release/src/lmsc-generation-trial.exe') `
+    --tools (Join-Path $trialWorkspace 'third_party/ffmpeg/bin') `
+    --project $trialProject --output $trialOutput --seed 20261005
+```
+
+一次 `run` 默认生成 Hard、Expert 的纯本地对照和模型候选。试用初值为 Hard 使用 `easy_15` 分支/强度 2.5、Expert 使用 `expert_15` 分支/强度 4.0；强度是上游模型控制参数，不能直接当作每秒音符数。多首歌曲使用 `batch --projects <工程1> <工程2> ...`，其他参数相同。
+
+结果查看 `trial-report.json`，每个任务保留日志与检查报告。`ready/` 存放通过当前桌面检查的对比 ZIP，仍待实际游玩；`editor-only/` 存放需要编辑处理的候选 ZIP。命令退出码 0 仅说明流程处理完成，不等于所有谱通过检查，仍须查看各项 `playableReady`。
+
+需要中途停止时，在报告的 `cancelFile` 路径建立取消请求文件；中断或失败保留原工程、原音频和已完成结果。再次运行使用新的 `--output` 目录，可用 `--resume <上一次输出目录>` 复用校验仍匹配的已完成结果；工程、音频、模型、代码、种子或环境变化后不会复用旧结果。已有输出目录拒绝覆盖。
+
+首轮固定几首歌曲及 Hard、Expert 两种目标难度，记录模型分支、修订、编排参数与随机种子。模型的密度参数和本软件难度名称不是一一对应关系，应依据生成谱的实际密度及动作检查判定，不把上游的“Expert+ 训练”直接解释为支持所有难度。
+
+候选结果统一走本软件的基础 Standard 格式导入与安全检查，导出副本使用 v2.2.0 谱面标记；上游原始结果保留。高级弧线、链条、自定义几何等不在本轮范围内。导入后在现有曲谱编辑页继续试听和手动编辑，不需要换用上游的独立网页编辑器。未通过动作约束的 ZIP 仅供编辑，不应仅凭格式可读取就认定可以直接游玩。
+
+出现模型缺失、校验不符、生成失败或安全检查失败时，保留原输入和已生成的原始候选，报告具体原因。未经确认的候选不能覆盖正式谱或自动写入头显。
+
+## 验证记录
+
+2026-10-06 已在 Windows 11（22631）、i5-13500H、约 16 GB 内存的笔记本上完成首轮真实歌曲试用。使用 CPU 四线程，三首歌曲时长约 141–319 秒，分别生成 Hard／Expert 的模型谱和本地对照，共 12 张谱、6 个双难度 ZIP；完整流程约 118 秒，不包含环境安装和模型下载。
+
+- 两个模型的音符组件共约 950 MB，全部核对固定修订与 SHA256；环境依赖、真实 TCN 前向、aubio／FFmpeg 及推理模块检查通过。
+- 模型单张完整处理约 14–23 秒，模型子进程峰值工作集约 1.01–2.45 GiB；本地对照约 1.0–1.7 秒。计时包含检查与导出，内存数值不代表整台电脑的总占用。
+- 12 张谱均可按基础 Standard v2.2.0 读取，含斜切并覆盖全部 12 格。六张本地对照通过当前动作约束；六张模型谱仍存在同手间隔、回刀、连接速度或跨半区问题，均归入 `editor-only`，原动作与时间保留供编辑。
+- 六个 ZIP 均在现有编辑器完成导入、音频解码、手改、撤销重做、保存、导出、重开及渲染。修改一张难度后，另一张难度的音符与原音频保持完整；原输入工程及资源共 21 个文件逐项 SHA256 和文件集合核对不变。
+- Debug／Release 核心试用工具构建及相关五项 CTest 通过；新增命令行检查各 10 项 QtTest、31 项 Python 单元检查和 12 项 PowerShell 缓存保护案例通过。检查包括格式版本与保护、元数据绑定、断线续传、取消、超时、结果复用及失败保留。安装器重复预检可保留旧 Python 缓存，同时拒绝其他源码改动。
+
+当前结果说明现成模型可以在本机运行，还没有证明它比现有本地算法更有趣或更顺手。模型输出存在 8–14 个音符的短动作串重复；精确的 16 音符循环和连续相同八拍乐句检查不能单独证明编排多样性。后续先编辑违规段，再做同曲对照试玩。Windows 10、新增模型谱的两款游戏兼容性及头显实际手感仍待验证；本轮不改应用按钮、训练模型或发布新便携包。
+
+每次试用分别记录以下阶段，未实际完成的阶段保持“待验证”：
+
+| 阶段 | 应记录内容 |
+| --- | --- |
+| 环境准备 | 实际包版本、导入与前向检查、失败日志 |
+| 模型加载 | 分支与固定修订、文件清单/SHA256、能否加载 |
+| 桌面生成 | 音频时长、总耗时、各阶段耗时、峰值内存、成功/失败原因 |
+| 谱面检查 | 实际密度、方向/位置分布、连续重复、同手回刀、连接速度、碰撞与遮挡 |
+| 编辑与导出 | 导入结果、候选编辑、Standard 导出与音频保持情况 |
+| 头显试玩 | 星穹绿洲/光之乐团分别记录能否播放、趣味性、节奏跟随与手感 |
+
+先与同曲同难度的纯本地规则谱对比。统计变化只能辅助定位问题，趣味性与手感以头显试玩反馈为准。本轮是否优于当前规则生成、实际处理时长、Windows 10 兼容性及两款游戏的新增模型兼容性，均不能在完成对应检查前宣布通过。
+
+若试用改善明显，再把推理入口作为可选生成服务接入现有编辑草稿、撤销、保存与 AI 精修流程；保留当前本地生成方式作为可用的回退。本轮模型复用未解决的问题，再决定是否需要小规模微调或自训。
