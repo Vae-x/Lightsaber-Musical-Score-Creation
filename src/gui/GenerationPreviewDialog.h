@@ -1,4 +1,5 @@
 #pragma once
+#include "core/GenerationSource.h"
 
 #include "core/AiGenerationService.h"
 #include "core/RefinementTypes.h"
@@ -18,7 +19,7 @@ class QProgressBar;
 
 namespace lmsc {
 class AiRefinementService;
-bool sameGenerationSource(const GenerationRequest &a, const GenerationRequest &b, bool compareJob = true);
+
 class GenerationPreviewDialog final : public QDialog {
     Q_OBJECT
 public:

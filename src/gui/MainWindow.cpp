@@ -4,7 +4,8 @@
 #include "SettingsPanel.h"
 #include "NavigationSidebar.h"
 #include "AiRecognitionPage.h"
-#include "GenerationPreviewDialog.h"
+#include "EditorSessionController.h"
+#include "EditorRefinementPanel.h"
 #include "ThemeManager.h"
 #include "SongImportDialog.h"
 #include "SongExportDialog.h"
@@ -146,6 +147,9 @@ MainWindow::MainWindow(QWidget *parent, const QString &settingsFile)
     lmsc::DiagnosticLog::instance().record("application.started");
     lmsc::ThemeManager::apply(preferences.themeMode);
     m_documentId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    m_editorSession = new lmsc::EditorSessionController(this);
+    m_editorSession->setObjectName(QStringLiteral("editorSessionController"));
+    m_editorSession->setFormalDocument(m_document.get(), m_documentId);
     m_aiTransport = new lmsc::ConfiguredAiTextTransport(this);
     m_aiTransport->configure(preferences);
     m_defaultGenerationService = new lmsc::LlmAiGenerationService(m_aiTransport, this);
@@ -162,6 +166,7 @@ MainWindow::MainWindow(QWidget *parent, const QString &settingsFile)
     buildEditor();
     buildActions();
     buildWorkspace();
+    connectRefinementService();
     connectAudio();
     connect(m_mtp, &MtpImportService::songImported, this, [this](const QString &folder) {
         if (!m_mtpImportPending) return;
@@ -216,7 +221,8 @@ MainWindow::MainWindow(QWidget *parent, const QString &settingsFile)
     m_autosave->setObjectName(QStringLiteral("documentAutosave"));
     m_autosave->setInterval(30000);
     connect(m_autosave, &QTimer::timeout, this, [this] {
-        if (m_busy || !m_document->isModified() || m_document->projectPath().isEmpty()) return;
+        if (m_busy || (!m_document->isModified() && !m_editorSession->isDirty()) || m_document->projectPath().isEmpty()) return;
+        if (!syncDraftRecords()) return;
         // Only the JSON snapshot is written; immutable assets were copied at first save.
         QString error;
         if (m_document->autoSave(&error)) statusBar()->showMessage(tr("已自动保存恢复快照"), 3000);
@@ -228,10 +234,11 @@ MainWindow::MainWindow(QWidget *parent, const QString &settingsFile)
 
 MainWindow::~MainWindow() {
     m_aiPage->cancelRecognition();
-    if (m_generationPreview) m_generationPreview->close();
+    cancelRefinement();
+    for (const auto &connection : m_refinementConnections) disconnect(connection);
     if (m_refinementService && !m_refinementService->status().jobId.isEmpty())
         m_refinementService->discard(m_refinementService->status().jobId);
-    m_cachedRefinement.reset(); m_cachedPreviewBaseline.reset();
+    m_cachedRefinement.reset();
     m_settingsPanel->discardChanges();
     m_mtp->cancel();
     m_mtpExport->cancel();
@@ -246,6 +253,11 @@ void MainWindow::buildEditor() {
     m_editorPage->setObjectName(QStringLiteral("editorPage"));
     auto outer = new QVBoxLayout(m_editorPage);
     outer->setContentsMargins(10, 8, 10, 6);
+    m_editorStateLabel = new QLabel(tr("正式谱"), m_editorPage);
+    m_editorStateLabel->setObjectName(QStringLiteral("editorSessionState"));
+    m_editorStateLabel->setProperty("role", "title");
+    m_editorStateLabel->setWordWrap(true);
+    outer->addWidget(m_editorStateLabel);
     auto split = new QSplitter(Qt::Horizontal, m_editorPage);
     outer->addWidget(split, 1);
     auto leftScroll = new QScrollArea(split);
@@ -304,8 +316,12 @@ void MainWindow::buildEditor() {
     connect(m_difficulties, &QListWidget::currentItemChanged, this,
             [this](QListWidgetItem *item, QListWidgetItem *) {
         if (!item || m_refreshing || m_busy) return;
+        cancelRefinement();
         QString error;
-        if (!m_document->setDifficulty(item->data(Qt::UserRole).toString(), &error)) showError(error);
+        const auto difficultyId = item->data(Qt::UserRole).toString();
+        if (!difficultyId.isEmpty() && !m_document->setDifficulty(difficultyId, &error)) showError(error);
+        m_editorSession->selectTarget(item->data(Qt::UserRole + 1).toString());
+        m_refinementPanel->clearResult();
         m_selection.clear();
         refreshDocument();
     });
@@ -321,11 +337,13 @@ void MainWindow::buildEditor() {
     leftLayout->addWidget(m_newDifficultyRow);
     connect(m_newDifficultySelector, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
         if (index < 0 || m_refreshing || m_busy || !m_document->isNewSong()) return;
+        cancelRefinement(true);
         QString error;
         const QString name = m_newDifficultySelector->currentData().toString();
         const int rank = m_newDifficultySelector->currentData(Qt::UserRole + 1).toInt();
         if (!m_document->setNewSongDifficulty(name, rank, &error)) showError(error);
         else statusBar()->showMessage(tr("已将新歌难度设为 %1").arg(m_newDifficultySelector->currentText()), 5000);
+        m_editorSession->selectTarget(name);
         refreshDocument();
     });
     m_exportLeadInRow = new QWidget(left);
@@ -361,7 +379,9 @@ void MainWindow::buildEditor() {
     m_estimateButton = new QPushButton(tr("重新估计节拍"), tempo);
     tf->addRow(m_estimateButton);
     connect(m_estimateButton, &QPushButton::clicked, this, [this] {
-        if (!m_busy && m_document->isNewSong() && m_audio->isReady() && !m_analyzer->isBusy())
+        if (!m_busy && m_document->isNewSong() && m_audio->isReady() && !m_analyzer->isBusy()
+            && m_editorSession->view() == lmsc::EditorSessionController::View::Formal
+            && !m_editorSession->viewReadOnly() && editingDocument() == m_document.get())
             requestRhythmAnalysis();
     });
     m_analysisLabel = new QLabel(tr("已有曲谱保留原始节拍。\n新歌估拍后可在此校准。"), tempo);
@@ -376,15 +396,23 @@ void MainWindow::buildEditor() {
     auto top = new QSplitter(Qt::Horizontal, center);
     m_track = new TrackView(top);
     m_grid = new GridEditor(top);
+    // Leave room for both editing surfaces beside the integrated tools panel.
+    m_track->setMinimumWidth(180);
+    m_grid->setMinimumWidth(180);
+    top->setChildrenCollapsible(false);
     top->setStretchFactor(0, 3);
     top->setStretchFactor(1, 2);
     m_timeline = new TimelineView(center);
     center->setStretchFactor(0, 3);
     center->setStretchFactor(1, 2);
-    auto rightScroll = new QScrollArea(split);
+    m_toolsTabs = new QTabWidget(split);
+    m_toolsTabs->setObjectName(QStringLiteral("editorToolsTabs"));
+    m_toolsTabs->setMinimumWidth(290); m_toolsTabs->setMaximumWidth(400);
+    auto rightScroll = new QScrollArea(m_toolsTabs);
     rightScroll->setWidgetResizable(true);
     rightScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    rightScroll->setMinimumWidth(245); rightScroll->setMaximumWidth(285);
+    rightScroll->setMinimumWidth(245);
+    m_toolsTabs->addTab(rightScroll, tr("物件"));
     auto right = new QWidget;
     rightScroll->setWidget(right);
     auto rl = new QVBoxLayout(right);
@@ -487,7 +515,9 @@ void MainWindow::buildEditor() {
     transport->addWidget(m_positionLabel);
     outer->addLayout(transport);
     m_progress = new QProgressBar(this);
-    m_progress->setMaximumWidth(250); m_progress->setMaximumHeight(18); m_progress->hide();
+    m_progress->setMaximumWidth(250);
+    m_progress->setMinimumHeight(m_progress->fontMetrics().height() + 8);
+    m_progress->hide();
     m_cancelButton = new QPushButton(tr("取消任务"), this); m_cancelButton->hide();
     statusBar()->addPermanentWidget(m_progress);
     statusBar()->addPermanentWidget(m_cancelButton);
@@ -509,6 +539,7 @@ void MainWindow::buildEditor() {
     connect(m_timeline, &TimelineView::deleteRequested, this, &MainWindow::deleteObjects);
     connect(m_timeline, &TimelineView::loopChanged, this, [this](double a, double b) {
         m_loopStart = a; m_loopEnd = b; m_loop->setChecked(true); m_audio->setLoop(a, b, true);
+        if (m_refinementPanel) m_refinementPanel->setSelection(a, b, true);
     });
 }
 
@@ -525,7 +556,7 @@ void MainWindow::buildWorkspace() {
     navigation->setAccessibleName(tr("工作区导航"));
     navigation->setAccessibleDescription(tr("使用上下方向键切换页面，左右方向键展开或收起大语言模型的账号授权子菜单。"));
     m_sidebar->addItem(tr("曲谱编辑"), lmsc::NavigationIcon::Editor);
-    m_sidebar->addItem(tr("AI 分析与制谱"), lmsc::NavigationIcon::Recognition);
+    m_sidebar->addItem(tr("生成与精修"), lmsc::NavigationIcon::Recognition);
     m_sidebar->addItem(tr("外观"), lmsc::NavigationIcon::Appearance);
     m_sidebar->addItem(tr("大语言模型"), lmsc::NavigationIcon::Model);
     m_sidebar->addSubItem(3, tr("账号授权"), lmsc::NavigationIcon::Account);
@@ -535,11 +566,73 @@ void MainWindow::buildWorkspace() {
     m_workspacePages = new WorkspacePages(ui->centralwidget);
     m_workspacePages->setObjectName(QStringLiteral("workspacePages"));
     m_workspacePages->addWidget(m_editorPage);
-    m_aiPage = new lmsc::AiRecognitionPage(m_workspacePages);
+    m_generationTools = new QWidget(m_toolsTabs);
+    m_generationTools->setObjectName(QStringLiteral("editorGenerationTools"));
+    auto toolsLayout = new QVBoxLayout(m_generationTools);
+    toolsLayout->setContentsMargins(6, 6, 6, 6);
+    m_aiPage = new lmsc::AiRecognitionPage(m_generationTools);
+    m_aiPage->setCompact(true);
     m_aiPage->setGenerationService(m_defaultGenerationService, m_defaultGenerationService);
     m_aiPage->setLocalGenerationService(m_localGenerationService, m_localGenerationService);
     m_aiPage->setHybridGenerationService(m_hybridGenerationService, m_hybridGenerationService);
-    m_workspacePages->addWidget(m_aiPage);
+    toolsLayout->addWidget(m_aiPage, 1);
+    m_draftReplacement = new QWidget(m_generationTools);
+    m_draftReplacement->setObjectName(QStringLiteral("draftReplacementPrompt"));
+    auto replacementLayout = new QVBoxLayout(m_draftReplacement);
+    replacementLayout->setContentsMargins(0, 0, 0, 0);
+    m_draftReplacementLabel = new QLabel(m_draftReplacement);
+    m_draftReplacementLabel->setWordWrap(true);
+    replacementLayout->addWidget(m_draftReplacementLabel);
+    auto replacementButtons = new QHBoxLayout;
+    auto replace = new QPushButton(tr("继续替换"), m_draftReplacement);
+    replace->setObjectName(QStringLiteral("draftReplacementAccept"));
+    auto keep = new QPushButton(tr("保留草稿"), m_draftReplacement);
+    keep->setObjectName(QStringLiteral("draftReplacementKeep"));
+    auto cancel = new QPushButton(tr("取消"), m_draftReplacement);
+    replacementButtons->addWidget(replace); replacementButtons->addWidget(keep); replacementButtons->addWidget(cancel);
+    replacementLayout->addLayout(replacementButtons);
+    connect(replace, &QPushButton::clicked, this, [this] {
+        auto action = std::move(m_pendingDraftAction);
+        m_pendingDraftAction = {}; m_draftReplacement->hide();
+        if (action) action();
+    });
+    const auto keepDraft = [this] { m_pendingDraftAction = {}; m_draftReplacement->hide(); };
+    connect(keep, &QPushButton::clicked, this, keepDraft);
+    connect(cancel, &QPushButton::clicked, this, keepDraft);
+    m_draftReplacement->hide(); toolsLayout->addWidget(m_draftReplacement);
+    m_refinementPanel = new lmsc::EditorRefinementPanel(m_generationTools);
+    toolsLayout->addWidget(m_refinementPanel);
+    m_toolsTabs->addTab(m_generationTools, tr("生成与精修"));
+    connect(m_refinementPanel, &lmsc::EditorRefinementPanel::refineRequested, this, &MainWindow::startRefinement);
+    connect(m_refinementPanel, &lmsc::EditorRefinementPanel::resumeRequested, this, &MainWindow::resumeRefinement);
+    connect(m_refinementPanel, &lmsc::EditorRefinementPanel::cancelRequested, this, [this] { cancelRefinement(); });
+    connect(m_refinementPanel, &lmsc::EditorRefinementPanel::versionRequested, this, [this](auto version) {
+        if (m_busy) return;
+        cancelRefinement();
+        m_editorSession->setView(static_cast<lmsc::EditorSessionController::View>(version));
+        m_selection.clear(); refreshDocument();
+    });
+    connect(m_refinementPanel, &lmsc::EditorRefinementPanel::restoreInitialRequested, this, [this] {
+        confirmDraftReplacement(tr("恢复初稿将替换当前草稿的手动修改和精修结果。"), [this] {
+            cancelRefinement(true); QString error;
+            if (!m_editorSession->restoreInitial(&error)) m_refinementPanel->showError(error);
+            else { m_refinementPanel->clearResult(); editingChanged(); }
+        });
+    });
+    connect(m_refinementPanel, &lmsc::EditorRefinementPanel::applyRequested, this, [this] {
+        cancelRefinement(); QString error;
+        if (!m_editorSession->applyDraft(&error)) { m_refinementPanel->showError(error); return; }
+        m_selection.clear(); syncDraftRecords(); refreshDocument();
+        m_aiPage->showGenerationApplied();
+        statusBar()->showMessage(tr("工作草稿已应用到正式谱，可一次撤销。"), 10000);
+    });
+    connect(m_refinementPanel, &lmsc::EditorRefinementPanel::discardRequested, this, [this] {
+        confirmDraftReplacement(tr("舍弃当前工作草稿及其对比版本？正式谱保持原样。"), [this] {
+            cancelRefinement(true); QString error;
+            if (!m_editorSession->discardDraft(&error)) { m_refinementPanel->showError(error); return; }
+            m_refinementPanel->clearResult(); editingChanged();
+        });
+    });
     m_settingsPanel = new lmsc::SettingsPanel(m_workspacePages, m_settingsFile, true);
     m_workspacePages->addWidget(m_settingsPanel);
     layout->addWidget(m_sidebar);
@@ -557,8 +650,7 @@ void MainWindow::buildWorkspace() {
         if (!sameAiPreferences(m_generationPreferences, preferences)) {
             if (sameGenerationModel(m_generationPreferences, preferences)) m_aiPage->pauseGenerationForConnectionChange();
             else m_aiPage->invalidateGenerationForConnectionChange();
-            if (m_generationPreview) m_generationPreview->invalidateRefinementForConnectionChange();
-            m_cachedRefinement.reset();
+            cancelRefinement(true);
             m_generationPreferences = preferences;
             m_aiTransport->configure(preferences);
             refreshRecognitionContext();
@@ -570,10 +662,8 @@ void MainWindow::buildWorkspace() {
     });
     connect(m_aiPage, &lmsc::AiRecognitionPage::generationDraftReady, this, &MainWindow::previewGeneratedChart);
     connect(m_aiPage, &lmsc::AiRecognitionPage::generationInvalidated, this, [this] {
-        m_cachedRefinement.reset(); m_cachedPreviewBaseline.reset();
-        if (m_refinementService && !m_refinementService->status().jobId.isEmpty())
-            m_refinementService->discard(m_refinementService->status().jobId);
-        if (m_generationPreview) m_generationPreview->close();
+        cancelRefinement(true);
+        m_pendingDraftAction = {}; m_draftReplacement->hide();
     });
     navigation->setCurrentRow(0);
 }
@@ -581,8 +671,8 @@ void MainWindow::buildWorkspace() {
 void MainWindow::selectWorkspacePage(int row) {
     if (row < 0 || row > 6) return;
     if (row < 2) {
-        m_workspacePages->setCurrentIndex(row);
-        if (row == 1) refreshRecognitionContext();
+        m_workspacePages->setCurrentWidget(m_editorPage);
+        if (row == 1) showGenerationTools();
     } else {
         m_workspacePages->setCurrentWidget(m_settingsPanel);
         m_settingsPanel->selectPage(row - 2);
@@ -640,151 +730,20 @@ void MainWindow::setAiHybridGenerationService(lmsc::AiGenerationService *service
     refreshRecognitionContext();
 }
 
-void MainWindow::setAiRefinementService(lmsc::AiRefinementService *service) {
-    m_refinementService = service ? service : m_defaultRefinementService;
-    m_cachedRefinement.reset();
-    if (m_generationPreview) {
-        m_generationPreview->invalidateRefinementForConnectionChange();
-        if (m_generationPreview) m_generationPreview->setRefinementService(m_refinementService);
-    }
-}
-
-bool MainWindow::generationSourceIsCurrent(const lmsc::GenerationRequest &source) const {
-    if (m_busy || !m_document->isLoaded() || !isAudioReady()) return false;
-    const auto audio = m_audio->pcmSnapshot();
-    return !source.jobId.isEmpty() && source.documentId == m_documentId
-        && source.documentRevision == m_document->revision()
-        && source.difficultyId == m_document->currentDifficultyId()
-        && source.audioRevision == audio.revision && source.audio.revision == audio.revision
-        && source.audio.path == audio.path && source.audio.sourcePath == audio.sourcePath
-        && source.audio.durationSeconds == audio.durationSeconds
-        && source.audio.sampleRate == audio.sampleRate && source.audio.channels == audio.channels
-        && sameGenerationTiming(source.timeMap, m_document->timeMap());
-}
-
-void MainWindow::previewGeneratedChart(const lmsc::GenerationDraft &draft) {
-    if (draft.source.analysisOnly || !m_document->isNewSong() || !generationSourceIsCurrent(draft.source)) return;
-    if (m_workspacePages->currentWidget()!=m_aiPage) {
-        statusBar()->showMessage(tr("AI 候选谱已生成，可返回 AI 页面查看。"),10000); return;
-    }
-    openGenerationPreview(draft, false);
-}
-
-bool MainWindow::currentChartSupportsRefinement() const {
-    if (m_busy || !m_document->isLoaded() || !m_document->isNewSong() || !isAudioReady()
-            || !m_document->readOnlyReason().isEmpty() || !m_document->timeMap().changes().isEmpty()
-            || m_document->objects().isEmpty()) return false;
-    for (const auto &object : m_document->objects()) if (object.isProtected()) return false;
-    for (const auto &difficulty : m_document->difficulties())
-        if (difficulty.id == m_document->currentDifficultyId())
-            return difficulty.characteristic == QStringLiteral("Standard") && difficulty.version == QStringLiteral("2.2.0");
-    return false;
-}
-
-void MainWindow::refineCurrentChart() {
-    if (!currentChartSupportsRefinement()) return;
-    lmsc::GenerationDraft draft;
-    auto &source = draft.source;
-    source.jobId = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    source.documentId = m_documentId; source.difficultyId = m_document->currentDifficultyId();
-    source.documentRevision = m_document->revision(); source.audio = m_audio->pcmSnapshot();
-    source.audioRevision = source.audio.revision; source.timeMap = m_document->timeMap();
-    for (const auto &difficulty : m_document->difficulties())
-        if (difficulty.id == source.difficultyId) source.profile = lmsc::DifficultyProfile::forName(difficulty.name);
-    source.allowedTypes = {};
-    draft.objects = m_document->objects();
-    for (const auto &object : draft.objects) {
-        if (object.kind == lmsc::ObjectKind::Bomb) source.allowedTypes |= lmsc::BombType;
-        else if (object.kind == lmsc::ObjectKind::Wall) source.allowedTypes |= lmsc::WallType;
-        else source.allowedTypes |= object.direction == 8 ? lmsc::DotType : lmsc::DirectionalType;
-    }
-    draft.metrics = lmsc::BeatmapPlayabilityValidator::metrics(draft.objects, source.timeMap, source.audio.durationSeconds);
-    draft.summary = tr("当前曲谱的精修快照；工程在确认应用前保持原样。");
-    if (m_cachedPreviewBaseline && m_cachedBaselineIsDocument
-            && generationSourceIsCurrent(m_cachedPreviewBaseline->source)
-            && lmsc::sameGenerationSource(m_cachedPreviewBaseline->source, draft.source, false)) draft = *m_cachedPreviewBaseline;
-    openGenerationPreview(draft, true);
-}
-
-void MainWindow::openGenerationPreview(const lmsc::GenerationDraft &requestedDraft, bool documentBaseline) {
-    if (!generationSourceIsCurrent(requestedDraft.source)) return;
-    auto draft = requestedDraft;
-    if (m_cachedPreviewBaseline && m_cachedBaselineIsDocument == documentBaseline
-            && m_cachedPreviewBaseline->source.jobId == draft.source.jobId
-            && generationSourceIsCurrent(m_cachedPreviewBaseline->source)
-            && lmsc::sameGenerationSource(m_cachedPreviewBaseline->source, draft.source, false)) draft = *m_cachedPreviewBaseline;
-    if (m_generationPreview) m_generationPreview->close();
-    const bool sameBaseline = m_cachedPreviewBaseline && m_cachedBaselineIsDocument == documentBaseline
-        && generationSourceIsCurrent(m_cachedPreviewBaseline->source)
-        && lmsc::sameGenerationSource(m_cachedPreviewBaseline->source, draft.source, false)
-        && lmsc::refinementBaselineHash(m_cachedPreviewBaseline->objects) == lmsc::refinementBaselineHash(draft.objects);
-    if (!sameBaseline) {
-        if (m_refinementService && !m_refinementService->status().jobId.isEmpty())
-            m_refinementService->discard(m_refinementService->status().jobId);
-        m_cachedRefinement.reset(); m_cachedPreviewBaseline.reset();
-    }
-    QString targetId;
-    for (const auto &difficulty : m_document->difficulties())
-        if (difficulty.name.compare(draft.source.profile.name,Qt::CaseInsensitive)==0) { targetId=difficulty.id; break; }
-    auto preview = new lmsc::GenerationPreviewDialog(draft, m_document->objectCount(targetId), m_audio, this, targetId.isEmpty());
-    m_generationPreview = preview;
-    m_cachedPreviewBaseline.reset(new lmsc::GenerationDraft(preview->initialDraft()));
-    m_cachedBaselineIsDocument = documentBaseline;
-    preview->setDocumentBaseline(documentBaseline);
-    preview->setSourceValidation([this](const lmsc::GenerationRequest &source) { return generationSourceIsCurrent(source); });
-    if (documentBaseline ? currentChartSupportsRefinement() : m_document->isNewSong())
-        preview->setRefinementService(m_refinementService);
-    if (m_loop->isChecked() && m_loopEnd > m_loopStart) preview->setRefinementSelection(m_loopStart, m_loopEnd);
-    if (m_cachedRefinement && lmsc::refinementBaselineHash(m_cachedRefinement->source.baseline)
-            == lmsc::refinementBaselineHash(preview->initialDraft().objects)) preview->setRefinementResult(*m_cachedRefinement);
-    connect(preview, &lmsc::GenerationPreviewDialog::refinementCompleted, this, [this](const lmsc::RefinementResult &result) {
-        if (generationSourceIsCurrent(result.source.generation)) m_cachedRefinement.reset(new lmsc::RefinementResult(result));
-    });
-    connect(preview, &lmsc::GenerationPreviewDialog::initialDraftRestored, this, [this] { m_cachedRefinement.reset(); });
-    connect(preview, &lmsc::GenerationPreviewDialog::applyRequested, this, [this, preview, documentBaseline] {
-        const auto &draft = preview->draft();
-        if (!m_document->isNewSong() || !generationSourceIsCurrent(draft.source)) {
-            preview->showApplicationError(tr("当前歌曲或曲谱已改变，请关闭预览并重新生成。"));
-            return;
-        }
-        QString error;
-        const bool applied = documentBaseline
-            ? preview->hasRefinementPatch() && m_document->applyRefinementPatch(preview->refinementResult().patch,
-                draft.source.difficultyId, draft.source.documentRevision, &error)
-            : m_document->applyGeneratedChart(draft.objects, draft.source.profile.name,
-                draft.source.profile.rank, draft.source.documentRevision, &error);
-        if (!applied) {
-            preview->showApplicationError(error);
-            return;
-        }
-        preview->close();
-        m_selection.clear();
-        refreshDocument();
-        m_aiPage->showGenerationApplied();
-        statusBar()->showMessage(tr("候选曲谱已应用，切换到曲谱编辑后可一次撤销。"), 10000);
-    });
-    connect(preview, &lmsc::GenerationPreviewDialog::regenerateRequested, this, [this, preview, documentBaseline] {
-        preview->close();
-        if (documentBaseline) { m_cachedRefinement.reset(); refineCurrentChart(); }
-        else m_aiPage->generateAgain();
-    });
-    preview->show();
-}
-
 void MainWindow::updateWorkspaceActions() {
     const bool editing = m_workspacePages && m_workspacePages->currentWidget() == m_editorPage;
     m_editorToolbar->setVisible(editing);
     m_saveAction->setEnabled(editing && m_document->isLoaded() && !m_busy);
     m_exportAction->setEnabled(editing && m_document->isLoaded() && !m_busy);
-    m_undoAction->setEnabled(editing && !m_busy && m_document->canUndo());
-    m_redoAction->setEnabled(editing && !m_busy && m_document->canRedo());
+    m_undoAction->setEnabled(editing && !m_busy && !m_editorSession->viewReadOnly() && editingDocument()->canUndo());
+    m_redoAction->setEnabled(editing && !m_busy && !m_editorSession->viewReadOnly() && editingDocument()->canRedo());
 }
 
 bool MainWindow::editorCommandAllowed() const {
     // Text fields keep their own editing shortcuts.
     const QWidget *focus = QApplication::focusWidget();
     return m_workspacePages && m_workspacePages->currentWidget() == m_editorPage
-        && !m_busy && m_document->isLoaded() && !qobject_cast<const QLineEdit *>(focus)
+        && !m_busy && editingDocument()->isLoaded() && !m_editorSession->viewReadOnly() && !qobject_cast<const QLineEdit *>(focus)
         && !qobject_cast<const QAbstractSpinBox *>(focus);
 }
 
@@ -813,10 +772,10 @@ void MainWindow::buildActions() {
     file->addSeparator();
     action(file, tr("退出"), QKeySequence("Alt+F4"), [this] { close(); });
     m_undoAction = action(edit, tr("撤销"), QKeySequence::Undo, [this] {
-        if (editorCommandAllowed() && m_document->undo()) refreshDocument();
+        if (editorCommandAllowed() && prepareManualEdit() && editingDocument()->undo()) editingChanged();
     });
     m_redoAction = action(edit, tr("重做"), QKeySequence::Redo, [this] {
-        if (editorCommandAllowed() && m_document->redo()) refreshDocument();
+        if (editorCommandAllowed() && prepareManualEdit() && editingDocument()->redo()) editingChanged();
     });
     m_redoAction->setShortcuts({QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")});
     edit->addSeparator();
@@ -826,7 +785,7 @@ void MainWindow::buildActions() {
     action(edit, tr("删除物件"), QKeySequence::Delete, [this] { if (editorCommandAllowed()) deleteObjects(); });
     action(edit, tr("选择全部"), QKeySequence::SelectAll, [this] {
         if (!editorCommandAllowed()) return;
-        QSet<QString> ids; for (const auto &o : m_document->objects()) ids.insert(o.id); selectObjects(ids);
+        QSet<QString> ids; for (const auto &o : editingDocument()->objects()) ids.insert(o.id); selectObjects(ids);
     });
     toolbar->addAction(m_saveAction); toolbar->addAction(m_exportAction); toolbar->addSeparator();
     toolbar->addAction(m_undoAction); toolbar->addAction(m_redoAction);
@@ -889,7 +848,9 @@ void MainWindow::connectAudio() {
         m_initializeAudio = false;
         m_audio->setLoop(m_loopStart, m_loopEnd, m_loop->isChecked());
         m_playButton->setEnabled(!m_busy);
-        m_estimateButton->setEnabled(!m_busy && m_document->isNewSong() && !m_analyzer->isBusy());
+        m_estimateButton->setEnabled(!m_busy && m_document->isNewSong() && !m_analyzer->isBusy()
+            && m_editorSession->view() == lmsc::EditorSessionController::View::Formal
+            && !m_editorSession->viewReadOnly() && editingDocument() == m_document.get());
         m_speed->setEnabled(!m_busy);
         refreshRecognitionContext();
         if (m_analyzeNew) {
@@ -989,9 +950,12 @@ void MainWindow::openPath(const QString &input) {
 }
 
 void MainWindow::replaceDocument(std::shared_ptr<lmsc::BeatmapDocument> document) {
+    cancelRefinement(true);
     m_aiPage->invalidateGeneration();
     m_document = std::move(document);
     m_documentId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    m_editorSession->setFormalDocument(m_document.get(), m_documentId);
+    m_refinementPanel->clearResult();
     m_initializeAudio = true;
     m_selection.clear(); m_clipboard.clear(); m_loopStart = 0; m_loopEnd = 0;
     m_loop->setChecked(false);
@@ -1013,8 +977,9 @@ void MainWindow::replaceDocument(std::shared_ptr<lmsc::BeatmapDocument> document
 
 void MainWindow::refreshDocument() {
     m_refreshing = true;
+    const auto active = editingDocument();
     const bool loaded = m_document->isLoaded();
-    setWindowTitle((loaded ? m_document->title() + (m_document->isModified() ? " *" : "") + " — " : "")
+    setWindowTitle((loaded ? m_document->title() + ((m_document->isModified() || m_editorSession->isDirty()) ? " *" : "") + " — " : "")
                    + tr("光剑曲谱制作"));
     m_songLabel->setText(loaded ? m_document->title() : tr("打开曲谱或创建新歌"));
     const QString project = m_document->projectPath();
@@ -1023,16 +988,26 @@ void MainWindow::refreshDocument() {
     m_recropButton->setEnabled(!m_busy && m_document->isNewSong() && m_document->importSource().isAvailable());
     m_refineCurrentChartButton->setEnabled(currentChartSupportsRefinement());
     m_difficulties->clear();
+    QSet<QString> listedDifficulties;
     for (const auto &difficulty : m_document->difficulties()) {
         auto item = new QListWidgetItem(difficulty.characteristic + " · " + difficulty.name, m_difficulties);
         item->setData(Qt::UserRole, difficulty.id);
+        item->setData(Qt::UserRole + 1, difficulty.name);
+        listedDifficulties.insert(difficulty.name);
         item->setToolTip(difficulty.filename + " / v" + difficulty.version);
-        if (difficulty.id == m_document->currentDifficultyId()) m_difficulties->setCurrentItem(item);
+        if (difficulty.name == m_editorSession->currentTargetKey()) m_difficulties->setCurrentItem(item);
+    }
+    for (const auto &name : m_editorSession->targetKeys()) if (!listedDifficulties.contains(name)) {
+        auto item = new QListWidgetItem(tr("Standard · %1 · 草稿").arg(name), m_difficulties);
+        item->setData(Qt::UserRole + 1, name);
+        if (name == m_editorSession->currentTargetKey()) m_difficulties->setCurrentItem(item);
     }
     m_newDifficultyRow->setVisible(loaded && m_document->isNewSong());
     m_exportLeadInRow->setVisible(loaded && m_document->isNewSong());
     m_exportLeadIn->setEnabled(loaded && m_document->isNewSong() && !m_busy);
-    m_newDifficultySelector->setEnabled(loaded && m_document->isNewSong() && !m_busy);
+    m_newDifficultySelector->setEnabled(loaded && m_document->isNewSong() && !m_busy
+        && m_editorSession->view() == lmsc::EditorSessionController::View::Formal
+        && !m_editorSession->viewReadOnly() && active == m_document.get());
     if (loaded && m_document->isNewSong())
         for (const auto &difficulty : m_document->difficulties())
             if (difficulty.id==m_document->currentDifficultyId())
@@ -1040,7 +1015,7 @@ void MainWindow::refreshDocument() {
     QVector<EditorObject> display;
     QSet<QString> valid;
     int protectedCount = 0;
-    for (const auto &o : m_document->objects()) {
+    for (const auto &o : active->objects()) {
         EditorObject d;
         d.id = o.id; d.type = static_cast<int>(o.kind); d.beat = o.beat;
         d.x = o.x; d.y = o.y; d.color = o.color; d.direction = o.direction;
@@ -1050,28 +1025,33 @@ void MainWindow::refreshDocument() {
     }
     m_selection.intersect(valid);
     m_track->setObjects(display); m_grid->setObjects(display); m_timeline->setObjects(display);
-    const auto &time = m_document->timeMap();
+    const auto &time = active->timeMap();
     m_bpm->setValue(time.baseBpm()); m_offset->setValue(time.firstBeatSeconds());
     m_track->setTempo(time.baseBpm(), time.firstBeatSeconds());
     m_timeline->setTempo(time.baseBpm(), time.firstBeatSeconds());
-    auto toSeconds = [this](double beat) { return m_document->timeMap().beatToSeconds(beat); };
-    auto toBeat = [this](double seconds) { return m_document->timeMap().secondsToBeat(seconds); };
+    auto toSeconds = [this](double beat) { return editingDocument()->timeMap().beatToSeconds(beat); };
+    auto toBeat = [this](double seconds) { return editingDocument()->timeMap().secondsToBeat(seconds); };
     m_track->setTimeMapping(toSeconds, toBeat); m_timeline->setTimeMapping(toSeconds, toBeat);
-    m_grid->setEnabled(loaded && m_document->readOnlyReason().isEmpty() && !m_busy);
+    m_grid->setEnabled(loaded && active->readOnlyReason().isEmpty() && !m_busy && !m_editorSession->viewReadOnly());
     m_difficulties->setEnabled(!m_busy);
     for (QWidget *widget : QVector<QWidget *>{m_bpm, m_offset, m_calibrateButton})
-        widget->setEnabled(loaded && m_document->isNewSong() && !m_busy);
-    m_estimateButton->setEnabled(loaded && m_document->isNewSong() && m_audio->isReady() && !m_busy && !m_analyzer->isBusy());
+        widget->setEnabled(loaded && m_document->isNewSong() && !m_busy
+            && m_editorSession->view() == lmsc::EditorSessionController::View::Formal
+            && !m_editorSession->viewReadOnly() && active == m_document.get());
+    m_estimateButton->setEnabled(loaded && m_document->isNewSong() && m_audio->isReady() && !m_busy && !m_analyzer->isBusy()
+        && m_editorSession->view() == lmsc::EditorSessionController::View::Formal
+        && !m_editorSession->viewReadOnly() && active == m_document.get());
     m_playButton->setEnabled(isAudioReady() && !m_busy);
     m_speed->setEnabled(isAudioReady() && !m_busy);
     m_saveAction->setEnabled(loaded && !m_busy); m_exportAction->setEnabled(loaded && !m_busy);
-    m_undoAction->setEnabled(!m_busy && m_document->canUndo()); m_redoAction->setEnabled(!m_busy && m_document->canRedo());
+    m_undoAction->setEnabled(!m_busy && active->canUndo()); m_redoAction->setEnabled(!m_busy && active->canRedo());
     m_summaryLabel->setText(loaded ? tr("%1 个物件 · %2 个受保护\n%3")
-          .arg(display.size()).arg(protectedCount).arg(m_document->readOnlyReason()) : tr("支持 BeatSaver v2/v3 曲谱"));
+          .arg(display.size()).arg(protectedCount).arg(active->readOnlyReason()) : tr("支持 BeatSaver v2/v3 曲谱"));
     refreshSelection();
     m_grid->setBeat(currentBeat());
     refreshRecognitionContext();
     updateWorkspaceActions();
+    refreshDraftPanel();
     m_refreshing = false;
 }
 
@@ -1080,13 +1060,13 @@ void MainWindow::refreshSelection() {
     m_timeline->setSelectedIds(m_selection);
     const lmsc::BeatObject *object = nullptr;
     if (m_selection.size() == 1)
-        for (const auto &o : m_document->objects()) if (m_selection.contains(o.id)) { object = &o; break; }
-    const bool editable = object && !object->isProtected() && m_document->readOnlyReason().isEmpty() && !m_busy;
+        for (const auto &o : editingDocument()->objects()) if (m_selection.contains(o.id)) { object = &o; break; }
+    const bool editable = object && !object->isProtected() && editingDocument()->readOnlyReason().isEmpty() && !m_busy && !m_editorSession->viewReadOnly();
     for (QWidget *w : QVector<QWidget *>{m_editBeat, m_editX, m_editY, m_editColor, m_editDirection, m_applyButton})
         w->setEnabled(editable);
     // Wall dimensions also serve as placement defaults when nothing is selected.
     for (QWidget *w : QVector<QWidget *>{m_editDuration, m_editWidth, m_editHeight})
-        w->setEnabled(!m_busy && (!object || (editable && object->kind == lmsc::ObjectKind::Wall)));
+        w->setEnabled(!m_busy && !m_editorSession->viewReadOnly() && (!object || (editable && object->kind == lmsc::ObjectKind::Wall)));
     if (object) {
         m_editBeat->setValue(object->beat); m_editX->setValue(object->x); m_editY->setValue(object->y);
         m_editColor->setCurrentIndex(object->color); m_editDirection->setCurrentIndex(object->direction);
@@ -1100,13 +1080,14 @@ void MainWindow::refreshSelection() {
                                                         : tr("已选中 1 个物件"));
     } else m_protectionLabel->setText(m_selection.isEmpty() ? tr("点击物件查看属性")
                               : tr("已选中 %1 个物件，可拖动、复制、镜像或删除").arg(m_selection.size()));
-    if (!m_document->readOnlyReason().isEmpty()) m_protectionLabel->setText(m_document->readOnlyReason());
+    if (!editingDocument()->readOnlyReason().isEmpty()) m_protectionLabel->setText(editingDocument()->readOnlyReason());
+    if (m_editorSession->viewReadOnly()) m_protectionLabel->setText(tr("当前为只读对比版本，切回工作草稿或正式谱继续编辑。"));
 }
 
 void MainWindow::selectObjects(const QSet<QString> &ids) { m_selection = ids; refreshSelection(); }
 QStringList MainWindow::selectedIds() const { return m_selection.values(); }
 double MainWindow::currentBeat() const {
-    const double beat = m_document->timeMap().secondsToBeat(m_audio->position());
+    const double beat = editingDocument()->timeMap().secondsToBeat(m_audio->position());
     const int division = m_snap->currentData().toInt();
     return std::max(0.0, std::round(beat * division) / division);
 }
@@ -1116,7 +1097,7 @@ void MainWindow::seek(double seconds) {
     m_timeline->setPlayheadSeconds(seconds); m_track->setPlayheadSeconds(seconds); m_grid->setBeat(currentBeat());
 }
 void MainWindow::addObject(double beat, int x, int y) {
-    if (m_busy || !m_document->isLoaded()) return;
+    if (!prepareManualEdit()) return;
     lmsc::BeatObject object;
     object.kind = static_cast<lmsc::ObjectKind>(m_placeType->currentIndex());
     object.beat = beat; object.x = x; object.y = y;
@@ -1125,57 +1106,64 @@ void MainWindow::addObject(double beat, int x, int y) {
     if (object.kind == lmsc::ObjectKind::Wall && object.height == 5) object.y = 0;
     if (object.kind == lmsc::ObjectKind::Wall && object.height == 3) object.y = 2;
     QString error;
-    if (!m_document->addObject(object, &error)) showError(error); else refreshDocument();
+    if (!editingDocument()->addObject(object, &error)) showError(error); else editingChanged();
 }
 void MainWindow::applyProperties() {
-    if (m_busy || m_selection.size() != 1) return;
-    for (auto object : m_document->objects()) {
-        if (!m_selection.contains(object.id)) continue;
-        object.beat = m_editBeat->value(); object.x = m_editX->value(); object.y = m_editY->value();
-        if (object.kind == lmsc::ObjectKind::Note) { object.color = m_editColor->currentIndex(); object.direction = m_editDirection->currentIndex(); }
+    if (m_busy || m_selection.size() != 1 || m_editorSession->viewReadOnly()) return;
+    const auto id = *m_selection.begin();
+    const double beat = m_editBeat->value(), duration = m_editDuration->value();
+    const int x = m_editX->value(), y = m_editY->value(), color = m_editColor->currentIndex();
+    const int direction = m_editDirection->currentIndex(), width = m_editWidth->value(), height = m_editHeight->value();
+    if (!prepareManualEdit()) return;
+    for (auto object : editingDocument()->objects()) {
+        if (object.id != id) continue;
+        object.beat = beat; object.x = x; object.y = y;
+        if (object.kind == lmsc::ObjectKind::Note) { object.color = color; object.direction = direction; }
         if (object.kind == lmsc::ObjectKind::Wall) {
-            object.duration = m_editDuration->value(); object.width = m_editWidth->value(); object.height = m_editHeight->value();
+            object.duration = duration; object.width = width; object.height = height;
         }
         QString error;
-        if (!m_document->updateObject(object, &error)) showError(error); else refreshDocument();
+        if (!editingDocument()->updateObject(object, &error)) showError(error); else editingChanged();
         return;
     }
 }
 void MainWindow::moveObjects(const QSet<QString> &ids, double beats, int x, int y) {
-    if (m_busy) return;
+    if (!prepareManualEdit()) return;
     QVector<lmsc::BeatObject> edits;
-    for (auto object : m_document->objects()) if (ids.contains(object.id)) {
+    for (auto object : editingDocument()->objects()) if (ids.contains(object.id)) {
         object.beat += beats; object.x += x; object.y += y; edits.append(object);
     }
     QString error;
-    if (!m_document->updateObjects(edits, &error)) showError(error); else refreshDocument();
+    if (!editingDocument()->updateObjects(edits, &error)) showError(error); else editingChanged();
 }
 void MainWindow::deleteObjects() {
-    if (m_busy || m_selection.isEmpty()) return;
+    if (m_selection.isEmpty() || !prepareManualEdit()) return;
     QString error;
-    if (!m_document->removeObjects(selectedIds(), &error)) showError(error);
-    else { m_selection.clear(); refreshDocument(); }
+    if (!editingDocument()->removeObjects(selectedIds(), &error)) showError(error);
+    else { m_selection.clear(); editingChanged(); }
 }
 void MainWindow::copyObjects() {
     QString error;
-    auto copy = m_document->copyObjects(selectedIds(), &error);
+    auto copy = editingDocument()->copyObjects(selectedIds(), &error);
     if (!error.isEmpty()) showError(error);
     else { m_clipboard = copy; statusBar()->showMessage(tr("已复制 %1 个物件").arg(copy.size()), 3000); }
 }
 void MainWindow::pasteObjects() {
-    if (m_busy || m_clipboard.isEmpty()) return;
+    if (m_clipboard.isEmpty() || !prepareManualEdit()) return;
     double first = m_clipboard.first().beat;
     for (const auto &o : m_clipboard) first = std::min(first, o.beat);
     QString error;
-    if (!m_document->pasteObjects(m_clipboard, currentBeat() - first, 0, false, &error)) showError(error);
-    else refreshDocument();
+    if (!editingDocument()->pasteObjects(m_clipboard, currentBeat() - first, 0, false, &error)) showError(error);
+    else editingChanged();
 }
 void MainWindow::mirrorObjects() {
+    if (!prepareManualEdit()) return;
     QString error;
-    if (!m_document->mirrorObjects(selectedIds(), &error)) showError(error); else refreshDocument();
+    if (!editingDocument()->mirrorObjects(selectedIds(), &error)) showError(error); else editingChanged();
 }
 void MainWindow::calibrateTempo() {
-    if (m_busy) return;
+    if (m_busy || m_editorSession->viewReadOnly() || editingDocument() != m_document.get()) return;
+    cancelRefinement(true);
     m_analyzeNew = false; m_analyzer->cancel();
     ++m_analysisGeneration;
     QString error;
@@ -1358,6 +1346,9 @@ bool MainWindow::saveProject(bool saveAs) {
         if (path.isEmpty()) return false;
         if (!path.endsWith(".lmsc", Qt::CaseInsensitive)) path += ".lmsc";
     }
+    cancelRefinement();
+    m_aiPage->cancelRecognition();
+    if (!syncDraftRecords()) return false;
     m_storageBusy = true;
     setBusy(true, tr("正在保存工程与资源…"));
     auto doc = m_document;
@@ -1373,6 +1364,8 @@ bool MainWindow::saveProject(bool saveAs) {
     m_storageBusy = false;
     setBusy(false); refreshDocument();
     if (!result.ok) { showError(result.error); return false; }
+    m_editorSession->markSaved();
+    refreshDocument();
     statusBar()->showMessage(tr("工程已保存；每 30 秒自动保存未保存改动"), 8000);
     return true;
 }
@@ -1455,9 +1448,11 @@ void MainWindow::exportSong() {
 }
 
 bool MainWindow::confirmDocumentChange() {
-    if (!m_document->isModified()) return true;
+    cancelRefinement();
+    syncDraftRecords();
+    if (!m_document->isModified() && !m_editorSession->isDirty()) return true;
     const auto answer = QMessageBox::question(this, tr("保存当前改动"),
-       tr("当前工程有未保存的改动。是否先保存？"),
+       tr("当前工程或工作草稿有未保存的改动。是否先保存？"),
        QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel, QMessageBox::Save);
     if (answer == QMessageBox::Cancel) return false;
     return answer == QMessageBox::Discard || saveProject();
@@ -1474,11 +1469,14 @@ void MainWindow::setBusy(bool busy, const QString &message) {
     m_difficulties->setEnabled(!busy);
     m_newDifficultySelector->setEnabled(!busy && m_document->isNewSong());
     m_exportLeadIn->setEnabled(!busy && m_document->isNewSong());
-    m_grid->setEnabled(!busy && m_document->isLoaded() && m_document->readOnlyReason().isEmpty());
-    m_bpm->setEnabled(!busy && m_document->isNewSong());
-    m_offset->setEnabled(!busy && m_document->isNewSong());
-    m_calibrateButton->setEnabled(!busy && m_document->isNewSong());
-    m_estimateButton->setEnabled(!busy && m_document->isNewSong() && m_audio->isReady() && !m_analyzer->isBusy());
+    m_grid->setEnabled(!busy && editingDocument()->isLoaded() && editingDocument()->readOnlyReason().isEmpty() && !m_editorSession->viewReadOnly());
+    const bool formalView = m_editorSession->view() == lmsc::EditorSessionController::View::Formal
+        && !m_editorSession->viewReadOnly() && editingDocument() == m_document.get();
+    m_newDifficultySelector->setEnabled(!busy && m_document->isNewSong() && formalView);
+    m_bpm->setEnabled(!busy && m_document->isNewSong() && formalView);
+    m_offset->setEnabled(!busy && m_document->isNewSong() && formalView);
+    m_calibrateButton->setEnabled(!busy && m_document->isNewSong() && formalView);
+    m_estimateButton->setEnabled(!busy && m_document->isNewSong() && m_audio->isReady() && !m_analyzer->isBusy() && formalView);
     m_recropButton->setEnabled(!busy && m_document->isNewSong() && m_document->importSource().isAvailable());
     m_playButton->setEnabled(!busy && isAudioReady());
     m_speed->setEnabled(!busy && isAudioReady());
@@ -1493,6 +1491,7 @@ void MainWindow::setBusy(bool busy, const QString &message) {
 void MainWindow::closeEvent(QCloseEvent *event) {
     if (m_busy) { statusBar()->showMessage(tr("请等待当前任务完成或先取消任务"), 8000); event->ignore(); return; }
     if (!m_testMode && !confirmDocumentChange()) { event->ignore(); return; }
+    cancelRefinement();
     m_analyzeNew = m_newPending = false;
     ++m_analysisGeneration; ++m_audioGeneration; m_queuedAudio = false;
     m_analyzer->cancel(); m_audio->cancel(); m_audio->stop();

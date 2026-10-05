@@ -1,6 +1,9 @@
 #include "gui/MainWindow.h"
 #include "gui/AiRecognitionPage.h"
 #include "gui/GenerationPreviewDialog.h"
+#include "gui/EditorRefinementPanel.h"
+#include "gui/EditorSessionController.h"
+#include "gui/TaskProgressView.h"
 #include "gui/EditorViews.h"
 #include "gui/NavigationSidebar.h"
 #include "gui/ThemeManager.h"
@@ -25,10 +28,12 @@
 #include <QDesktopServices>
 #include <QDoubleSpinBox>
 #include <QFileDialog>
+#include <QFile>
 #include <QFileSystemModel>
 #include <QFormLayout>
 #include <QIcon>
 #include <QJsonArray>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -58,6 +63,7 @@
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QProgressDialog>
+#include <QScrollArea>
 #include <cmath>
 
 class HomepageUrlReceiver : public QObject {
@@ -98,13 +104,18 @@ public:
     QVector<lmsc::RefinementRequest> requests;
     QStringList cancelledJobs, discardedJobs, resumedJobs;
     lmsc::AiGenerationService::Status current;
+    bool publishPartialOnCancel = false;
     bool isAvailable() const override { return true; }
     lmsc::AiGenerationService::Status status() const override { return current; }
     void refine(const lmsc::RefinementRequest &request) override { requests.append(request); current={}; current.jobId=request.generation.jobId; current.state=lmsc::AiGenerationService::Status::Running; }
-    void cancel(const QString &job) override { cancelledJobs.append(job); current.state=lmsc::AiGenerationService::Status::Paused; current.resumable=true; emit cancelled(job); }
+    void cancel(const QString &job) override {
+        cancelledJobs.append(job); current.state=lmsc::AiGenerationService::Status::Paused; current.resumable=true;
+        if (publishPartialOnCancel && !requests.isEmpty()) emit candidateReady(resultFor(requests.last()));
+        emit cancelled(job);
+    }
     void discard(const QString &job) override { discardedJobs.append(job); current={}; }
     void resume(const QString &job) override { resumedJobs.append(job); current.state=lmsc::AiGenerationService::Status::Running; current.resumable=false; }
-    void finish(const lmsc::RefinementRequest &request) {
+    lmsc::RefinementResult resultFor(const lmsc::RefinementRequest &request) const {
         lmsc::RefinementResult result; result.source=request; result.candidate.source=request.generation;
         result.candidate.objects=request.baseline;
         if (!result.candidate.objects.isEmpty()) result.candidate.objects.first().y=2;
@@ -112,8 +123,12 @@ public:
         result.stats=lmsc::refinementStatistics(result.patch,request.baseline);
         result.processedSegments=QStringList{QStringLiteral("s1")};
         result.remainingSegments=QStringList{QStringLiteral("s2")}; result.resumable=true;
+        result.processedRanges=QStringList{QStringLiteral("p1 · 0.000–4.000 秒")};
+        return result;
+    }
+    void finish(const lmsc::RefinementRequest &request) {
         current.state=lmsc::AiGenerationService::Status::Completed; current.resumable=true;
-        emit candidateReady(result);
+        emit candidateReady(resultFor(request));
     }
 };
 
@@ -168,6 +183,26 @@ QPoint gridCell(GridEditor &grid, int x, int y) {
     const double top = 39 + (grid.height() - 78 - unit * 3) / 2;
     return QPoint(qRound(left + (x + 0.5) * unit), qRound(top + (2.5 - y) * unit));
 }
+QAction *namedAction(QWidget &root, const QString &name) {
+    for (auto action : root.findChildren<QAction *>()) if (action->text() == name) return action;
+    return nullptr;
+}
+lmsc::EditorSessionController *session(MainWindow &window) {
+    return window.findChild<lmsc::EditorSessionController *>(QStringLiteral("editorSessionController"));
+}
+lmsc::GenerationDraft syntheticDraft(const lmsc::GenerationRequest &source, int count = 3) {
+    lmsc::GenerationDraft draft;
+    draft.source = source;
+    draft.summary = QStringLiteral("编辑页内暂存的合成测试候选");
+    for (int i = 0; i < count; ++i) {
+        lmsc::BeatObject note;
+        note.beat = 2 + i * 2; note.x = i % 2 ? 2 : 0; note.y = 1;
+        note.color = i % 2; note.direction = i % 2 ? 0 : 1;
+        draft.objects.append(note);
+    }
+    draft.metrics.directional = count;
+    return draft;
+}
 }
 
 class MainWindowTest : public QObject {
@@ -184,6 +219,12 @@ private slots:
     void aiGenerationPreviewAndAtomicApply();
     void localGenerationOfflinePreviewAndApply();
     void existingNewSongRefinementIsAtomicAndReusable();
+    void manualEditCancelsRefinementAndRejectsLateResult();
+    void savedDraftReopensForManualEditingWithoutApplying();
+    void draftSynchronizationFailureDoesNotMarkSavedOrReplaceDisk();
+    void difficultySwitchPreservesIndependentDrafts();
+    void viewingCachedDraftPreservesRefinementPartialAndManualChanges();
+    void inlinePromptCannotReplaceOtherDifficulty();
     void outputLimitSettingsReachGenerationTransport();
     void clickPlaceApplyUndoAndDifficulty();
     void protectedSelectionRejectsEntireDrag();
@@ -270,14 +311,13 @@ void MainWindowTest::navigationPreservesEditorAndSettingsDraft() {
     auto settingsPages = window.findChild<QStackedWidget *>(QStringLiteral("settingsPages"));
     auto toggle = sidebar ? sidebar->findChild<QToolButton *>(QStringLiteral("navigationToggle")) : nullptr;
     QVERIFY(sidebar && nav && workspace && settingsPages && toggle);
-    const QStringList names{QStringLiteral("曲谱编辑"), QStringLiteral("AI 分析与制谱"),
+    const QStringList names{QStringLiteral("曲谱编辑"), QStringLiteral("生成与精修"),
         QStringLiteral("外观"), QStringLiteral("大语言模型"), QStringLiteral("账号授权"),
         QStringLiteral("网络"), QStringLiteral("关于")};
     QCOMPARE(nav->count(), names.size());
-    QCOMPARE(workspace->count(), 3);
+    QCOMPARE(workspace->count(), 2);
     QCOMPARE(workspace->widget(0)->objectName(), QStringLiteral("editorPage"));
-    QCOMPARE(workspace->widget(1)->objectName(), QStringLiteral("aiRecognitionPage"));
-    QCOMPARE(workspace->widget(2)->objectName(), QStringLiteral("settingsPanel"));
+    QCOMPARE(workspace->widget(1)->objectName(), QStringLiteral("settingsPanel"));
     QCOMPARE(nav->currentRow(), 0);
     QVERIFY(sidebar->isCollapsed());
     QCOMPARE(sidebar->width(), 64);
@@ -311,7 +351,7 @@ void MainWindowTest::navigationPreservesEditorAndSettingsDraft() {
     QWidget *const editor = workspace->currentWidget();
 
     nav->setCurrentRow(3);
-    QCOMPARE(workspace->currentIndex(), 2);
+    QCOMPARE(workspace->currentIndex(), 1);
     QCOMPARE(settingsPages->currentIndex(), 1);
     auto model = window.findChild<QComboBox *>(QStringLiteral("aiModel"));
     auto key = window.findChild<QLineEdit *>(QStringLiteral("aiApiKey"));
@@ -340,11 +380,10 @@ void MainWindowTest::navigationPreservesEditorAndSettingsDraft() {
     QVERIFY(!QApplication::activeModalWidget());
 
     nav->setCurrentRow(1);
-    QCOMPARE(workspace->currentIndex(), 1);
-    nav->setFocus();
-    QTest::keyClick(nav, Qt::Key_Z, Qt::ControlModifier);
-    QTest::keyClick(nav, Qt::Key_Delete);
-    QTest::keyClick(nav, Qt::Key_Space);
+    QCOMPARE(workspace->currentWidget(), editor);
+    QCOMPARE(window.findChild<QTabWidget *>(QStringLiteral("editorToolsTabs"))->currentIndex(), 1);
+    // Both navigation entries now share the same editor and its command route.
+    // Settings still preserve document edits and their undo history.
     QCOMPARE(objectCount(window), 2);
     QVERIFY(!audio->isPlaying());
     QCOMPARE(audio->position(), playbackPosition);
@@ -453,7 +492,7 @@ void MainWindowTest::aiRecognitionEntry() {
     auto status = window.findChild<QLabel *>(QStringLiteral("aiRecognitionStatus"));
     QVERIFY(nav && workspace && recognize && configure && status);
     nav->setCurrentRow(1);
-    QCOMPARE(workspace->currentIndex(), 1);
+    QCOMPARE(workspace->currentIndex(), 0);
     QVERIFY(recognize->isVisible());
     QVERIFY(!recognize->isEnabled());
     QVERIFY(!status->text().isEmpty());
@@ -470,7 +509,7 @@ void MainWindowTest::aiRecognitionEntry() {
     QCOMPARE(objectCount(window), 3);
     QTest::mouseClick(configure, Qt::LeftButton);
     QCOMPARE(nav->currentRow(), 3);
-    QCOMPARE(workspace->currentIndex(), 2);
+    QCOMPARE(workspace->currentIndex(), 1);
     QCOMPARE(window.findChild<QStackedWidget *>(QStringLiteral("settingsPages"))->currentIndex(), 1);
     QVERIFY(!QApplication::activeModalWidget());
     window.close();
@@ -558,93 +597,65 @@ void MainWindowTest::outputLimitSettingsReachGenerationTransport() {
 void MainWindowTest::localGenerationOfflinePreviewAndApply() {
     QString error;
     const QString song = QDir(m_song).filePath(QStringLiteral("song.ogg"));
-    QFile source(song);
-    QVERIFY(source.open(QIODevice::ReadOnly));
-    const auto hash = QCryptographicHash::hash(source.readAll(), QCryptographicHash::Sha256);
-    source.close();
+    QFile source(song); QVERIFY(source.open(QIODevice::ReadOnly));
+    const auto hash = QCryptographicHash::hash(source.readAll(), QCryptographicHash::Sha256); source.close();
     lmsc::BeatmapDocument original;
     QVERIFY2(original.createNew(song, QStringLiteral("本地制谱检查"), 120, .25, {}, &error), qPrintable(error));
-    lmsc::BeatObject note;
-    note.beat = 2; note.direction = 1;
+    lmsc::BeatObject note; note.beat = 2; note.direction = 1;
     QVERIFY2(original.addObject(note, &error), qPrintable(error));
     const QString project = m_temp.filePath(QStringLiteral("local-generation-project/project.lmsc"));
     QVERIFY2(original.saveProject(project, &error), qPrintable(error));
-    MainWindow window(nullptr, settingsFile());
-    window.setTestMode(true);
-    window.show();
-    QSignalSpy ready(&window, &MainWindow::documentReady);
-    window.openPath(project);
+    MainWindow window(nullptr, settingsFile()); window.setTestMode(true); window.show();
+    QSignalSpy ready(&window, &MainWindow::documentReady); window.openPath(project);
     QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 20000);
     QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
-    auto *page = window.findChild<lmsc::AiRecognitionPage *>();
-    auto *service = window.findChild<lmsc::LocalAiGenerationService *>();
-    auto *nav = window.findChild<QListWidget *>(QStringLiteral("mainNavigation"));
-    auto *generate = window.findChild<QPushButton *>(QStringLiteral("aiGenerateButton"));
-    auto *target = window.findChild<QComboBox *>(QStringLiteral("aiGenerationDifficulty"));
-    auto *actual = window.findChild<QComboBox *>(QStringLiteral("newSongDifficultySelector"));
-    auto *candidate = window.findChild<QPushButton *>(QStringLiteral("aiViewCandidate"));
-    QVERIFY(page && service && nav && generate && target && actual && candidate);
+    auto page = window.findChild<lmsc::AiRecognitionPage *>();
+    auto service = window.findChild<lmsc::LocalAiGenerationService *>();
+    auto nav = window.findChild<QListWidget *>(QStringLiteral("mainNavigation"));
+    auto generate = window.findChild<QPushButton *>(QStringLiteral("aiGenerateButton"));
+    auto target = window.findChild<QComboBox *>(QStringLiteral("aiGenerationDifficulty"));
+    auto controller = session(window);
+    QVERIFY(page && service && nav && generate && target && controller);
     QCOMPARE(page->generationMode(), lmsc::AiRecognitionPage::Hybrid);
     page->setGenerationMode(lmsc::AiRecognitionPage::LocalQuick);
     QVERIFY(!QFile::exists(settingsFile()));
-    nav->setCurrentRow(1);
-    target->setCurrentIndex(target->findData(QStringLiteral("Hard")));
+    nav->setCurrentRow(1); target->setCurrentIndex(target->findData(QStringLiteral("Hard")));
     QVERIFY(generate->isEnabled());
     QSignalSpy drafts(service, &lmsc::AiGenerationService::draftReady);
     QSignalSpy failed(service, &lmsc::AiGenerationService::requestFailed);
-    generate->click();
-    nav->setCurrentRow(0);
+    generate->click(); nav->setCurrentRow(0);
     QTRY_VERIFY_WITH_TIMEOUT(drafts.count() == 1 || failed.count() > 0, 30000);
-    const QString failure = failed.isEmpty() ? QString() : failed.first().at(1).toString();
-    QVERIFY2(failed.isEmpty(), qPrintable(failure));
+    QVERIFY2(failed.isEmpty(), qPrintable(failed.isEmpty() ? QString() : failed.first().at(1).toString()));
     const auto draft = qvariant_cast<lmsc::GenerationDraft>(drafts.first().first());
     QVERIFY(draft.objects.size() > 1);
-    QCOMPARE(objectCount(window), 1);
+    QCOMPARE(controller->formalDocument()->objects().size(), 1);
+    QCOMPARE(controller->workingDocument()->objects().size(), draft.objects.size());
+    QCOMPARE(objectCount(window), draft.objects.size());
     QVERIFY(!window.findChild<lmsc::GenerationPreviewDialog *>());
-    nav->setCurrentRow(1);
-    QVERIFY(candidate->isEnabled());
     const QString captures = qEnvironmentVariable("LMSC_LOCAL_CAPTURE_DIRECTORY");
     if (!captures.isEmpty()) {
-        QVERIFY(QDir().mkpath(captures));
-        const QString originalTheme = lmsc::ThemeManager::mode();
-        for (const QString &mode : {QStringLiteral("light"), QStringLiteral("dark")}) {
-            lmsc::ThemeManager::apply(mode);
-            window.resize(1200, 800);
-            QApplication::processEvents();
-            QTest::qWait(80);
+        QVERIFY(QDir().mkpath(captures)); const auto theme = lmsc::ThemeManager::mode();
+        for (const QString &mode : QStringList{QStringLiteral("light"), QStringLiteral("dark")}) {
+            lmsc::ThemeManager::apply(mode); window.resize(1200, 800); QTest::qWait(80);
             QVERIFY(window.grab().save(QDir(captures).filePath(QStringLiteral("local-generation-%1.png").arg(mode))));
         }
-        lmsc::ThemeManager::apply(originalTheme);
+        lmsc::ThemeManager::apply(theme);
     }
-    candidate->click();
-    QPointer<lmsc::GenerationPreviewDialog> preview = window.findChild<lmsc::GenerationPreviewDialog *>();
-    QVERIFY(preview && preview->isVisible());
-    if (!captures.isEmpty()) {
-        QApplication::processEvents();
-        QVERIFY(preview->grab().save(QDir(captures).filePath(QStringLiteral("local-preview.png"))));
-    }
-    preview->findChild<QPushButton *>(QStringLiteral("generationPreviewApply"))->click();
-    QTRY_VERIFY(preview.isNull());
-    QCOMPARE(objectCount(window), draft.objects.size());
-    QCOMPARE(actual->currentData().toString(), QStringLiteral("Hard"));
-    QCOMPARE(window.findChild<QListWidget *>(QStringLiteral("difficultyList"))->count(), 2);
-    nav->setCurrentRow(0);
-    QAction *undo = nullptr, *redo = nullptr, *save = nullptr;
-    for (auto *action : window.findChildren<QAction *>()) {
-        if (action->text() == QStringLiteral("撤销")) undo = action;
-        if (action->text() == QStringLiteral("重做")) redo = action;
-        if (action->text() == QStringLiteral("保存工程")) save = action;
-    }
+    auto apply = window.findChild<QPushButton *>(QStringLiteral("editorCandidateApply"));
+    QVERIFY(apply && apply->isEnabled()); apply->click();
+    QCOMPARE(controller->formalDocument()->objects().size(), draft.objects.size());
+    QCOMPARE(controller->formalDocument()->difficulties().size(), 2);
+    auto versions = window.findChild<QComboBox *>(QStringLiteral("editorCandidateVersion"));
+    versions->setCurrentIndex(versions->findData(lmsc::EditorRefinementPanel::Formal));
+    auto undo = namedAction(window, QStringLiteral("撤销"));
+    auto redo = namedAction(window, QStringLiteral("重做"));
+    auto save = namedAction(window, QStringLiteral("保存工程"));
     QVERIFY(undo && redo && save);
-    undo->trigger();
-    QCOMPARE(objectCount(window), 1);
-    QCOMPARE(actual->currentData().toString(), QStringLiteral("Expert"));
-    redo->trigger();
-    QCOMPARE(objectCount(window), draft.objects.size());
-    save->trigger();
-    QTRY_VERIFY_WITH_TIMEOUT(save->isEnabled(), 20000);
-    lmsc::BeatmapDocument reopened;
-    QVERIFY2(reopened.loadProject(project, &error), qPrintable(error));
+    undo->trigger(); QCOMPARE(controller->formalDocument()->objects().size(), 1);
+    QCOMPARE(controller->formalDocument()->difficulties().size(), 1);
+    redo->trigger(); QCOMPARE(controller->formalDocument()->objects().size(), draft.objects.size());
+    save->trigger(); QTRY_VERIFY_WITH_TIMEOUT(save->isEnabled(), 20000);
+    lmsc::BeatmapDocument reopened; QVERIFY2(reopened.loadProject(project, &error), qPrintable(error));
     QCOMPARE(reopened.difficulties().size(), 2);
     QCOMPARE(reopened.objects().size(), draft.objects.size());
     QVERIFY(source.open(QIODevice::ReadOnly));
@@ -653,229 +664,538 @@ void MainWindowTest::localGenerationOfflinePreviewAndApply() {
 }
 
 void MainWindowTest::existingNewSongRefinementIsAtomicAndReusable() {
-    QString error;
-    lmsc::BeatmapDocument original;
-    QVERIFY2(original.createNew(QDir(m_song).filePath(QStringLiteral("song.ogg")),QStringLiteral("已有谱精修"),120,0,{},&error),qPrintable(error));
-    lmsc::BeatObject note; note.beat=2; note.x=0; note.y=0; note.direction=1;
-    QVERIFY2(original.addObject(note,&error),qPrintable(error));
-    const QString originalId=original.objects().first().id;
-    const QString project=m_temp.filePath(QStringLiteral("refinement-project/project.lmsc"));
-    QVERIFY2(original.saveProject(project,&error),qPrintable(error));
-    MainRefinementService service; MainWindow window(nullptr,settingsFile());
+    QString error; lmsc::BeatmapDocument original;
+    QVERIFY2(original.createNew(QDir(m_song).filePath(QStringLiteral("song.ogg")), QStringLiteral("已有谱精修"), 120, 0, {}, &error), qPrintable(error));
+    lmsc::BeatObject note; note.beat = 2; note.x = 0; note.y = 0; note.direction = 1;
+    note.preservedCustomData = {{"_customData", QJsonObject{{"_color", QJsonArray{.2, .3, .4, 1}}}}};
+    QVERIFY2(original.addObject(note, &error), qPrintable(error));
+    const QString originalId = original.objects().first().id;
+    const auto preserved = original.objects().first().preservedCustomData;
+    const QString project = m_temp.filePath(QStringLiteral("refinement-project/project.lmsc"));
+    QVERIFY2(original.saveProject(project, &error), qPrintable(error));
+    MainRefinementService service; MainWindow window(nullptr, settingsFile());
     window.setTestMode(true); window.setAiRefinementService(&service); window.show();
-    QSignalSpy ready(&window,&MainWindow::documentReady); window.openPath(project);
-    QTRY_COMPARE_WITH_TIMEOUT(ready.count(),1,20000); QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(),20000);
-    auto entry=window.findChild<QPushButton *>(QStringLiteral("refineCurrentChartButton")); QVERIFY(entry && entry->isEnabled());
-    auto audio=window.findChild<AudioService *>(); QVERIFY(audio);
-    const QString audioPath=audio->pcmSnapshot().sourcePath;
-    QSignalSpy decoded(audio,&AudioService::audioReady);
-    audio->loadAudio(audioPath);
+    QSignalSpy ready(&window, &MainWindow::documentReady); window.openPath(project);
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 20000); QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
+    auto entry = window.findChild<QPushButton *>(QStringLiteral("refineCurrentChartButton"));
+    QVERIFY(entry && entry->isEnabled());
+    auto audio = window.findChild<AudioService *>(); QVERIFY(audio);
+    const QString audioPath = audio->pcmSnapshot().sourcePath;
+    QSignalSpy decoded(audio, &AudioService::audioReady); audio->loadAudio(audioPath);
     QVERIFY(!entry->isEnabled());
-    QTRY_COMPARE_WITH_TIMEOUT(decoded.count(),1,20000); QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(),20000);
+    QTRY_COMPARE_WITH_TIMEOUT(decoded.count(), 1, 20000); QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
     QVERIFY(entry->isEnabled());
-    auto grid=window.findChild<GridEditor *>(); QVERIFY(grid);
-    auto currentY=[&] { emit grid->selectionChanged(QSet<QString>{originalId}); return field<QSpinBox>(window,QStringLiteral("层 (0–2)"))->value(); };
-    QCOMPARE(currentY(),0);
-    entry->click(); QPointer<lmsc::GenerationPreviewDialog> preview=window.findChild<lmsc::GenerationPreviewDialog *>();
-    QVERIFY(preview); QCOMPARE(preview->initialDraft().objects.first().id,originalId);
-    QVERIFY(!preview->findChild<QPushButton *>(QStringLiteral("generationPreviewApply"))->isEnabled());
-    preview->setRefinementSelection(0,4); preview->refineChart(); QCOMPARE(service.requests.size(),1);
-    const auto request=service.requests.last(); service.finish(request);
-    QCOMPARE(currentY(),0); QVERIFY(preview->hasRefinementPatch()); QCOMPARE(preview->draft().objects.first().y,2);
-    const QString captures=qEnvironmentVariable("LMSC_HYBRID_CAPTURE_DIRECTORY");
+    auto controller = session(window); QVERIFY(controller);
+    auto panel = window.findChild<lmsc::EditorRefinementPanel *>(); QVERIFY(panel);
+    auto nav = window.findChild<QListWidget *>(QStringLiteral("mainNavigation"));
+    nav->setCurrentRow(1); panel->setSelection(0, 4);
+    auto refine = window.findChild<QPushButton *>(QStringLiteral("editorRefineButton"));
+    QVERIFY(refine && refine->isEnabled()); refine->click(); QCOMPARE(service.requests.size(), 1);
+    const auto request = service.requests.last();
+    QVERIFY(request.selectedOnly); QCOMPARE(request.endSeconds, 4.0);
+    QCOMPARE(request.baseline.first().id, originalId);
+    service.finish(request);
+    QCOMPARE(controller->formalDocument()->objects().first().y, 0);
+    QCOMPARE(controller->workingDocument()->objects().first().y, 2);
+    QCOMPARE(controller->initialDocument()->objects().first().y, 0);
+    QVERIFY(controller->hasBeforeRefinement());
+    QCOMPARE(controller->workingDocument()->objects().first().preservedCustomData, preserved);
+    QVERIFY(!window.findChild<lmsc::GenerationPreviewDialog *>());
+    const QString captures = qEnvironmentVariable("LMSC_HYBRID_CAPTURE_DIRECTORY");
     if (!captures.isEmpty()) {
-        QVERIFY(QDir().mkpath(captures)); const auto originalTheme=lmsc::ThemeManager::mode();
-        preview->resize(1080,760); window.resize(1080,760);
-        for (const QString theme : {QStringLiteral("light"),QStringLiteral("dark")}) {
-            lmsc::ThemeManager::apply(theme); QTest::qWait(100);
-            QVERIFY(preview->grab().save(QDir(captures).filePath("refinement-existing-"+theme+".png")));
-            auto nav=window.findChild<QListWidget *>(QStringLiteral("mainNavigation")); nav->setCurrentRow(1); QTest::qWait(50);
-            QVERIFY(window.grab().save(QDir(captures).filePath("hybrid-page-"+theme+".png"))); nav->setCurrentRow(0);
+        QVERIFY(QDir().mkpath(captures)); const auto theme = lmsc::ThemeManager::mode();
+        window.resize(1080, 760);
+        for (const QString &mode : QStringList{QStringLiteral("light"), QStringLiteral("dark")}) {
+            lmsc::ThemeManager::apply(mode); QTest::qWait(80);
+            QVERIFY(window.grab().save(QDir(captures).filePath("refinement-existing-" + mode + ".png")));
         }
-        lmsc::ThemeManager::apply(originalTheme);
+        lmsc::ThemeManager::apply(theme);
     }
-    preview->close(); QTRY_VERIFY(preview.isNull());
+    nav->setCurrentRow(3); nav->setCurrentRow(1);
+    QCOMPARE(controller->workingDocument()->objects().first().y, 2);
     QVERIFY(!service.discardedJobs.contains(request.generation.jobId));
-    entry->click(); preview=window.findChild<lmsc::GenerationPreviewDialog *>(); QVERIFY(preview);
-    QVERIFY(preview->hasRefinementPatch()); QCOMPARE(preview->draft().objects.first().y,2);
-    auto resume=preview->findChild<QPushButton *>(QStringLiteral("generationRefinementResume")); QVERIFY(resume->isEnabled());
-    resume->click(); QCOMPARE(service.resumedJobs,QStringList{request.generation.jobId}); service.finish(request);
-    preview->findChild<QPushButton *>(QStringLiteral("generationPreviewApply"))->click(); QTRY_VERIFY(preview.isNull());
-    QCOMPARE(objectCount(window),1); QCOMPARE(currentY(),2);
-    QAction *undo=nullptr,*redo=nullptr,*save=nullptr;
-    for (auto action : window.findChildren<QAction *>()) {
-        if (action->text()==QStringLiteral("撤销")) undo=action;
-        if (action->text()==QStringLiteral("重做")) redo=action;
-        if (action->text()==QStringLiteral("保存工程")) save=action;
-    }
-    QVERIFY(undo && redo && save); undo->trigger(); QCOMPARE(currentY(),0);
-    redo->trigger(); QCOMPARE(currentY(),2); save->trigger(); QTRY_VERIFY_WITH_TIMEOUT(save->isEnabled(),20000);
-    lmsc::BeatmapDocument reopened; QVERIFY2(reopened.loadProject(project,&error),qPrintable(error));
-    QCOMPARE(reopened.objects().first().id,originalId); QCOMPARE(reopened.objects().first().y,2);
-    window.openPath(m_song); QTRY_COMPARE_WITH_TIMEOUT(ready.count(),2,20000); QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(),20000);
+    auto resume = window.findChild<QPushButton *>(QStringLiteral("editorRefinementResume"));
+    QVERIFY(resume && resume->isEnabled()); resume->click();
+    QCOMPARE(service.resumedJobs, QStringList{request.generation.jobId}); service.finish(request);
+    auto apply = window.findChild<QPushButton *>(QStringLiteral("editorCandidateApply"));
+    QVERIFY(apply->isEnabled()); apply->click();
+    QCOMPARE(controller->formalDocument()->objects().first().id, originalId);
+    QCOMPARE(controller->formalDocument()->objects().first().y, 2);
+    auto undo = namedAction(window, QStringLiteral("撤销"));
+    auto redo = namedAction(window, QStringLiteral("重做"));
+    auto save = namedAction(window, QStringLiteral("保存工程"));
+    QVERIFY(undo && redo && save);
+    undo->trigger(); QCOMPARE(controller->formalDocument()->objects().first().y, 0);
+    redo->trigger(); QCOMPARE(controller->formalDocument()->objects().first().y, 2);
+    save->trigger(); QTRY_VERIFY_WITH_TIMEOUT(save->isEnabled(), 20000);
+    lmsc::BeatmapDocument reopened; QVERIFY2(reopened.loadProject(project, &error), qPrintable(error));
+    QCOMPARE(reopened.objects().first().id, originalId); QCOMPARE(reopened.objects().first().y, 2);
+    QCOMPARE(reopened.objects().first().preservedCustomData, preserved);
+    window.openPath(m_song); QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 2, 20000);
+    QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
     QVERIFY(!entry->isEnabled()); window.close();
 }
 
 void MainWindowTest::aiGenerationPreviewAndAtomicApply() {
-    QString error;
-    lmsc::BeatmapDocument original;
-    QVERIFY2(original.createNew(QDir(m_song).filePath(QStringLiteral("song.ogg")),
-                               QStringLiteral("AI 新歌测试"), 120, 0, {}, &error), qPrintable(error));
-    lmsc::BeatObject old;
-    old.beat = 2; old.x = 0; old.y = 0; old.direction = 1;
+    QString error; lmsc::BeatmapDocument original;
+    QVERIFY2(original.createNew(QDir(m_song).filePath(QStringLiteral("song.ogg")), QStringLiteral("统一编辑测试"), 120, 0, {}, &error), qPrintable(error));
+    lmsc::BeatObject old; old.beat = 8; old.x = 1; old.direction = 1;
+    old.preservedCustomData = {{"_customData", QJsonObject{{"_color", QJsonArray{.2, .3, .4, 1}}}}};
     QVERIFY2(original.addObject(old, &error), qPrintable(error));
+    const QString expertId = original.currentDifficultyId();
+    const auto originalObject = original.objects().first();
     const QString project = m_temp.filePath(QStringLiteral("ai-generation-project/project.lmsc"));
     QVERIFY2(original.saveProject(project, &error), qPrintable(error));
-    MainGenerationService service;
-    MainWindow window(nullptr, settingsFile());
-    window.setTestMode(true);
-    window.setAiGenerationService(&service);
-    QVERIFY(!service.parent());
-    window.show();
-    QSignalSpy ready(&window, &MainWindow::documentReady);
-    window.openPath(project);
-    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 20000);
-    QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
+    MainGenerationService service; MainWindow window(nullptr, settingsFile());
+    window.setTestMode(true); window.setAiGenerationService(&service); window.show();
+    QSignalSpy ready(&window, &MainWindow::documentReady); window.openPath(project);
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 20000); QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
+    auto controller = session(window); QVERIFY(controller);
     auto audio = window.findChild<AudioService *>();
     auto nav = window.findChild<QListWidget *>(QStringLiteral("mainNavigation"));
     auto generate = window.findChild<QPushButton *>(QStringLiteral("aiGenerateButton"));
-    auto targetDifficulty = window.findChild<QComboBox *>(QStringLiteral("aiGenerationDifficulty"));
-    auto actualDifficulty = window.findChild<QComboBox *>(QStringLiteral("newSongDifficultySelector"));
-    auto grid = window.findChild<GridEditor *>();
-    QVERIFY(audio && nav && generate && targetDifficulty && actualDifficulty && grid);
-    audio->seek(1.25);
-    audio->setLoop(1, 2, true);
+    auto target = window.findChild<QComboBox *>(QStringLiteral("aiGenerationDifficulty"));
+    auto apply = window.findChild<QPushButton *>(QStringLiteral("editorCandidateApply"));
+    auto workspace = window.findChild<QStackedWidget *>(QStringLiteral("workspacePages"));
+    QVERIFY(audio && nav && generate && target && apply && workspace);
+    audio->seek(1.25); audio->setLoop(1, 2, true);
     const auto originalAudio = audio->pcmSnapshot();
-    QFile sourceAudio(originalAudio.sourcePath);
-    QVERIFY(sourceAudio.open(QIODevice::ReadOnly));
-    const auto audioHash = QCryptographicHash::hash(sourceAudio.readAll(), QCryptographicHash::Sha256);
-    sourceAudio.close();
+    QFile sourceAudio(originalAudio.sourcePath); QVERIFY(sourceAudio.open(QIODevice::ReadOnly));
+    const auto audioHash = QCryptographicHash::hash(sourceAudio.readAll(), QCryptographicHash::Sha256); sourceAudio.close();
+    nav->setCurrentRow(1); target->setCurrentIndex(target->findData(QStringLiteral("Hard")));
+    generate->click(); QCOMPARE(service.requests.size(), 1);
+    const auto obsolete = syntheticDraft(service.requests.last());
+    auto bpm = field<QDoubleSpinBox>(window, QStringLiteral("BPM"));
+    auto calibrate = button(window, QStringLiteral("应用校准")); QVERIFY(bpm && calibrate);
+    bpm->setValue(121); calibrate->click();
+    emit service.draftReady(obsolete);
+    QVERIFY(!controller->hasDraft());
+    QCOMPARE(controller->formalDocument()->objects().size(), 1);
+    bpm->setValue(120); calibrate->click();
+    generate->click(); QCOMPARE(service.requests.size(), 2);
+    auto draft = syntheticDraft(service.requests.last());
+    nav->setCurrentRow(3); emit service.draftReady(draft);
+    QCOMPARE(workspace->currentWidget()->objectName(), QStringLiteral("settingsPanel"));
     nav->setCurrentRow(1);
-    targetDifficulty->setCurrentIndex(targetDifficulty->findData(QStringLiteral("Hard")));
-    QCOMPARE(actualDifficulty->currentData().toString(), QStringLiteral("Expert"));
-    QVERIFY(generate->isEnabled());
-    generate->click();
-    QCOMPARE(service.requests.size(), 1);
-    lmsc::GenerationDraft draft;
-    draft.source = service.requests.last();
-    draft.summary = QStringLiteral("预览后应用的测试规划");
-    for (int i = 0; i < 3; ++i) {
-        lmsc::BeatObject note;
-        note.beat = 1 + i; note.x = i % 2 == 0 ? 0 : 2; note.y = 1;
-        note.color = i % 2; note.direction = i % 2 == 0 ? 1 : 0;
-        draft.objects.append(note);
-    }
-    draft.metrics.directional = 3;
-    nav->setCurrentRow(0);
-    emit service.draftReady(draft);
+    QCOMPARE(workspace->currentWidget()->objectName(), QStringLiteral("editorPage"));
+    QCOMPARE(controller->currentTargetKey(), QStringLiteral("Hard"));
+    QCOMPARE(controller->formalDocument()->objects().size(), 1);
+    QCOMPARE(controller->workingDocument()->objects().size(), 3);
+    QCOMPARE(controller->initialDocument()->objects().size(), 3);
     QVERIFY(!window.findChild<lmsc::GenerationPreviewDialog *>());
-    nav->setCurrentRow(1);
-    auto viewCandidate=window.findChild<QPushButton *>(QStringLiteral("aiViewCandidate"));
-    QVERIFY(viewCandidate && viewCandidate->isEnabled()); viewCandidate->click();
-    QPointer<lmsc::GenerationPreviewDialog> preview = window.findChild<lmsc::GenerationPreviewDialog *>();
-    QVERIFY(preview && preview->isVisible());
-    QCOMPARE(objectCount(window), 1);
-    QCOMPARE(actualDifficulty->currentData().toString(), QStringLiteral("Expert"));
-    QVERIFY(!audio->loopEnabled());
-    preview->findChild<QPushButton *>(QStringLiteral("generationPreviewCancel"))->click();
-    QTRY_VERIFY(preview.isNull());
-    QVERIFY(audio->loopEnabled());
-    QCOMPARE(audio->loopStartSeconds(), 1.0);
-    QCOMPARE(audio->loopEndSeconds(), 2.0);
-    QCOMPARE(objectCount(window), 1);
-    generate->click();
-    QCOMPARE(service.requests.size(), 2);
-    emit service.draftReady(draft);
-    QVERIFY(!window.findChild<lmsc::GenerationPreviewDialog *>());
-    draft.source = service.requests.last();
-    emit service.draftReady(draft);
-    preview = window.findChild<lmsc::GenerationPreviewDialog *>();
-    QVERIFY(preview);
-    preview->findChild<QPushButton *>(QStringLiteral("generationPreviewApply"))->click();
-    QTRY_VERIFY(preview.isNull());
-    QCOMPARE(objectCount(window), 3);
-    QCOMPARE(actualDifficulty->currentData().toString(), QStringLiteral("Hard"));
-    auto difficulties=window.findChild<QListWidget *>(QStringLiteral("difficultyList"));
-    QVERIFY(difficulties);
-    QCOMPARE(difficulties->count(),2);
-    nav->setCurrentRow(0);
-    window.activateWindow(); window.raise(); QTRY_VERIFY(window.isActiveWindow());
-    grid->setFocus();
-    QTRY_COMPARE(QApplication::focusWidget(),static_cast<QWidget *>(grid));
-    QTest::keyClick(grid, Qt::Key_Z, Qt::ControlModifier);
-    QCOMPARE(objectCount(window), 1);
-    QCOMPARE(actualDifficulty->currentData().toString(), QStringLiteral("Expert"));
-    QTest::keyClick(grid, Qt::Key_Y, Qt::ControlModifier);
-    QCOMPARE(objectCount(window), 3);
-    QCOMPARE(actualDifficulty->currentData().toString(), QStringLiteral("Hard"));
-    // A second generation adds Easy without changing Expert or the first Hard.
-    nav->setCurrentRow(1);
-    targetDifficulty->setCurrentIndex(targetDifficulty->findData(QStringLiteral("Easy")));
-    generate->click();
-    QCOMPARE(service.requests.size(),3);
-    draft.source=service.requests.last(); draft.objects.resize(2);
-    emit service.draftReady(draft);
-    preview=window.findChild<lmsc::GenerationPreviewDialog *>(); QVERIFY(preview);
-    auto notice=preview->findChild<QLabel *>(QStringLiteral("generationReplaceNotice"));
-    QVERIFY(notice && notice->text().contains(QStringLiteral("添加 Easy")));
-    preview->findChild<QPushButton *>(QStringLiteral("generationPreviewApply"))->click();
-    QTRY_VERIFY(preview.isNull());
-    QCOMPARE(difficulties->count(),3);
-    QCOMPARE(actualDifficulty->currentData().toString(),QStringLiteral("Easy"));
-    QCOMPARE(objectCount(window),2);
-    nav->setCurrentRow(0);
-    for (int i=0;i<difficulties->count();++i)
-        if (difficulties->item(i)->text().endsWith(QStringLiteral("Expert"))) { difficulties->setCurrentRow(i); break; }
-    QCOMPARE(objectCount(window),1);
-    QCOMPARE(actualDifficulty->currentData().toString(),QStringLiteral("Expert"));
-    window.activateWindow(); window.raise(); QTRY_VERIFY(window.isActiveWindow());
-    grid->setFocus(); QTRY_COMPARE(QApplication::focusWidget(),static_cast<QWidget *>(grid));
-    QTest::keyClick(grid,Qt::Key_Z,Qt::ControlModifier);
-    QCOMPARE(difficulties->count(),2);
-    QCOMPARE(objectCount(window),3);
-    QCOMPARE(actualDifficulty->currentData().toString(),QStringLiteral("Hard"));
-    QTest::keyClick(grid,Qt::Key_Y,Qt::ControlModifier);
-    QCOMPARE(difficulties->count(),3);
-    QCOMPARE(objectCount(window),2);
-    QCOMPARE(actualDifficulty->currentData().toString(),QStringLiteral("Easy"));
-    const QString captures=qEnvironmentVariable("LMSC_MAIN_CAPTURE_DIRECTORY");
-    if (!captures.isEmpty()) {
-        QVERIFY(QDir().mkpath(captures));
-        for (const QString &mode : QStringList{"dark","light"}) {
-            lmsc::ThemeManager::apply(mode); QTest::qWait(80);
-            QVERIFY(window.grab().save(QDir(captures).filePath("main-editor-multiple-difficulties-"+mode+".png")));
-        }
-    }
-    // Replacement notice counts Hard's chart, even while Easy is selected.
-    nav->setCurrentRow(1);
-    targetDifficulty->setCurrentIndex(targetDifficulty->findData(QStringLiteral("Hard")));
-    generate->click(); QCOMPARE(service.requests.size(),4);
-    draft.source=service.requests.last(); draft.objects.resize(1);
-    emit service.draftReady(draft);
-    preview=window.findChild<lmsc::GenerationPreviewDialog *>(); QVERIFY(preview);
-    notice=preview->findChild<QLabel *>(QStringLiteral("generationReplaceNotice"));
-    QVERIFY(notice && notice->text().contains(QStringLiteral("Hard 难度的 3 个物件")));
-    if (!captures.isEmpty()) {
-        QTest::qWait(80);
-        QVERIFY(preview->grab().save(QDir(captures).filePath("main-preview-replace-target-only.png")));
-    }
-    preview->findChild<QPushButton *>(QStringLiteral("generationPreviewApply"))->click();
-    QTRY_VERIFY(preview.isNull());
-    QCOMPARE(difficulties->count(),3); QCOMPARE(objectCount(window),1);
-    QCOMPARE(actualDifficulty->currentData().toString(),QStringLiteral("Hard"));
-    nav->setCurrentRow(0); window.activateWindow(); window.raise(); QTRY_VERIFY(window.isActiveWindow());
-    grid->setFocus(); QTRY_COMPARE(QApplication::focusWidget(),static_cast<QWidget *>(grid));
-    QTest::keyClick(grid,Qt::Key_Z,Qt::ControlModifier);
-    QCOMPARE(difficulties->count(),3); QCOMPARE(objectCount(window),3);
-    QCOMPARE(actualDifficulty->currentData().toString(),QStringLiteral("Hard"));
+    QVERIFY(audio->loopEnabled()); QCOMPARE(audio->loopStartSeconds(), 1.0); QCOMPARE(audio->loopEndSeconds(), 2.0);
+    nav->setCurrentRow(3); nav->setCurrentRow(1);
+    QCOMPARE(controller->workingDocument()->objects().size(), 3);
+    QVERIFY(apply->isEnabled()); apply->click();
+    QCOMPARE(controller->formalDocument()->difficulties().size(), 2);
+    QCOMPARE(controller->formalDocument()->objects().size(), 3);
+    auto undo = namedAction(window, QStringLiteral("撤销"));
+    auto redo = namedAction(window, QStringLiteral("重做")); QVERIFY(undo && redo);
+    undo->trigger();
+    QCOMPARE(controller->formalDocument()->difficulties().size(), 1);
+    QCOMPARE(controller->formalDocument()->objects().size(), 1);
+    QCOMPARE(controller->formalDocument()->objects().first().id, originalObject.id);
+    redo->trigger(); QCOMPARE(controller->formalDocument()->objects().size(), 3);
+
+    target->setCurrentIndex(target->findData(QStringLiteral("Easy"))); generate->click();
+    QCOMPARE(service.requests.size(), 3); emit service.draftReady(syntheticDraft(service.requests.last(), 2));
+    QCOMPARE(controller->formalDocument()->difficulties().size(), 2);
+    QCOMPARE(controller->workingDocument()->objects().size(), 2);
+    apply->click(); QCOMPARE(controller->formalDocument()->difficulties().size(), 3);
+    QCOMPARE(controller->formalDocument()->objectCount(expertId), 1);
+    undo->trigger(); QCOMPARE(controller->formalDocument()->difficulties().size(), 2);
+    redo->trigger(); QCOMPARE(controller->formalDocument()->difficulties().size(), 3);
+
+    target->setCurrentIndex(target->findData(QStringLiteral("Hard"))); generate->click();
+    QCOMPARE(service.requests.size(), 4); emit service.draftReady(syntheticDraft(service.requests.last(), 1));
+    auto replacement = window.findChild<QWidget *>(QStringLiteral("draftReplacementPrompt"));
+    if (replacement->isVisible()) window.findChild<QPushButton *>(QStringLiteral("draftReplacementAccept"))->click();
+    QCOMPARE(controller->workingDocument()->objects().size(), 1);
+    apply->click(); QCOMPARE(controller->formalDocument()->objects().size(), 1);
+    QCOMPARE(controller->formalDocument()->difficulties().size(), 3);
+    undo->trigger(); QCOMPARE(controller->formalDocument()->objects().size(), 3);
+    QCOMPARE(controller->formalDocument()->objectCount(expertId), 1);
+    const auto currentId = controller->formalDocument()->currentDifficultyId();
+    QVERIFY(controller->formalDocument()->setDifficulty(expertId, &error));
+    QCOMPARE(controller->formalDocument()->objects().first().preservedCustomData, originalObject.preservedCustomData);
+    QCOMPARE(controller->formalDocument()->objects().first().id, originalObject.id);
+    QVERIFY(controller->formalDocument()->setDifficulty(currentId, &error));
     QVERIFY(sourceAudio.open(QIODevice::ReadOnly));
     QCOMPARE(QCryptographicHash::hash(sourceAudio.readAll(), QCryptographicHash::Sha256), audioHash);
     QCOMPARE(audio->pcmSnapshot().revision, originalAudio.revision);
-    lmsc::BeatmapDocument unchangedDisk;
-    QVERIFY2(unchangedDisk.loadProject(project, &error), qPrintable(error));
+    lmsc::BeatmapDocument unchangedDisk; QVERIFY2(unchangedDisk.loadProject(project, &error), qPrintable(error));
     QCOMPARE(unchangedDisk.objects().size(), 1);
     QCOMPARE(unchangedDisk.difficulties().first().name, QStringLiteral("Expert"));
     window.close();
+}
+
+void MainWindowTest::manualEditCancelsRefinementAndRejectsLateResult() {
+    QString error; lmsc::BeatmapDocument original;
+    QVERIFY2(original.createNew(QDir(m_song).filePath(QStringLiteral("song.ogg")), QStringLiteral("手改取消精修"), 120, 0, {}, &error), qPrintable(error));
+    lmsc::BeatObject note; note.beat = 2; note.x = 0; note.y = 0; note.direction = 1;
+    QVERIFY(original.addObject(note, &error)); note.beat = 4; note.color = 1; note.x = 2; note.direction = 0;
+    QVERIFY(original.addObject(note, &error));
+    const auto secondId = original.objects()[1].id;
+    const QString project = m_temp.filePath(QStringLiteral("manual-refinement-project/project.lmsc"));
+    QVERIFY(original.saveProject(project, &error));
+    MainRefinementService service; service.publishPartialOnCancel = true;
+    MainWindow window(nullptr, settingsFile()); window.setTestMode(true); window.setAiRefinementService(&service); window.show();
+    QSignalSpy ready(&window, &MainWindow::documentReady); window.openPath(project);
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 20000); QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
+    auto controller = session(window); QVERIFY(controller);
+    auto panel = window.findChild<lmsc::EditorRefinementPanel *>(); QVERIFY(panel);
+    window.findChild<QPushButton *>(QStringLiteral("refineCurrentChartButton"))->click();
+    QCOMPARE(service.requests.size(), 1); const auto request = service.requests.last();
+    emit service.progress(request.generation.jobId, 31, QStringLiteral("精修乐句 2/5 · 9.3–11.1 秒 · 剩余 8 个乐句"));
+    auto percentage = panel->taskProgress()->percentageLabel();
+    window.resize(1080, 760); QTest::qWait(40);
+    QCOMPARE(percentage->text(), QStringLiteral("31%")); QVERIFY(percentage->isVisible());
+    auto refinementDetails = panel->findChild<QScrollArea *>(QStringLiteral("editorRefinementDetailsScroll"));
+    QVERIFY(refinementDetails && refinementDetails->isVisible());
+    QVERIFY(refinementDetails->height() >= panel->fontMetrics().height() * 3);
+    QVERIFY(panel->taskProgress()->rect().contains(QRect(percentage->mapTo(panel->taskProgress(), QPoint()), percentage->size())));
+    QVERIFY(window.rect().contains(QRect(percentage->mapTo(&window, QPoint()), percentage->size())));
+    auto track = window.findChild<TrackView *>();
+    auto grid = window.findChild<GridEditor *>();
+    QVERIFY(track && grid && track->isVisible() && grid->isVisible());
+    auto centerTop = track->parentWidget();
+    QCOMPARE(grid->parentWidget(), centerTop);
+    for (auto view : QVector<QWidget *>{track, grid}) {
+        QVERIFY(centerTop->rect().contains(QRect(view->mapTo(centerTop, QPoint()), view->size())));
+        QVERIFY(window.rect().contains(QRect(view->mapTo(&window, QPoint()), view->size())));
+    }
+    for (auto ancestor = percentage->parentWidget(); ancestor; ancestor = ancestor->parentWidget())
+        QVERIFY(!qobject_cast<QScrollArea *>(ancestor));
+    const auto captures = qEnvironmentVariable("LMSC_EDITOR_SCREENSHOT");
+    if (!captures.isEmpty()) {
+        QVERIFY(QDir().mkpath(captures)); const auto theme = lmsc::ThemeManager::mode();
+        const auto scale = qEnvironmentVariable("QT_SCALE_FACTOR", QStringLiteral("1"));
+        for (const auto &mode : QStringList{QStringLiteral("light"), QStringLiteral("dark")}) {
+            lmsc::ThemeManager::apply(mode); QTest::qWait(80);
+            QVERIFY(!track->grabFramebuffer().isNull());
+            QVERIFY(window.grab().save(QDir(captures).filePath(QStringLiteral("unified-editor-%1-scale-%2.png").arg(mode, scale))));
+        }
+        lmsc::ThemeManager::apply(theme);
+    }
+    emit grid->selectionChanged(QSet<QString>{secondId});
+    auto y = field<QSpinBox>(window, QStringLiteral("层 (0–2)")); QVERIFY(y);
+    y->setValue(1); auto applyProperties = button(window, QStringLiteral("应用属性"));
+    QVERIFY(applyProperties && applyProperties->isEnabled()); applyProperties->click();
+    QCOMPARE(service.cancelledJobs, QStringList{request.generation.jobId});
+    QVERIFY(service.discardedJobs.contains(request.generation.jobId));
+    QCOMPARE(controller->workingDocument()->objects()[0].y, 2);
+    QCOMPARE(controller->workingDocument()->objects()[1].y, 1);
+    QCOMPARE(controller->formalDocument()->objects()[0].y, 0);
+    QCOMPARE(controller->formalDocument()->objects()[1].y, 0);
+    const auto editedHash = lmsc::refinementBaselineHash(controller->workingDocument()->objects());
+    service.finish(request); // Deliberately late, with the older second-note position.
+    QCOMPARE(lmsc::refinementBaselineHash(controller->workingDocument()->objects()), editedHash);
+    QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("editorRefinementResume"))->isEnabled());
+    QVERIFY(!window.findChild<lmsc::GenerationPreviewDialog *>());
+    window.close();
+}
+
+void MainWindowTest::savedDraftReopensForManualEditingWithoutApplying() {
+    QString error; lmsc::BeatmapDocument original;
+    QVERIFY(original.createNew(QDir(m_song).filePath(QStringLiteral("song.ogg")), QStringLiteral("草稿恢复"), 120, 0, {}, &error));
+    lmsc::BeatObject note; note.beat = 8; note.direction = 1; QVERIFY(original.addObject(note, &error));
+    const QString project = m_temp.filePath(QStringLiteral("saved-editor-draft/project.lmsc"));
+    QVERIFY(original.saveProject(project, &error));
+    MainGenerationService service;
+    {
+        MainWindow window(nullptr, settingsFile()); window.setTestMode(true); window.setAiGenerationService(&service); window.show();
+        QSignalSpy ready(&window, &MainWindow::documentReady); window.openPath(project);
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 20000); QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
+        window.findChild<QListWidget *>(QStringLiteral("mainNavigation"))->setCurrentRow(1);
+        window.findChild<QPushButton *>(QStringLiteral("aiGenerateButton"))->click();
+        QCOMPARE(service.requests.size(), 1); emit service.draftReady(syntheticDraft(service.requests.last(), 2));
+        auto controller = session(window); QVERIFY(controller && controller->hasDraft());
+        const auto id = controller->workingDocument()->objects().first().id;
+        emit window.findChild<GridEditor *>()->selectionChanged(QSet<QString>{id});
+        field<QSpinBox>(window, QStringLiteral("层 (0–2)"))->setValue(2);
+        button(window, QStringLiteral("应用属性"))->click();
+        QCOMPARE(controller->workingDocument()->objects().first().y, 2);
+        QCOMPARE(controller->formalDocument()->objects().size(), 1);
+        auto save = namedAction(window, QStringLiteral("保存工程")); QVERIFY(save); save->trigger();
+        QTRY_VERIFY_WITH_TIMEOUT(save->isEnabled(), 20000);
+        lmsc::BeatmapDocument saved; QVERIFY(saved.loadProject(project, &error));
+        QCOMPARE(saved.objects().size(), 1); QVERIFY(!saved.editorDraftRecords().isUndefined());
+        const QString exported = m_temp.filePath(QStringLiteral("saved-draft-formal-export"));
+        QVERIFY2(saved.exportSong(exported, &error), qPrintable(error));
+        lmsc::BeatmapDocument exportedChart; QVERIFY(exportedChart.loadSong(exported, &error));
+        QCOMPARE(exportedChart.objects().size(), 1);
+        window.close();
+    }
+    MainWindow restored(nullptr, settingsFile()); restored.setTestMode(true); restored.show();
+    QSignalSpy ready(&restored, &MainWindow::documentReady); restored.openPath(project);
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 20000); QTRY_VERIFY_WITH_TIMEOUT(restored.isAudioReady(), 20000);
+    auto controller = session(restored); QVERIFY(controller && controller->hasDraft());
+    QVERIFY(!controller->viewReadOnly());
+    QCOMPARE(controller->workingDocument()->objects().size(), 2);
+    QCOMPARE(controller->workingDocument()->objects().first().y, 2);
+    QCOMPARE(controller->initialDocument()->objects().first().y, 1);
+    const auto id = controller->workingDocument()->objects().first().id;
+    emit restored.findChild<GridEditor *>()->selectionChanged(QSet<QString>{id});
+    field<QSpinBox>(restored, QStringLiteral("列 (0–3)"))->setValue(1);
+    button(restored, QStringLiteral("应用属性"))->click();
+    QCOMPARE(controller->workingDocument()->objects().first().x, 1);
+    QCOMPARE(controller->formalDocument()->objects().size(), 1);
+    QVERIFY(!restored.findChild<QPushButton *>(QStringLiteral("editorRefinementResume"))->isEnabled());
+    QCOMPARE(service.requests.size(), 1); QVERIFY(!restored.findChild<lmsc::GenerationPreviewDialog *>());
+    restored.close();
+}
+
+void MainWindowTest::draftSynchronizationFailureDoesNotMarkSavedOrReplaceDisk() {
+    QString error; lmsc::BeatmapDocument original;
+    QVERIFY(original.createNew(QDir(m_song).filePath(QStringLiteral("song.ogg")), QStringLiteral("草稿同步失败保护"), 120, 0, {}, &error));
+    lmsc::BeatObject note; note.beat = 8; note.direction = 1; QVERIFY(original.addObject(note, &error));
+    const QString project = m_temp.filePath(QStringLiteral("failed-draft-sync/project.lmsc"));
+    QVERIFY(original.saveProject(project, &error));
+    MainGenerationService service; MainWindow window(nullptr, settingsFile());
+    window.setTestMode(true); window.setAiGenerationService(&service); window.show();
+    auto autosave = window.findChild<QTimer *>(QStringLiteral("documentAutosave")); QVERIFY(autosave);
+    autosave->stop(); // Trigger the real timeout handler below without relying on a 30-second wait.
+    QSignalSpy ready(&window, &MainWindow::documentReady); window.openPath(project);
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 20000); QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
+    window.findChild<QListWidget *>(QStringLiteral("mainNavigation"))->setCurrentRow(1);
+    window.findChild<QPushButton *>(QStringLiteral("aiGenerateButton"))->click();
+    QCOMPARE(service.requests.size(), 1); emit service.draftReady(syntheticDraft(service.requests.last(), 2));
+    auto controller = session(window); QVERIFY(controller && controller->hasDraft());
+    auto save = namedAction(window, QStringLiteral("保存工程")); QVERIFY(save && save->isEnabled());
+    save->trigger(); QVERIFY(!controller->isDirty()); QVERIFY(!controller->formalDocument()->isModified());
+    const auto savedRecords = controller->formalDocument()->editorDraftRecords();
+    const auto readFile = [](const QString &path) {
+        QFile file(path); return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray{};
+    };
+    const auto savedBytes = readFile(project); QVERIFY(!savedBytes.isEmpty());
+
+    // Keep an earlier, valid recovery snapshot with a distinct formal edit. A
+    // stale autosave after failed synchronization would overwrite this file.
+    lmsc::BeatmapDocument earlierRecovery; QVERIFY(earlierRecovery.loadProject(project, &error));
+    note.beat = 10; note.x = 3; note.color = 1; note.direction = 0;
+    QVERIFY(earlierRecovery.addObject(note, &error)); QVERIFY(earlierRecovery.autoSave(&error));
+    const auto recoveryPath = lmsc::BeatmapDocument::recoveryPath(project);
+    const auto recoveryBytes = readFile(recoveryPath); QVERIFY(!recoveryBytes.isEmpty());
+
+    // JSON escapes each control character to six bytes, exceeding the real
+    // 32 MiB limit while keeping the in-memory fixture small on 32-bit builds.
+    auto oversizedRecords = controller->toJson().toObject();
+    oversizedRecords.insert(QStringLiteral("futureOpaqueData"), QString(6 * 1024 * 1024, QChar(1)));
+    QStringList warnings; QVERIFY(controller->restoreFromJson(oversizedRecords, &warnings));
+    QVERIFY(warnings.isEmpty()); QVERIFY(controller->isApplicable());
+    QVERIFY(!controller->isDirty());
+    auto grid = window.findChild<GridEditor *>(); QVERIFY(grid);
+    emit grid->selectionChanged(QSet<QString>{controller->workingDocument()->objects().first().id});
+    auto y = field<QSpinBox>(window, QStringLiteral("层 (0–2)")); QVERIFY(y); y->setValue(2);
+    auto properties = button(window, QStringLiteral("应用属性")); QVERIFY(properties && properties->isEnabled());
+    properties->click();
+    QCOMPARE(controller->workingDocument()->objects().first().y, 2);
+    const auto workingHash = lmsc::refinementBaselineHash(controller->workingDocument()->objects());
+    QVERIFY(controller->isDirty()); QVERIFY(!controller->formalDocument()->isModified());
+    QVERIFY(controller->formalDocument()->editorDraftRecords() == savedRecords);
+
+    window.statusBar()->clearMessage(); save->trigger();
+    QVERIFY(window.statusBar()->currentMessage().contains(QStringLiteral("32 MiB")));
+    QVERIFY(controller->isDirty()); QVERIFY(save->isEnabled());
+    QVERIFY(readFile(project) == savedBytes);
+    QVERIFY(lmsc::refinementBaselineHash(controller->workingDocument()->objects()) == workingHash);
+    QVERIFY(controller->formalDocument()->editorDraftRecords() == savedRecords);
+
+    window.statusBar()->clearMessage();
+    QVERIFY(QMetaObject::invokeMethod(autosave, "timeout", Qt::DirectConnection));
+    QVERIFY(window.statusBar()->currentMessage().contains(QStringLiteral("32 MiB")));
+    QVERIFY(readFile(recoveryPath) == recoveryBytes);
+    QVERIFY(readFile(project) == savedBytes);
+    QVERIFY(controller->isDirty());
+    QVERIFY(lmsc::refinementBaselineHash(controller->workingDocument()->objects()) == workingHash);
+    lmsc::BeatmapDocument saved; QVERIFY(saved.loadProject(project, &error));
+    QVERIFY(saved.editorDraftRecords() == savedRecords); QCOMPARE(saved.objects().size(), 1);
+    window.close();
+}
+
+void MainWindowTest::difficultySwitchPreservesIndependentDrafts() {
+    QString error; lmsc::BeatmapDocument original;
+    QVERIFY(original.createNew(QDir(m_song).filePath(QStringLiteral("song.ogg")), QStringLiteral("两难度草稿"), 120, 0, {}, &error));
+    lmsc::BeatObject note; note.beat = 8; note.direction = 1; QVERIFY(original.addObject(note, &error));
+    QVector<lmsc::BeatObject> hard{note}; hard[0].beat = 6;
+    QVERIFY(original.applyGeneratedChart(hard, QStringLiteral("Hard"), 5, original.revision(), &error));
+    const QString project = m_temp.filePath(QStringLiteral("two-editor-drafts/project.lmsc"));
+    QVERIFY(original.saveProject(project, &error));
+    MainGenerationService service; MainWindow window(nullptr, settingsFile());
+    window.setTestMode(true); window.setAiGenerationService(&service); window.show();
+    QSignalSpy ready(&window, &MainWindow::documentReady); window.openPath(project);
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 20000); QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
+    auto controller = session(window); QVERIFY(controller);
+    auto target = window.findChild<QComboBox *>(QStringLiteral("aiGenerationDifficulty"));
+    auto generate = window.findChild<QPushButton *>(QStringLiteral("aiGenerateButton"));
+    window.findChild<QListWidget *>(QStringLiteral("mainNavigation"))->setCurrentRow(1);
+    target->setCurrentIndex(target->findData(QStringLiteral("Hard"))); generate->click();
+    emit service.draftReady(syntheticDraft(service.requests.last(), 2));
+    const auto hardHash = lmsc::refinementBaselineHash(controller->workingDocument()->objects());
+    target->setCurrentIndex(target->findData(QStringLiteral("Expert"))); generate->click();
+    QCOMPARE(service.requests.size(), 2); emit service.draftReady(syntheticDraft(service.requests.last(), 3));
+    const auto expertHash = lmsc::refinementBaselineHash(controller->workingDocument()->objects());
+    QCOMPARE(controller->targetKeys().size(), 2);
+    auto difficulties = window.findChild<QListWidget *>(QStringLiteral("difficultyList")); QVERIFY(difficulties);
+    for (int i = 0; i < difficulties->count(); ++i)
+        if (difficulties->item(i)->data(Qt::UserRole + 1).toString() == QStringLiteral("Hard")) { difficulties->setCurrentRow(i); break; }
+    QCOMPARE(controller->currentTargetKey(), QStringLiteral("Hard"));
+    QCOMPARE(lmsc::refinementBaselineHash(controller->workingDocument()->objects()), hardHash);
+    QVERIFY(controller->isApplicable());
+    for (int i = 0; i < difficulties->count(); ++i)
+        if (difficulties->item(i)->data(Qt::UserRole + 1).toString() == QStringLiteral("Expert")) { difficulties->setCurrentRow(i); break; }
+    QCOMPARE(controller->currentTargetKey(), QStringLiteral("Expert"));
+    QCOMPARE(lmsc::refinementBaselineHash(controller->workingDocument()->objects()), expertHash);
+    QVERIFY(controller->isApplicable());
+    QCOMPARE(controller->formalDocument()->objects().size(), 1);
+    QVERIFY(!window.findChild<lmsc::GenerationPreviewDialog *>()); window.close();
+}
+
+void MainWindowTest::viewingCachedDraftPreservesRefinementPartialAndManualChanges() {
+    QString error; lmsc::BeatmapDocument original;
+    QVERIFY(original.createNew(QDir(m_song).filePath(QStringLiteral("song.ogg")), QStringLiteral("查看草稿时保留精修"), 120, 0, {}, &error));
+    lmsc::BeatObject note; note.beat = 2; note.x = 0; note.y = 0; note.direction = 1;
+    QVERIFY(original.addObject(note, &error)); note.beat = 4; note.color = 1; note.x = 2; note.direction = 0;
+    QVERIFY(original.addObject(note, &error));
+    const QString project = m_temp.filePath(QStringLiteral("view-cached-draft/project.lmsc"));
+    QVERIFY(original.saveProject(project, &error));
+    MainGenerationService generation; MainRefinementService refinement; refinement.publishPartialOnCancel = true;
+    MainWindow window(nullptr, settingsFile()); window.setTestMode(true);
+    window.setAiGenerationService(&generation); window.setAiRefinementService(&refinement); window.show();
+    QSignalSpy ready(&window, &MainWindow::documentReady); window.openPath(project);
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 20000); QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
+    auto controller = session(window); QVERIFY(controller);
+    auto target = window.findChild<QComboBox *>(QStringLiteral("aiGenerationDifficulty"));
+    auto generate = window.findChild<QPushButton *>(QStringLiteral("aiGenerateButton"));
+    auto view = window.findChild<QPushButton *>(QStringLiteral("aiViewCandidate"));
+    auto difficulties = window.findChild<QListWidget *>(QStringLiteral("difficultyList"));
+    auto grid = window.findChild<GridEditor *>();
+    auto y = field<QSpinBox>(window, QStringLiteral("层 (0–2)"));
+    auto properties = button(window, QStringLiteral("应用属性"));
+    QVERIFY(target && generate && view && difficulties && grid && y && properties);
+    window.findChild<QListWidget *>(QStringLiteral("mainNavigation"))->setCurrentRow(1);
+    target->setCurrentIndex(target->findData(QStringLiteral("Hard"))); generate->click();
+    QCOMPARE(generation.requests.size(), 1); emit generation.draftReady(syntheticDraft(generation.requests.last(), 2));
+    emit grid->selectionChanged(QSet<QString>{controller->workingDocument()->objects().first().id});
+    y->setValue(2); properties->click();
+    QCOMPARE(controller->workingDocument()->objects().first().y, 2);
+    const auto hardHash = lmsc::refinementBaselineHash(controller->workingDocument()->objects());
+    QVERIFY(hardHash != lmsc::refinementBaselineHash(controller->initialDocument()->objects()));
+    const auto selectDifficulty = [&](const QString &name) {
+        for (int i = 0; i < difficulties->count(); ++i)
+            if (difficulties->item(i)->data(Qt::UserRole + 1).toString() == name) {
+                difficulties->setCurrentRow(i); return true;
+            }
+        return false;
+    };
+    QVERIFY(selectDifficulty(QStringLiteral("Expert")));
+    QCOMPARE(controller->view(), lmsc::EditorSessionController::View::Formal);
+    auto refine = window.findChild<QPushButton *>(QStringLiteral("refineCurrentChartButton"));
+    QVERIFY(refine && refine->isEnabled()); refine->click();
+    QCOMPARE(refinement.requests.size(), 1); const auto request = refinement.requests.last();
+    QCOMPARE(controller->currentTargetKey(), QStringLiteral("Expert"));
+    QVERIFY(view->isEnabled()); view->click();
+
+    QCOMPARE(controller->currentTargetKey(), QStringLiteral("Hard"));
+    QCOMPARE(controller->view(), lmsc::EditorSessionController::View::Working);
+    QCOMPARE(lmsc::refinementBaselineHash(controller->workingDocument()->objects()), hardHash);
+    QCOMPARE(generation.requests.size(), 1);
+    QCOMPARE(refinement.cancelledJobs, QStringList{request.generation.jobId});
+    QVERIFY(refinement.discardedJobs.contains(request.generation.jobId));
+    QVERIFY(refinement.status().jobId.isEmpty());
+    auto prompt = window.findChild<QWidget *>(QStringLiteral("draftReplacementPrompt"));
+    QVERIFY(prompt && !prompt->isVisible());
+    QVERIFY(selectDifficulty(QStringLiteral("Expert")));
+    QVERIFY(controller->workingDocument() && controller->initialDocument() && controller->beforeRefinementDocument());
+    QCOMPARE(controller->workingDocument()->objects().first().y, 2);
+    QCOMPARE(controller->initialDocument()->objects().first().y, 0);
+    QCOMPARE(controller->beforeRefinementDocument()->objects().first().y, 0);
+    QCOMPARE(controller->formalDocument()->objects().first().y, 0);
+    const auto expertHash = lmsc::refinementBaselineHash(controller->workingDocument()->objects());
+    auto late = refinement.resultFor(request); late.candidate.objects.last().y = 1;
+    late.patch = lmsc::refinementDifference(request.baseline, late.candidate.objects);
+    late.stats = lmsc::refinementStatistics(late.patch, request.baseline);
+    emit refinement.candidateReady(late); // A distinct late result must not mutate either target.
+    QCOMPARE(lmsc::refinementBaselineHash(controller->workingDocument()->objects()), expertHash);
+    QVERIFY(selectDifficulty(QStringLiteral("Hard")));
+    QCOMPARE(lmsc::refinementBaselineHash(controller->workingDocument()->objects()), hardHash);
+    QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("editorRefinementResume"))->isEnabled());
+    QVERIFY(!window.findChild<lmsc::GenerationPreviewDialog *>()); window.close();
+}
+
+void MainWindowTest::inlinePromptCannotReplaceOtherDifficulty() {
+    QString error; lmsc::BeatmapDocument original;
+    QVERIFY(original.createNew(QDir(m_song).filePath(QStringLiteral("song.ogg")), QStringLiteral("固定提示目标"), 120, 0, {}, &error));
+    lmsc::BeatObject note; note.beat = 8; note.direction = 1;
+    QVERIFY(original.addObject(note, &error));
+    const auto formalHash = lmsc::refinementBaselineHash(original.objects());
+    const QString project = m_temp.filePath(QStringLiteral("inline-prompt-target/project.lmsc"));
+    QVERIFY(original.saveProject(project, &error));
+    MainGenerationService service; MainWindow window(nullptr, settingsFile());
+    window.setTestMode(true); window.setAiGenerationService(&service); window.show();
+    QSignalSpy ready(&window, &MainWindow::documentReady); window.openPath(project);
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 20000); QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
+    auto controller = session(window); QVERIFY(controller);
+    auto target = window.findChild<QComboBox *>(QStringLiteral("aiGenerationDifficulty"));
+    auto generate = window.findChild<QPushButton *>(QStringLiteral("aiGenerateButton"));
+    auto versions = window.findChild<QComboBox *>(QStringLiteral("editorCandidateVersion"));
+    auto difficulties = window.findChild<QListWidget *>(QStringLiteral("difficultyList"));
+    auto grid = window.findChild<GridEditor *>();
+    auto y = field<QSpinBox>(window, QStringLiteral("层 (0–2)"));
+    auto applyProperties = button(window, QStringLiteral("应用属性"));
+    auto prompt = window.findChild<QWidget *>(QStringLiteral("draftReplacementPrompt"));
+    auto proceed = window.findChild<QPushButton *>(QStringLiteral("draftReplacementAccept"));
+    QVERIFY(target && generate && versions && difficulties && grid && y && applyProperties && prompt && proceed);
+    window.findChild<QListWidget *>(QStringLiteral("mainNavigation"))->setCurrentRow(1);
+    target->setCurrentIndex(target->findData(QStringLiteral("Hard"))); generate->click();
+    QCOMPARE(service.requests.size(), 1); emit service.draftReady(syntheticDraft(service.requests.last(), 2));
+    QCOMPARE(controller->currentTargetKey(), QStringLiteral("Hard"));
+
+    // Hard has a candidate but no formal chart. Its formal comparison must be
+    // an empty, locked baseline, rather than silently editing formal Expert.
+    versions->setCurrentIndex(versions->findData(lmsc::EditorRefinementPanel::Formal));
+    QCOMPARE(controller->view(), lmsc::EditorSessionController::View::Formal);
+    QVERIFY(controller->viewReadOnly()); QVERIFY(!grid->isEnabled());
+    QCOMPARE(controller->activeDocument()->objects().size(), 0);
+    QCOMPARE(objectCount(window), 0);
+    QCOMPARE(controller->formalDocument()->objects().size(), 1);
+    QCOMPARE(lmsc::refinementBaselineHash(controller->formalDocument()->objects()), formalHash);
+    versions->setCurrentIndex(versions->findData(lmsc::EditorRefinementPanel::Working));
+    QVERIFY(grid->isEnabled());
+    emit grid->selectionChanged(QSet<QString>{controller->workingDocument()->objects().first().id});
+    y->setValue(2); applyProperties->click();
+    const auto hardHash = lmsc::refinementBaselineHash(controller->workingDocument()->objects());
+    QVERIFY(hardHash != lmsc::refinementBaselineHash(controller->initialDocument()->objects()));
+
+    target->setCurrentIndex(target->findData(QStringLiteral("Expert"))); generate->click();
+    QCOMPARE(service.requests.size(), 2); emit service.draftReady(syntheticDraft(service.requests.last(), 3));
+    emit grid->selectionChanged(QSet<QString>{controller->workingDocument()->objects().first().id});
+    y->setValue(2); applyProperties->click();
+    const auto expertHash = lmsc::refinementBaselineHash(controller->workingDocument()->objects());
+    QVERIFY(expertHash != lmsc::refinementBaselineHash(controller->initialDocument()->objects()));
+    const auto selectDifficulty = [&](const QString &name) {
+        for (int i = 0; i < difficulties->count(); ++i)
+            if (difficulties->item(i)->data(Qt::UserRole + 1).toString() == name) {
+                difficulties->setCurrentRow(i); return true;
+            }
+        return false;
+    };
+    for (const auto &actionName : QStringList{QStringLiteral("editorRestoreInitial"), QStringLiteral("editorCandidateDiscard")}) {
+        QVERIFY(selectDifficulty(QStringLiteral("Hard")));
+        QCOMPARE(controller->currentTargetKey(), QStringLiteral("Hard"));
+        auto action = window.findChild<QPushButton *>(actionName); QVERIFY(action && action->isEnabled());
+        action->click(); QVERIFY(prompt->isVisible());
+        QVERIFY(selectDifficulty(QStringLiteral("Expert")));
+        QCOMPARE(controller->currentTargetKey(), QStringLiteral("Expert"));
+        proceed->click();
+        QVERIFY(!prompt->isVisible());
+        QCOMPARE(controller->targetKeys().size(), 2);
+        QCOMPARE(lmsc::refinementBaselineHash(controller->workingDocument()->objects()), expertHash);
+        QVERIFY(selectDifficulty(QStringLiteral("Hard")));
+        QCOMPARE(lmsc::refinementBaselineHash(controller->workingDocument()->objects()), hardHash);
+        QCOMPARE(lmsc::refinementBaselineHash(controller->formalDocument()->objects()), formalHash);
+    }
+    QVERIFY(!window.findChild<lmsc::GenerationPreviewDialog *>()); window.close();
 }
 
 void MainWindowTest::importHeadsetThroughDialog() {
@@ -1325,7 +1645,7 @@ void MainWindowTest::chineseBrandIconAndAboutLicense() {
     auto displayedLicense = window.findChild<QTextBrowser *>(QStringLiteral("gplLicenseText"));
     QVERIFY(nav && workspace && pages && version && author && homepage && showLicense && displayedLicense);
     QCOMPARE(nav->currentRow(), 6);
-    QCOMPARE(workspace->currentIndex(), 2);
+    QCOMPARE(workspace->currentIndex(), 1);
     QCOMPARE(pages->currentIndex(), 4);
     QCOMPARE(version->text(), QStringLiteral("0.5.0"));
     QCOMPARE(author->text(), QStringLiteral("Vae-x"));
@@ -1914,8 +2234,11 @@ void MainWindowTest::captureWorkspace() {
         QVERIFY(capture(QStringLiteral("main-settings-model-%1-minimum").arg(mode)));
         nav->setCurrentRow(1);
         QApplication::processEvents();
-        QVERIFY(fullyInside(start, workspace->currentWidget()));
-        if (configure->isVisible()) QVERIFY(fullyInside(configure, workspace->currentWidget()));
+        auto details = window.findChild<QScrollArea *>(QStringLiteral("aiGenerationDetailsScroll"));
+        QVERIFY(details); details->ensureWidgetVisible(start); QApplication::processEvents();
+        QVERIFY(fullyInside(start, details->viewport()));
+        details->ensureWidgetVisible(configure); QApplication::processEvents();
+        if (configure->isVisible()) QVERIFY(fullyInside(configure, details->viewport()));
         QVERIFY(capture(QStringLiteral("main-ai-recognition-%1-minimum").arg(mode)));
     }
     window.close();

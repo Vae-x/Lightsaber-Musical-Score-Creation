@@ -198,7 +198,7 @@ struct BeatmapDocument::Impl {
     struct SongCommand { int track, beforeCurrent; Command edit; bool added = false; };
     QVector<SongCommand> songHistory;
     int songCursor = 0;
-    std::unique_ptr<QTemporaryDir> temporary;
+    std::shared_ptr<QTemporaryDir> temporary;
     QString assets;
     QString infoRelative;
     QString audioRelative;
@@ -217,6 +217,10 @@ struct BeatmapDocument::Impl {
     QStringList warnings;
     quint64 nextKey = 1, metaKey = 0, savedMetaKey = 0;
     quint64 revision = 0;
+    bool editingSnapshot = false;
+    QString snapshotBaselineHash;
+    QJsonValue editorDrafts = QJsonArray{};
+    quint64 editorDraftKey = 0, savedEditorDraftKey = 0;
 
     Track *track() { return current >= 0 && current < tracks.size() ? &tracks[current] : nullptr; }
     const Track *track() const { return current >= 0 && current < tracks.size() ? &tracks[current] : nullptr; }
@@ -257,6 +261,16 @@ struct BeatmapDocument::Impl {
     bool changed(const Track &track) const;
     QJsonObject state() const;
     bool restoreState(const QJsonObject &state, QString *error);
+    bool applyEditingObjects(Track *selected, const QVector<BeatObject> &objects, QString *error,
+                             bool added = false, int beforeCurrent = -1);
+    void clearEditingHistory() {
+        songHistory.clear(); songCursor = 0;
+        for (auto &selected : tracks) {
+            selected.history.clear(); selected.cursor = 0;
+            selected.savedKey = selected.stateKey; selected.savedActive = selected.active;
+        }
+        savedMetaKey = metaKey; savedEditorDraftKey = editorDraftKey;
+    }
 };
 
 bool BeatmapDocument::Impl::initialize(QString *error) {
@@ -694,14 +708,15 @@ QJsonObject BeatmapDocument::Impl::state() const {
         if (selected.generated) difficulty.insert("generated", true);
         difficulties.append(difficulty);
     }
-    return {{"format", "LightsaberScoreProject"}, {"version", 1}, {"newSong", newSong},
+    return {{"format", "LightsaberScoreProject"}, {"version", 2}, {"newSong", newSong},
             {"selectedDifficulty", current >= 0 ? tracks[current].descriptor.id : QString()},
             {"info", info}, {"firstBeatSeconds", newFirstBeatSeconds}, {"assetHashes", assetHashes},
-            {"source", source}, {"difficulties", difficulties}};
+            {"source", source}, {"difficulties", difficulties}, {"editorDrafts", editorDrafts}};
 }
 
 bool BeatmapDocument::Impl::restoreState(const QJsonObject &state, QString *error) {
-    if (state.value("format").toString() != "LightsaberScoreProject" || state.value("version").toInt() != 1)
+    if (state.value("format").toString() != "LightsaberScoreProject" || !integral(state.value("version"))
+            || (state.value("version").toInt() != 1 && state.value("version").toInt() != 2))
         return fail(error, QStringLiteral("不是支持的编辑工程。"));
     if (state.value("assetHashes").toObject() != assetHashes)
         return fail(error, QStringLiteral("工程原始资源快照已改变或不完整，拒绝加载编辑记录。"));
@@ -819,6 +834,10 @@ bool BeatmapDocument::Impl::restoreState(const QJsonObject &state, QString *erro
     })) return fail(error,QStringLiteral("工程当前难度不存在。"));
     for (int i = 0; i < tracks.size(); ++i) if (tracks[i].descriptor.id == selected) current = i;
     refresh();
+    // Draft records are not authoritative chart edits. Unknown or damaged
+    // values survive round trips for the controller to inspect and preserve.
+    editorDrafts = state.value("editorDrafts");
+    if (editorDrafts.isUndefined()) editorDrafts = QJsonArray{};
     return true;
 }
 
@@ -827,7 +846,71 @@ BeatmapDocument::~BeatmapDocument() = default;
 BeatmapDocument::BeatmapDocument(BeatmapDocument &&) noexcept = default;
 BeatmapDocument &BeatmapDocument::operator=(BeatmapDocument &&) noexcept = default;
 
+bool BeatmapDocument::Impl::applyEditingObjects(Track *selected, const QVector<BeatObject> &objects,
+                                               QString *error, bool added, int beforeCurrent) {
+    if (!selected || !selected->readOnly.isEmpty())
+        return fail(error, selected ? selected->readOnly : QStringLiteral("草稿目标难度不存在。"));
+    QHash<QString, BeatObject> requested;
+    QVector<BeatObject> incoming, additions;
+    QSet<QString> replaced;
+    QVector<Change> changes;
+    for (auto object : objects) {
+        if (object.id.isEmpty()) object.id = newId();
+        if (requested.contains(object.id)) return fail(error, QStringLiteral("草稿包含重复物件标识，未应用。"));
+        requested.insert(object.id, object);
+        const int index = selected->byId.value(object.id, -1);
+        if (index >= 0) {
+            const auto &entry = selected->entries[index];
+            if (entry.deleted && !editingSnapshot)
+                return fail(error, QStringLiteral("草稿引用已删除的物件标识，未应用。"));
+            const auto &before = entry.object;
+            if (before.isProtected()) {
+                if (!sameFields(before, object) || before.protectedReason != object.protectedReason)
+                    return fail(error, before.protectedReason);
+                continue;
+            }
+            if (object.kind != before.kind || object.protectedReason != before.protectedReason
+                    || object.preservedCustomData != before.preservedCustomData)
+                return fail(error, QStringLiteral("草稿不能改变已有物件类型、保护状态或自定义颜色。"));
+            if (entry.deleted || !sameFields(before, object)) {
+                replaced.insert(object.id); incoming.append(object);
+                changes.append({index, {before, entry.deleted}, {object, false}});
+            }
+        } else {
+            if (object.isProtected()) return fail(error, object.protectedReason);
+            for (const auto &track : tracks)
+                if (track.byId.contains(object.id))
+                    return fail(error, QStringLiteral("草稿新增标识与已有物件冲突，未应用。"));
+            if (!colorDataForSchema(&object.preservedCustomData, selected->v3))
+                return fail(error, QStringLiteral("草稿新增物件含未支持的扩展。"));
+            if (object.kind == ObjectKind::Bomb) { object.color = 0; object.direction = 8; }
+            additions.append(object); incoming.append(object);
+        }
+    }
+    for (int index = 0; index < selected->entries.size(); ++index) {
+        const auto &entry = selected->entries[index];
+        if (entry.deleted || requested.contains(entry.object.id)) continue;
+        if (entry.object.isProtected()) return fail(error, entry.object.protectedReason);
+        replaced.insert(entry.object.id);
+        changes.append({index, {entry.object, false}, {entry.object, true}});
+    }
+    if ((qint64(changes.size()) + additions.size()) * sizeof(Change) > 16 * 1024 * 1024)
+        return fail(error, QStringLiteral("草稿超过整批撤销上限，未应用。"));
+    if (!validate(*selected, incoming, replaced, error)) return false;
+    // All fallible checks precede entry allocation and the single undo command.
+    for (const auto &object : additions) {
+        Entry entry; entry.object = entry.original = object; entry.deleted = true;
+        entry.array = object.kind == ObjectKind::Wall ? (selected->v3 ? "obstacles" : "_obstacles")
+            : selected->v3 ? (object.kind == ObjectKind::Bomb ? "bombNotes" : "colorNotes") : "_notes";
+        const int index = selected->entries.size();
+        selected->entries.append(entry); selected->byId.insert(object.id, index);
+        changes.append({index, {object, true}, {object, false}});
+    }
+    return commit(selected, std::move(changes), error, {}, 0, added, beforeCurrent);
+}
+
 bool BeatmapDocument::loadSong(const QString &folder, QString *error) {
+    if (d->editingSnapshot) return fail(error, QStringLiteral("编辑草稿不能载入另一首歌曲。"));
     auto incoming = std::unique_ptr<Impl>(new Impl);
     incoming->temporary.reset(new QTemporaryDir(QDir::tempPath() + "/lmsc-song-XXXXXX"));
     if (!incoming->temporary->isValid()) return fail(error, QStringLiteral("无法建立导入快照目录。"));
@@ -839,6 +922,7 @@ bool BeatmapDocument::loadSong(const QString &folder, QString *error) {
 }
 
 bool BeatmapDocument::loadZip(const QString &filename, QString *error) {
+    if (d->editingSnapshot) return fail(error, QStringLiteral("编辑草稿不能更换资源。"));
     auto incoming = std::unique_ptr<Impl>(new Impl);
     incoming->temporary.reset(new QTemporaryDir(QDir::tempPath() + "/lmsc-zip-XXXXXX"));
     if (!incoming->temporary->isValid()) return fail(error, QStringLiteral("无法建立 ZIP 快照目录。"));
@@ -850,6 +934,7 @@ bool BeatmapDocument::loadZip(const QString &filename, QString *error) {
 }
 
 bool BeatmapDocument::loadProject(const QString &path, QString *error) {
+    if (d->editingSnapshot) return fail(error, QStringLiteral("编辑草稿不能载入另一份工程。"));
     const QString file = normalizedManifest(path);
     QJsonObject json;
     if (!ProjectStore::readJson(file, &json, error)) return false;
@@ -896,6 +981,7 @@ bool BeatmapDocument::loadProject(const QString &path, QString *error) {
 
 bool BeatmapDocument::createNew(const QString &audioPath, const QString &title, double bpm,
                                double firstBeatSeconds, const QString &coverPath, QString *error) {
+    if (d->editingSnapshot) return fail(error, QStringLiteral("编辑草稿不能更换音频或建立另一首歌曲。"));
     TimeMap timing;
     if (!timing.configure(bpm, firstBeatSeconds, {}, error)) return false;
     if (firstBeatSeconds < 0.0) return fail(error, QStringLiteral("第一拍不能早于裁剪后音频的起点。"));
@@ -962,7 +1048,99 @@ QString BeatmapDocument::readOnlyReason() const { return d->track() ? d->track()
 QStringList BeatmapDocument::warnings() const { return d->warnings; }
 quint64 BeatmapDocument::revision() const { return d->revision; }
 
+std::unique_ptr<BeatmapDocument> BeatmapDocument::createEditingSnapshot(QString *error) const {
+    return createEditingSnapshotForDifficulty(currentDifficultyId(), {}, 7, error);
+}
+std::unique_ptr<BeatmapDocument> BeatmapDocument::createEditingSnapshotForDifficulty(
+        const QString &difficultyId, const QString &newDifficultyName, int newDifficultyRank, QString *error) const {
+    if (!isLoaded()) { fail(error, QStringLiteral("请先打开正式曲谱。")); return {}; }
+    auto snapshot = std::unique_ptr<BeatmapDocument>(new BeatmapDocument);
+    snapshot->d.reset(new Impl(*d));
+    int target = -1;
+    for (int i = 0; i < d->tracks.size(); ++i)
+        if (d->tracks[i].active && d->tracks[i].descriptor.id == difficultyId) { target = i; break; }
+    if (!difficultyId.isEmpty() && target < 0) { fail(error, QStringLiteral("草稿目标难度不存在。")); return {}; }
+    if (difficultyId.isEmpty()) {
+        const QMap<QString, int> ranks{{"Easy",1},{"Normal",3},{"Hard",5},{"Expert",7},{"ExpertPlus",9}};
+        if (!d->newSong || !d->track() || !ranks.contains(newDifficultyName)
+                || ranks.value(newDifficultyName) != newDifficultyRank
+                || d->track()->v3 || d->track()->descriptor.version != "2.2.0"
+                || !d->track()->time.changes().isEmpty()) {
+            fail(error, QStringLiteral("新增草稿目标仅支持新歌的基础 Standard 难度。")); return {};
+        }
+        for (const auto &track : d->tracks) if (track.active && track.descriptor.name.compare(newDifficultyName, Qt::CaseInsensitive) == 0) {
+            fail(error, QStringLiteral("目标难度已存在，请使用其固定标识建立草稿。")); return {};
+        }
+        Impl::Track added; const QString uuid = newId();
+        added.descriptor = {"generated:" + uuid, "Standard", newDifficultyName, "_generated-" + uuid + ".dat", newDifficultyRank, "2.2.0"};
+        added.raw = emptyNewSongMap(); added.generated = true; added.time = d->track()->time;
+        snapshot->d->tracks.append(added); target = snapshot->d->tracks.size() - 1;
+        snapshot->d->syncNewSongDifficulties();
+    }
+    snapshot->d->current = target; snapshot->d->editingSnapshot = true;
+    snapshot->d->snapshotBaselineHash = difficultyId.isEmpty() ? refinementBaselineHash({}) : editingBaselineHash(difficultyId);
+    snapshot->d->editorDrafts = QJsonArray{}; snapshot->d->editorDraftKey = snapshot->d->savedEditorDraftKey = 0;
+    snapshot->d->manifest.clear(); snapshot->d->clearEditingHistory(); snapshot->d->refresh();
+    return snapshot;
+}
+bool BeatmapDocument::isEditingSnapshot() const { return d->editingSnapshot; }
+QString BeatmapDocument::editingBaselineHash(const QString &difficultyId) const {
+    const QString target = difficultyId.isEmpty() ? currentDifficultyId() : difficultyId;
+    if (d->editingSnapshot && target == currentDifficultyId()) return d->snapshotBaselineHash;
+    QVector<BeatObject> objects;
+    for (const auto &track : d->tracks) if (track.active && track.descriptor.id == target)
+        for (const auto &entry : track.entries) if (!entry.deleted) objects.append(entry.object);
+    return refinementBaselineHash(objects);
+}
+bool BeatmapDocument::replaceEditingSnapshotObjects(const QVector<BeatObject> &objects, bool clearHistory, QString *error) {
+    if (!d->editingSnapshot) return fail(error, QStringLiteral("整图替换仅用于独立编辑草稿。"));
+    if (!d->applyEditingObjects(d->track(), objects, error)) return false;
+    if (clearHistory) d->clearEditingHistory();
+    return true;
+}
+bool BeatmapDocument::applyEditingDraft(const EditingDraftApplication &draft, QString *error) {
+    if (d->editingSnapshot || !isLoaded()) return fail(error, QStringLiteral("草稿仅可应用到已打开的正式工程。"));
+    if (draft.expectedRevision != d->revision) return fail(error, QStringLiteral("正式曲谱修订已变化，请重新建立草稿。"));
+    const int beforeCurrent = d->current;
+    int target = -1;
+    for (int i = 0; i < d->tracks.size(); ++i)
+        if (d->tracks[i].active && d->tracks[i].descriptor.id == draft.targetDifficultyId) { target = i; break; }
+    bool added = false;
+    if (draft.targetDifficultyId.isEmpty()) {
+        if (draft.baselineHash != refinementBaselineHash({})) return fail(error, QStringLiteral("新增目标的空基线摘要不一致。"));
+        auto staged = createEditingSnapshotForDifficulty({}, draft.targetDifficultyName, draft.targetDifficultyRank, error);
+        if (!staged) return false;
+        d->tracks.append(*staged->d->track()); target = d->tracks.size() - 1; added = true;
+        d->tracks[target].savedActive = false;
+    } else {
+        if (target < 0 || draft.baselineHash != editingBaselineHash(draft.targetDifficultyId))
+            return fail(error, QStringLiteral("草稿目标或基线已变化，未应用。"));
+        if ((!draft.targetDifficultyName.isEmpty() && draft.targetDifficultyName != d->tracks[target].descriptor.name)
+                || (draft.targetDifficultyRank > 0 && draft.targetDifficultyRank != d->tracks[target].descriptor.rank))
+            return fail(error, QStringLiteral("草稿目标的名称或等级不一致，未应用。"));
+    }
+    d->current = target;
+    if (!d->applyEditingObjects(d->track(), draft.objects, error, added, beforeCurrent)) {
+        if (added) d->tracks.removeLast();
+        d->current = beforeCurrent; d->refresh(); return false;
+    }
+    // A content no-op may still select a different fixed target. Match
+    // setDifficulty's revision semantics without creating an undo command.
+    if (d->revision == draft.expectedRevision && beforeCurrent != target) ++d->revision;
+    d->refresh(); return true;
+}
+QJsonValue BeatmapDocument::editorDraftRecords() const { return d->editorDrafts; }
+bool BeatmapDocument::setEditorDraftRecords(const QJsonValue &records, QString *error) {
+    if (d->editingSnapshot || !isLoaded()) return fail(error, QStringLiteral("草稿记录仅随正式工程保存。"));
+    const QJsonValue normalized = records.isUndefined() ? QJsonValue(QJsonArray{}) : records;
+    if (QJsonDocument(QJsonArray{normalized}).toJson(QJsonDocument::Compact).size() > 32 * 1024 * 1024)
+        return fail(error, QStringLiteral("编辑草稿记录超过 32 MiB 保存上限。"));
+    if (d->editorDrafts != normalized) { d->editorDrafts = normalized; d->editorDraftKey = d->nextKey++; }
+    return true;
+}
+
 bool BeatmapDocument::setDifficulty(const QString &id, QString *error) {
+    if (d->editingSnapshot && id != currentDifficultyId()) return fail(error, QStringLiteral("编辑草稿固定当前目标难度。"));
     for (int i = 0; i < d->tracks.size(); ++i) if (d->tracks[i].active && d->tracks[i].descriptor.id == id) {
         if (d->current != i) { d->current = i; ++d->revision; }
         d->refresh(); return true;
@@ -1163,6 +1341,7 @@ bool BeatmapDocument::mirrorObjects(const QStringList &ids, QString *error) {
 bool BeatmapDocument::applyGeneratedChart(const QVector<BeatObject> &objects,
                                            const QString &difficultyName, int difficultyRank,
                                            quint64 expectedRevision, QString *error) {
+    if (d->editingSnapshot) return fail(error, QStringLiteral("生成结果请通过草稿整图替换载入，不能更换草稿目标难度。"));
     auto *selected = d->track();
     if (!d->newSong || !selected || selected->descriptor.characteristic != "Standard")
         return fail(error, QStringLiteral("整曲自动制谱仅应用到新建歌曲的 Standard 谱。"));
@@ -1296,13 +1475,14 @@ bool BeatmapDocument::redo() {
     return true;
 }
 bool BeatmapDocument::isModified() const {
-    if (d->metaKey != d->savedMetaKey) return true;
+    if (d->metaKey != d->savedMetaKey || d->editorDraftKey != d->savedEditorDraftKey) return true;
     for (const auto &selected : d->tracks)
         if (selected.active!=selected.savedActive || (selected.active && selected.stateKey!=selected.savedKey)) return true;
     return false;
 }
 
 bool BeatmapDocument::setNewSongTempo(double bpm, double firstBeatSeconds, QString *error) {
+    if (d->editingSnapshot) return fail(error, QStringLiteral("编辑草稿不能改变全曲 BPM 或时间偏移。"));
     if (!d->newSong || !d->track()) return fail(error, QStringLiteral("已有谱的 BPM 与偏移保持原样。"));
     TimeMap time;
     if (!time.configure(bpm, firstBeatSeconds, {}, error)) return false;
@@ -1317,6 +1497,7 @@ bool BeatmapDocument::setNewSongTempo(double bpm, double firstBeatSeconds, QStri
 }
 
 bool BeatmapDocument::setNewSongDifficulty(const QString &name, int rank, QString *error) {
+    if (d->editingSnapshot) return fail(error, QStringLiteral("编辑草稿固定目标难度，不能更改标识。"));
     if (!d->newSong || d->tracks.isEmpty()) return fail(error, QStringLiteral("已有谱的难度标识保持原样。"));
     if (name.trimmed().isEmpty() || rank <= 0 || rank > 99) return fail(error, QStringLiteral("难度名称或等级标识无效。"));
     for (const auto &selected : d->tracks)
@@ -1327,6 +1508,7 @@ bool BeatmapDocument::setNewSongDifficulty(const QString &name, int rank, QStrin
 
 bool BeatmapDocument::setNewSongMetadata(const QString &title, const QString &artist,
                                        const QString &mapper, QString *error) {
+    if (d->editingSnapshot) return fail(error, QStringLiteral("编辑草稿不能改变正式歌曲信息。"));
     if (!d->newSong) return fail(error, QStringLiteral("已有谱的歌曲元数据保持原样。"));
     if (title.trimmed().isEmpty()) return fail(error, QStringLiteral("歌名不能为空。"));
     d->info.insert("_songName", title.trimmed());
@@ -1339,6 +1521,7 @@ bool BeatmapDocument::setNewSongMetadata(const QString &title, const QString &ar
 
 bool BeatmapDocument::setImportSource(const QString &path, int absoluteStreamIndex,
                                     double startSeconds, double endSeconds, QString *error) {
+    if (d->editingSnapshot) return fail(error, QStringLiteral("编辑草稿不能更换音频或源媒体。"));
     if (!d->newSong || !isLoaded()) return fail(error, QStringLiteral("仅新歌保存导入源媒体与裁剪记录。"));
     const QFileInfo input(path);
     if (!input.isFile() || input.isSymLink() || absoluteStreamIndex < 0 || !finite(startSeconds) || startSeconds < 0 ||
@@ -1374,6 +1557,7 @@ ImportSource BeatmapDocument::importSource() const {
 }
 
 bool BeatmapDocument::saveProject(const QString &path, QString *error) {
+    if (d->editingSnapshot) return fail(error, QStringLiteral("编辑草稿请随正式工程保存，不能独立保存。"));
     if (!isLoaded()) return fail(error, QStringLiteral("请先打开或建立工程。"));
     const QString file = normalizedManifest(path);
     if (QFileInfo(file).suffix().compare("lmsc", Qt::CaseInsensitive) != 0)
@@ -1408,10 +1592,13 @@ bool BeatmapDocument::saveProject(const QString &path, QString *error) {
         }
         state.insert("sourceAssets", sourceAssets);
     }
+    if (QJsonDocument(state).toJson(QJsonDocument::Indented).size() > 64 * 1024 * 1024)
+        return fail(error, QStringLiteral("工程及草稿超过 64 MiB 保存上限，未覆盖已保存工程。"));
     if (!ProjectStore::writeJson(file, state, error)) return false;
     d->manifest = file;
     for (auto &selected : d->tracks) { selected.savedKey = selected.stateKey; selected.savedActive=selected.active; }
     d->savedMetaKey = d->metaKey;
+    d->savedEditorDraftKey = d->editorDraftKey;
     return true;
 }
 
@@ -1421,6 +1608,7 @@ QString BeatmapDocument::recoveryPath(const QString &projectPath) {
 }
 
 bool BeatmapDocument::autoSave(QString *error) {
+    if (d->editingSnapshot) return fail(error, QStringLiteral("编辑草稿请随正式工程保存，不能独立自动保存。"));
     if (d->manifest.isEmpty()) return fail(error, QStringLiteral("请先保存工程一次，再启用自动恢复。"));
     QJsonObject saved;
     if (!ProjectStore::readJson(d->manifest, &saved, error)) return false;
@@ -1434,6 +1622,8 @@ bool BeatmapDocument::autoSave(QString *error) {
             return fail(error, QStringLiteral("源媒体记录已改变，请先手动保存工程。"));
         state.insert("sourceAssets", saved.value("sourceAssets"));
     }
+    if (QJsonDocument(state).toJson(QJsonDocument::Indented).size() > 64 * 1024 * 1024)
+        return fail(error, QStringLiteral("工程及草稿超过 64 MiB 自动恢复上限，保留已有恢复快照。"));
     return ProjectStore::writeJson(recoveryPath(d->manifest), state, error);
 }
 
@@ -1448,6 +1638,7 @@ bool BeatmapDocument::hasRecovery(const QString &projectPath) {
 }
 
 bool BeatmapDocument::exportSong(const QString &destinationFolder, QString *error) const {
+    if (d->editingSnapshot) return fail(error, QStringLiteral("请先应用草稿，再从正式工程导出歌曲。"));
     if (!isLoaded()) return fail(error, QStringLiteral("请先打开或建立工程。"));
     const QFileInfo target(destinationFolder);
     if (target.exists()) return fail(error, QStringLiteral("导出目录必须是新目录，未覆盖已有歌曲。"));

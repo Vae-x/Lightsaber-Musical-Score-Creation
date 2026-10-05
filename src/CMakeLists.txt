@@ -63,6 +63,7 @@ endif ()
 add_executable(src WIN32
         app/main.cpp
         gui/MainWindow.cpp
+        gui/MainWindowAi.cpp
         gui/MainWindow.h
         gui/MainWindow.ui
         gui/SongImportDialog.cpp gui/SongImportDialog.h
@@ -72,7 +73,9 @@ add_executable(src WIN32
         gui/SettingsDialog.cpp gui/SettingsDialog.h
         gui/SettingsPanel.cpp gui/SettingsPanel.h
         gui/AiRecognitionPage.cpp gui/AiRecognitionPage.h
-        gui/GenerationPreviewDialog.cpp gui/GenerationPreviewDialog.h
+        gui/TaskProgressView.cpp gui/TaskProgressView.h
+        gui/EditorRefinementPanel.cpp gui/EditorRefinementPanel.h
+        gui/EditorSessionController.cpp gui/EditorSessionController.h
         gui/NavigationSidebar.cpp gui/NavigationSidebar.h
         gui/ThemeManager.cpp gui/ThemeManager.h
         ../resources/app.qrc)
@@ -225,6 +228,26 @@ if (BUILD_TESTING)
         add_test(NAME ${LMSC_HYBRID_NAME} COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:${LMSC_HYBRID_NAME}_tests>")
         set_tests_properties(${LMSC_HYBRID_NAME} PROPERTIES TIMEOUT 180 LABELS "core;audio;ai;generation")
     endforeach()
+    add_executable(editing_draft_tests "${LMSC_REPOSITORY_DIR}/tests/EditingDraftTest.cpp")
+    target_link_libraries(editing_draft_tests PRIVATE lmsc_core Qt5::Test)
+    set_target_properties(editing_draft_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_test(NAME editing_draft COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:editing_draft_tests>")
+    set_tests_properties(editing_draft PROPERTIES TIMEOUT 90 LABELS "core;editing")
+    add_executable(editor_session_tests "${LMSC_REPOSITORY_DIR}/tests/EditorSessionControllerTest.cpp"
+            gui/EditorSessionController.cpp gui/EditorSessionController.h)
+    target_link_libraries(editor_session_tests PRIVATE lmsc_core Qt5::Widgets Qt5::Test)
+    set_target_properties(editor_session_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_test(NAME editor_session COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:editor_session_tests>")
+    set_tests_properties(editor_session PROPERTIES TIMEOUT 90 LABELS "gui;editing")
+    add_executable(editor_refinement_panel_tests "${LMSC_REPOSITORY_DIR}/tests/EditorRefinementPanelTest.cpp"
+            gui/EditorRefinementPanel.cpp gui/EditorRefinementPanel.h
+            gui/TaskProgressView.cpp gui/TaskProgressView.h
+            gui/AiRecognitionPage.cpp gui/AiRecognitionPage.h gui/ThemeManager.cpp gui/ThemeManager.h
+            ../resources/app.qrc)
+    target_link_libraries(editor_refinement_panel_tests PRIVATE lmsc_core Qt5::Widgets Qt5::Test)
+    set_target_properties(editor_refinement_panel_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_test(NAME editor_refinement_panel COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:editor_refinement_panel_tests>")
+    set_tests_properties(editor_refinement_panel PROPERTIES TIMEOUT 90 LABELS "gui;editing;ai")
     add_executable(ai_generation_page_tests
             "${LMSC_REPOSITORY_DIR}/tests/AiGenerationPageTest.cpp"
             gui/AiRecognitionPage.cpp gui/AiRecognitionPage.h
@@ -348,6 +371,7 @@ if (BUILD_TESTING)
         add_executable(main_window_tests
                 "${LMSC_REPOSITORY_DIR}/tests/MainWindowTest.cpp"
                 gui/MainWindow.cpp gui/MainWindow.h gui/MainWindow.ui
+                gui/MainWindowAi.cpp
                 gui/EditorViews.cpp gui/EditorViews.h)
         target_sources(main_window_tests PRIVATE
                 gui/SongImportDialog.cpp gui/SongImportDialog.h
@@ -355,6 +379,9 @@ if (BUILD_TESTING)
                 gui/SettingsDialog.cpp gui/SettingsDialog.h
                 gui/SettingsPanel.cpp gui/SettingsPanel.h
                 gui/AiRecognitionPage.cpp gui/AiRecognitionPage.h
+                gui/TaskProgressView.cpp gui/TaskProgressView.h
+                gui/EditorRefinementPanel.cpp gui/EditorRefinementPanel.h
+                gui/EditorSessionController.cpp gui/EditorSessionController.h
                 gui/GenerationPreviewDialog.cpp gui/GenerationPreviewDialog.h
                 gui/NavigationSidebar.cpp gui/NavigationSidebar.h
                 gui/ThemeManager.cpp gui/ThemeManager.h)
@@ -375,7 +402,12 @@ if (BUILD_TESTING)
     endif ()
 endif ()
 
-foreach(LMSC_LOG_UI_TARGET src ai_generation_page_tests ai_recognition_tests settings_dialog_tests main_window_tests)
+foreach(LMSC_TASK_UI_TARGET ai_generation_page_tests ai_recognition_tests)
+    if(TARGET ${LMSC_TASK_UI_TARGET})
+        target_sources(${LMSC_TASK_UI_TARGET} PRIVATE gui/TaskProgressView.cpp gui/TaskProgressView.h)
+    endif()
+endforeach()
+foreach(LMSC_LOG_UI_TARGET src ai_generation_page_tests ai_recognition_tests settings_dialog_tests main_window_tests editor_refinement_panel_tests)
     if(TARGET ${LMSC_LOG_UI_TARGET})
         target_sources(${LMSC_LOG_UI_TARGET} PRIVATE gui/DiagnosticLogDialog.cpp gui/DiagnosticLogDialog.h)
     endif()

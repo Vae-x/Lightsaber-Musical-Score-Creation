@@ -2,6 +2,7 @@
 
 #include "TimeMap.h"
 #include <QJsonObject>
+#include <QJsonValue>
 #include <QVector>
 #include <QStringList>
 #include <memory>
@@ -46,6 +47,14 @@ struct ImportSource {
     bool isAvailable() const { return !path.isEmpty(); }
 };
 
+struct EditingDraftApplication {
+    QString targetDifficultyId, targetDifficultyName, baselineHash;
+    // Optional for an existing fixed ID; required for a new named target.
+    int targetDifficultyRank = 0;
+    quint64 expectedRevision = 0;
+    QVector<BeatObject> objects;
+};
+
 class BeatmapDocument {
 public:
     BeatmapDocument();
@@ -79,6 +88,21 @@ public:
     QStringList warnings() const;
     // Monotonic within this document, including undo/redo and timing changes.
     quint64 revision() const;
+
+    // Independent in-memory editing only; shares immutable temporary resources.
+    std::unique_ptr<BeatmapDocument> createEditingSnapshot(QString *error = nullptr) const;
+    std::unique_ptr<BeatmapDocument> createEditingSnapshotForDifficulty(
+        const QString &difficultyId, const QString &newDifficultyName = {},
+        int newDifficultyRank = 7, QString *error = nullptr) const;
+    bool isEditingSnapshot() const;
+    QString editingBaselineHash(const QString &difficultyId = {}) const;
+    bool replaceEditingSnapshotObjects(const QVector<BeatObject> &objects,
+                                       bool clearHistory = false, QString *error = nullptr);
+    bool applyEditingDraft(const EditingDraftApplication &draft, QString *error = nullptr);
+    // Draft JSON is owned/validated by the session controller. Updating it is
+    // save-dirty without changing the formal chart revision.
+    QJsonValue editorDraftRecords() const;
+    bool setEditorDraftRecords(const QJsonValue &records, QString *error = nullptr);
 
     bool addObject(const BeatObject &object, QString *error = nullptr);
     bool updateObject(const BeatObject &object, QString *error = nullptr);

@@ -1,11 +1,13 @@
 #include "AiRecognitionPage.h"
 #include "DiagnosticLogDialog.h"
+#include "TaskProgressView.h"
 #include "core/HybridAiGenerationService.h"
 
 #include <QFileInfo>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QFrame>
+#include <QGridLayout>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QPlainTextEdit>
@@ -16,6 +18,7 @@
 #include <QUuid>
 #include <QVBoxLayout>
 #include <QSignalBlocker>
+#include <QToolButton>
 #include <cmath>
 
 namespace lmsc {
@@ -32,8 +35,8 @@ QFrame *card(QWidget *parent) {
     auto widget = new QFrame(parent);
     widget->setProperty("role", "settingsCard");
     auto layout = new QVBoxLayout(widget);
-    layout->setContentsMargins(20, 18, 20, 18);
-    layout->setSpacing(12);
+    layout->setContentsMargins(10, 8, 10, 8);
+    layout->setSpacing(8);
     return widget;
 }
 
@@ -55,20 +58,41 @@ AiRecognitionPage::AiRecognitionPage(QWidget *parent)
     setAttribute(Qt::WA_StyledBackground, true);
     setProperty("role", "workspacePage");
     auto outer = new QVBoxLayout(this);
-    outer->setContentsMargins(0, 0, 0, 0);
+    outer->setContentsMargins(8, 6, 8, 6);
+    outer->setSpacing(6);
+    outer->setSizeConstraint(QLayout::SetMinimumSize);
+    m_expandButton = new QToolButton(this);
+    m_expandButton->setObjectName(QStringLiteral("aiGenerationPanelToggle"));
+    m_expandButton->setText(tr("AI 分析与制谱"));
+    m_expandButton->setCheckable(true);
+    m_expandButton->setChecked(true);
+    m_expandButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    m_expandButton->setArrowType(Qt::DownArrow);
+    m_expandButton->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    // The workspace's transparent descendant rule otherwise hides the global
+    // checked background while retaining white checked text and arrows.
+    m_expandButton->setStyleSheet(QStringLiteral(
+        "QToolButton { background: palette(button); color: palette(button-text); }"
+        "QToolButton:checked { background: palette(highlight); color: palette(highlighted-text); }"
+        "QToolButton:hover:!checked { background: palette(midlight); }"));
+    outer->addWidget(m_expandButton);
     auto scroll = new QScrollArea(this);
+    m_detailsScroll = scroll;
+    scroll->setObjectName(QStringLiteral("aiGenerationDetailsScroll"));
     scroll->setFrameShape(QFrame::NoFrame);
     scroll->setWidgetResizable(true);
     scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    scroll->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Ignored);
+    scroll->setMinimumHeight(0);
     auto content = new QWidget(scroll);
     content->setProperty("role", "workspacePage");
     auto layout = new QVBoxLayout(content);
-    layout->setContentsMargins(28, 28, 28, 24);
-    layout->setSpacing(16);
-    layout->addWidget(label(tr("AI 分析与制谱"), content, "pageTitle"));
-    layout->addWidget(label(tr("分析整首音乐，按难度编排动作；先预览，确认后应用到新歌。"), content));
+    layout->setContentsMargins(0, 0, 6, 0);
+    layout->setSpacing(8);
+    layout->setSizeConstraint(QLayout::SetMinimumSize);
 
     auto song = card(content);
+    m_songCard = song;
     auto songLayout = qobject_cast<QVBoxLayout *>(song->layout());
     songLayout->addWidget(label(tr("当前歌曲"), song, "cardTitle"));
     m_songTitle = label(tr("尚未打开歌曲"), song, "cardTitle");
@@ -85,20 +109,23 @@ AiRecognitionPage::AiRecognitionPage(QWidget *parent)
     m_serviceStatus->setObjectName(QStringLiteral("aiServiceStatus"));
     serviceLayout->addWidget(m_serviceStatus);
     serviceLayout->addWidget(label(tr("AI 建议音乐段落和动作主题，本地编排完整初稿；试听后可选择重点和片段进行 AI 精修。也可使用纯本地或大语言模型制谱。自动制谱仅支持新建歌曲。"), service));
-    auto modes = new QHBoxLayout;
+    auto modes = new QVBoxLayout;
     modes->addWidget(label(tr("生成方式"), service));
     m_mode = new QComboBox(service);
     m_mode->setObjectName(QStringLiteral("aiGenerationMode"));
+    m_mode->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    m_mode->setMinimumContentsLength(10);
     m_mode->addItem(tr("AI 建议 + 本地编排"), Hybrid);
     m_mode->addItem(tr("本地快速制谱"), LocalQuick);
     m_mode->addItem(tr("大语言模型制谱"), LanguageModel);
     modes->addWidget(m_mode);
-    modes->addStretch();
     serviceLayout->addLayout(modes);
-    auto options = new QHBoxLayout;
+    auto options = new QVBoxLayout;
     options->addWidget(label(tr("生成难度"), service));
     m_difficulty = new QComboBox(service);
     m_difficulty->setObjectName(QStringLiteral("aiGenerationDifficulty"));
+    m_difficulty->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    m_difficulty->setMinimumContentsLength(10);
     const QStringList names{QStringLiteral("Easy"), QStringLiteral("Normal"), QStringLiteral("Hard"),
                             QStringLiteral("Expert"), QStringLiteral("ExpertPlus")};
     const QStringList labels{tr("简单 · Easy"), tr("普通 · Normal"), tr("困难 · Hard"),
@@ -106,9 +133,8 @@ AiRecognitionPage::AiRecognitionPage(QWidget *parent)
     for (int i = 0; i < names.size(); ++i) m_difficulty->addItem(labels[i], names[i]);
     m_difficulty->setCurrentIndex(3);
     options->addWidget(m_difficulty);
-    options->addStretch();
     serviceLayout->addLayout(options);
-    auto types = new QHBoxLayout;
+    auto types = new QGridLayout;
     m_directional = new QCheckBox(tr("方向方块"), service);
     m_dots = new QCheckBox(tr("无方向方块"), service);
     m_bombs = new QCheckBox(tr("炸弹"), service);
@@ -118,60 +144,57 @@ AiRecognitionPage::AiRecognitionPage(QWidget *parent)
     m_bombs->setObjectName(QStringLiteral("aiBombType"));
     m_walls->setObjectName(QStringLiteral("aiWallType"));
     m_directional->setChecked(true);
-    for (auto box : {m_directional, m_dots, m_bombs, m_walls}) types->addWidget(box);
-    types->addStretch();
+    types->addWidget(m_directional, 0, 0); types->addWidget(m_dots, 0, 1);
+    types->addWidget(m_bombs, 1, 0); types->addWidget(m_walls, 1, 1);
     serviceLayout->addLayout(types);
     serviceLayout->addWidget(label(tr("勾选要使用的类型；仅选择炸弹或墙也可生成避障练习。合适位置不足时会减少相应物件。"), service));
-    auto actions = new QHBoxLayout;
-    actions->setSpacing(10);
+    auto actions = new QGridLayout;
+    actions->setSpacing(6);
     m_start = new QPushButton(tr("分析音乐"), service);
     m_start->setObjectName(QStringLiteral("aiRecognizeButton"));
     m_start->setProperty("role", "primary");
-    actions->addWidget(m_start);
+    actions->addWidget(m_start, 0, 0);
     m_generate = new QPushButton(tr("生成候选谱"), service);
     m_generate->setObjectName(QStringLiteral("aiGenerateButton"));
     m_generate->setProperty("role", "primary");
-    actions->addWidget(m_generate);
-    m_cancel = new QPushButton(tr("取消任务"), service);
+    actions->addWidget(m_generate, 0, 1);
+    m_cancel = new QPushButton(tr("取消任务"), this);
     m_cancel->setObjectName(QStringLiteral("aiCancelRecognition"));
-    actions->addWidget(m_cancel);
-    m_resume=new QPushButton(tr("继续生成"), service); m_resume->setObjectName("aiResumeGeneration"); actions->addWidget(m_resume);
-    m_preview=new QPushButton(tr("查看候选谱"), service); m_preview->setObjectName("aiViewCandidate"); actions->addWidget(m_preview);
-    m_logs=new QPushButton(tr("查看本次日志"), service); m_logs->setObjectName("aiViewLog"); actions->addWidget(m_logs);
+    m_resume=new QPushButton(tr("继续生成"), service); m_resume->setObjectName("aiResumeGeneration"); actions->addWidget(m_resume, 1, 0);
+    m_preview=new QPushButton(tr("查看工作稿"), service); m_preview->setObjectName("aiViewCandidate"); actions->addWidget(m_preview, 1, 1);
+    m_logs=new QPushButton(tr("查看本次日志"), service); m_logs->setObjectName("aiViewLog"); actions->addWidget(m_logs, 2, 0);
     m_skipPlanning=new QPushButton(tr("跳过 AI 建议"), service); m_skipPlanning->setObjectName("aiSkipPlanning");
     m_changeArrangement=new QPushButton(tr("换一种编排"), service); m_changeArrangement->setObjectName("aiChangeArrangement");
-    actions->addStretch();
     m_configure = new QPushButton(tr("配置 AI 连接"), service);
     m_configure->setObjectName(QStringLiteral("aiConfigureConnection"));
-    actions->addWidget(m_configure);
+    actions->addWidget(m_configure, 2, 1);
     serviceLayout->addLayout(actions);
-    auto arrangementActions = new QHBoxLayout;
-    arrangementActions->addWidget(m_skipPlanning); arrangementActions->addWidget(m_changeArrangement);
-    arrangementActions->addStretch(); serviceLayout->addLayout(arrangementActions);
-    m_status = label({}, service);
-    m_status->setObjectName(QStringLiteral("aiRecognitionStatus"));
-    serviceLayout->addWidget(m_status);
-    m_progress = new QProgressBar(service);
-    m_progress->setObjectName(QStringLiteral("aiRecognitionProgress"));
-    m_progress->setRange(0, 100);
-    m_progress->setVisible(false);
-    serviceLayout->addWidget(m_progress);
+    actions->addWidget(m_skipPlanning, 3, 0); actions->addWidget(m_changeArrangement, 3, 1);
     layout->addWidget(service);
 
     auto result = card(content);
     auto resultLayout = qobject_cast<QVBoxLayout *>(result->layout());
     resultLayout->addWidget(label(tr("分析与生成结果"), result, "cardTitle"));
-    resultLayout->addWidget(label(tr("分析建议不会改变曲谱。生成结果将在独立预览中展示，点击应用才写入工程，且可一次撤销。"), result));
+    resultLayout->addWidget(label(tr("分析建议不会改变曲谱。候选在曲谱编辑区暂存，可手动修改，确认应用后可一次撤销。"), result));
     m_result = new QPlainTextEdit(result);
     m_result->setObjectName(QStringLiteral("aiRecognitionResult"));
     m_result->setReadOnly(true);
     m_result->setPlaceholderText(tr("尚无识别结果"));
-    m_result->setMinimumHeight(150);
+    m_result->setMinimumHeight(90);
     resultLayout->addWidget(m_result);
     layout->addWidget(result);
     layout->addStretch();
     scroll->setWidget(content);
-    outer->addWidget(scroll);
+    outer->addWidget(scroll, 1);
+    m_taskProgress = new TaskProgressView(this);
+    m_taskProgress->setObjectName(QStringLiteral("aiGenerationTaskProgress"));
+    m_status = m_taskProgress->stageLabel();
+    m_status->setObjectName(QStringLiteral("aiRecognitionStatus"));
+    m_progress = m_taskProgress->progressBar();
+    m_progress->setObjectName(QStringLiteral("aiRecognitionProgress"));
+    outer->addWidget(m_taskProgress);
+    outer->addWidget(m_cancel);
+    connect(m_expandButton, &QToolButton::toggled, this, &AiRecognitionPage::setExpanded);
 
     connect(m_start, &QPushButton::clicked, this, &AiRecognitionPage::startRecognition);
     connect(m_generate, &QPushButton::clicked, this, [this] { startGeneration(false); });
@@ -219,6 +242,23 @@ AiRecognitionPage::~AiRecognitionPage() {
     if (m_generationService && !m_lastGeneration.jobId.isEmpty()) m_generationService->discard(m_lastGeneration.jobId);
     for (const auto &connection : m_connections) disconnect(connection);
     for (const auto &connection : m_generationConnections) disconnect(connection);
+}
+
+void AiRecognitionPage::setCompact(bool compact) {
+    if (m_compact == compact) return;
+    m_compact = compact;
+    m_songCard->setVisible(!compact);
+    m_detailsScroll->setMaximumHeight(compact ? 245 : QWIDGETSIZE_MAX);
+    setExpanded(!compact);
+}
+
+void AiRecognitionPage::setExpanded(bool expanded) {
+    m_expanded = expanded;
+    setSizePolicy(QSizePolicy::Expanding, m_compact && !expanded ? QSizePolicy::Maximum : QSizePolicy::Preferred);
+    const QSignalBlocker blocker(m_expandButton);
+    m_expandButton->setChecked(expanded);
+    m_expandButton->setArrowType(expanded ? Qt::DownArrow : Qt::RightArrow);
+    m_detailsScroll->setVisible(expanded);
 }
 
 void AiRecognitionPage::setContext(const QString &audioFile, const QString &title, double bpm,
@@ -297,8 +337,7 @@ void AiRecognitionPage::setService(AiRecognitionService *service) {
     m_connections.append(connect(next, &AiRecognitionService::progress, this,
         [this](const QString &contextId, int percent) {
             if (!accepts(contextId)) return;
-            m_progress->setRange(0, 100);
-            m_progress->setValue(qBound(0, percent, 100));
+            m_taskProgress->setProgress(percent, m_status->text());
         }));
     m_connections.append(connect(next, &AiRecognitionService::cancelled, this,
         [this](const QString &contextId) {
@@ -377,7 +416,7 @@ void AiRecognitionPage::activateGenerationService(bool force) {
                 if (revision != m_generationServiceRevision || !acceptsGeneration(draft.source)) return;
                 m_pendingGeneration = {};
                 m_cachedDraft=draft; m_hasDraft=!draft.source.analysisOnly;
-                m_progress->setRange(0,100); m_progress->setValue(100);
+                m_taskProgress->setProgress(100, m_status->text());
                 QString output = draft.summary;
                 if (!draft.source.analysisOnly) {
                     output += tr("\n\n%1 · 方向 %2 · 无方向 %3 · 炸弹 %4 · 墙 %5\n平均每秒 %6 个音符 · 峰值 %7")
@@ -388,7 +427,7 @@ void AiRecognitionPage::activateGenerationService(bool force) {
                 if (!draft.warnings.isEmpty()) output += QStringLiteral("\n\n") + draft.warnings.join(QStringLiteral("\n"));
                 m_result->setPlainText(output.isEmpty() ? tr("分析完成，未返回可展示的建议。") : output);
                 setStatus(draft.source.analysisOnly ? tr("分析完成，曲谱未改变。")
-                    : draft.hasThemeWarnings ? tr("候选谱已生成，部分乐句建议试听") : tr("候选谱已生成，请试听预览后应用。"),
+                    : draft.hasThemeWarnings ? tr("候选谱已生成，部分乐句建议试听") : tr("工作稿已生成，可在编辑区试听、修改后确认应用。"),
                     draft.hasThemeWarnings ? "warning" : "success");
                 refreshControls();
                 if (!draft.source.analysisOnly) emit generationDraftReady(draft);
@@ -407,8 +446,7 @@ void AiRecognitionPage::activateGenerationService(bool force) {
         m_generationConnections.append(connect(service, &AiGenerationService::progress, this,
             [this, revision](const QString &jobId, int percent, const QString &stage) {
                 if (revision != m_generationServiceRevision || jobId != m_pendingGeneration.jobId || jobId.isEmpty()) return;
-                m_progress->setRange(0, percent < 0 ? 0 : 100);
-                if (percent >= 0) m_progress->setValue(qBound(0, percent, 100));
+                m_taskProgress->setProgress(percent, stage.isEmpty() ? m_status->text() : stage);
                 if (!stage.isEmpty()) setStatus(stage, "status");
                 refreshControls();
             }));
@@ -509,7 +547,7 @@ void AiRecognitionPage::startGeneration(bool analysisOnly) {
     m_pendingGeneration.arrangementSeed = m_arrangementSeed;
     m_lastGeneration=m_pendingGeneration; m_cachedDraft={}; m_hasDraft=false;
     m_result->clear();
-    m_progress->setRange(0, 0);
+    m_taskProgress->setProgress(-1, {});
     setStatus(analysisOnly ? tr("正在分析整首音乐…") : tr("正在分析音乐并生成候选谱…"), "status");
     refreshControls();
     const auto request = m_pendingGeneration;
@@ -561,7 +599,7 @@ void AiRecognitionPage::startRecognition() {
     request.offsetSeconds = m_offsetSeconds;
     request.durationSeconds = m_durationSeconds;
     m_result->clear();
-    m_progress->setRange(0, 0);
+    m_taskProgress->setProgress(-1, {});
     setStatus(tr("正在识别当前歌曲…"), "status");
     refreshControls();
     emit analyzeRequested(request);
@@ -613,9 +651,9 @@ void AiRecognitionPage::refreshControls() {
     m_preview->setVisible(m_hasDraft); m_preview->setEnabled(m_hasDraft && !m_contextBusy && !isRecognizing());
     m_logs->setVisible(!m_lastGeneration.jobId.isEmpty());
     m_generate->setText(!m_lastGeneration.jobId.isEmpty() && !m_lastGeneration.analysisOnly ? tr("重新生成") : tr("生成候选谱"));
-    m_progress->setVisible(isRecognizing() || !m_lastGeneration.jobId.isEmpty());
+    m_taskProgress->setProgressVisible(isRecognizing() || !m_lastGeneration.jobId.isEmpty());
     m_configure->setEnabled((usesLocalGeneration() || !isRecognizing()) && !m_contextBusy);
-    m_configure->setText(usesLocalGeneration() ? tr("模型连接设置（可选）") : tr("配置 AI 连接"));
+    m_configure->setText(usesLocalGeneration() ? tr("模型连接（可选）") : tr("配置 AI 连接"));
     m_skipPlanning->setVisible(usesHybridGeneration() && isRecognizing() && !m_pendingGeneration.analysisOnly);
     m_skipPlanning->setEnabled(usesHybridGeneration() && isRecognizing() && !m_pendingGeneration.analysisOnly);
     m_changeArrangement->setVisible(m_generationMode != LanguageModel);
@@ -667,7 +705,7 @@ void AiRecognitionPage::showIdleStatus() {
 }
 
 void AiRecognitionPage::setStatus(const QString &text, const char *role) {
-    m_status->setText(text);
+    m_taskProgress->setStage(text);
     m_status->setProperty("role", role);
     m_status->style()->unpolish(m_status);
     m_status->style()->polish(m_status);

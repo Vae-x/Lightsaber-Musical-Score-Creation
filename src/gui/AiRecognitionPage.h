@@ -12,8 +12,11 @@ class QProgressBar;
 class QPushButton;
 class QComboBox;
 class QCheckBox;
+class QScrollArea;
+class QToolButton;
 
 namespace lmsc {
+class TaskProgressView;
 
 class AiRecognitionPage : public QWidget {
     Q_OBJECT
@@ -40,6 +43,12 @@ public:
     void invalidateGenerationForConnectionChange();
     void showGenerationApplied();
     bool isRecognizing() const { return !m_pendingContextId.isEmpty() || !m_pendingGeneration.jobId.isEmpty(); }
+    // Embed the same controls beside the score editor. Task state remains
+    // visible while the parameter/result area is collapsed or scrolled.
+    void setCompact(bool compact);
+    void setExpanded(bool expanded);
+    bool isExpanded() const { return m_expanded; }
+    TaskProgressView *taskProgress() const { return m_taskProgress; }
 
 public slots:
     void cancelRecognition();
@@ -114,6 +123,12 @@ private:
     quint32 m_arrangementSeed = 0;
     QPushButton *m_configure;
     QProgressBar *m_progress;
+    TaskProgressView *m_taskProgress;
+    QScrollArea *m_detailsScroll;
+    QToolButton *m_expandButton;
+    QWidget *m_songCard;
+    bool m_compact = false;
+    bool m_expanded = true;
     QPlainTextEdit *m_result;
 };
 

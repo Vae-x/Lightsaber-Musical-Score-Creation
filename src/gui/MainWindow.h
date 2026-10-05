@@ -8,6 +8,7 @@
 #include <functional>
 #include "core/BeatmapDocument.h"
 #include "core/AppSettings.h"
+#include "core/RefinementTypes.h"
 
 namespace Ui { class MainWindow; }
 class AudioService;
@@ -33,6 +34,7 @@ class QSlider;
 class QAction;
 class QStackedWidget;
 class QToolBar;
+class QTabWidget;
 namespace lmsc {
 class NavigationSidebar;
 class SettingsPanel;
@@ -44,7 +46,8 @@ class LlmAiGenerationService;
 class LocalAiGenerationService;
 class HybridAiGenerationService;
 class AiRefinementService;
-class GenerationPreviewDialog;
+class EditorSessionController;
+class EditorRefinementPanel;
 struct GenerationRequest;
 struct GenerationDraft;
 struct RefinementResult;
@@ -86,7 +89,18 @@ private:
     void refreshRecognitionContext();
     bool generationSourceIsCurrent(const lmsc::GenerationRequest &source) const;
     void previewGeneratedChart(const lmsc::GenerationDraft &draft);
-    void openGenerationPreview(const lmsc::GenerationDraft &draft, bool documentBaseline);
+    lmsc::BeatmapDocument *editingDocument() const;
+    bool prepareManualEdit();
+    void editingChanged();
+    void refreshDraftPanel();
+    void showGenerationTools();
+    void startRefinement(bool selectedOnly, double start, double end);
+    void resumeRefinement();
+    void cancelRefinement(bool manualEdit = false);
+    void connectRefinementService();
+    bool acceptsRefinement(const lmsc::RefinementResult &result) const;
+    void confirmDraftReplacement(const QString &message, std::function<void()> action);
+    bool syncDraftRecords();
     void refineCurrentChart();
     bool currentChartSupportsRefinement() const;
     void updateWorkspaceActions();
@@ -138,9 +152,18 @@ private:
     lmsc::AiRefinementService *m_defaultRefinementService = nullptr;
     QPointer<lmsc::AiRefinementService> m_refinementService;
     std::unique_ptr<lmsc::RefinementResult> m_cachedRefinement;
-    std::unique_ptr<lmsc::GenerationDraft> m_cachedPreviewBaseline;
-    bool m_cachedBaselineIsDocument = false;
-    QPointer<lmsc::GenerationPreviewDialog> m_generationPreview;
+    lmsc::EditorSessionController *m_editorSession = nullptr;
+    lmsc::EditorRefinementPanel *m_refinementPanel = nullptr;
+    QTabWidget *m_toolsTabs = nullptr;
+    QWidget *m_generationTools = nullptr;
+    QWidget *m_draftReplacement = nullptr;
+    QLabel *m_draftReplacementLabel = nullptr;
+    QLabel *m_editorStateLabel = nullptr;
+    std::function<void()> m_pendingDraftAction;
+    QVector<QMetaObject::Connection> m_refinementConnections;
+    lmsc::RefinementRequest m_pendingRefinement, m_lastRefinement;
+    QString m_refinementTarget;
+    quint64 m_refinementWorkingRevision = 0, m_refinementServiceRevision = 0;
     QString m_documentId;
     lmsc::AppPreferences m_generationPreferences;
     QToolBar *m_editorToolbar = nullptr;
