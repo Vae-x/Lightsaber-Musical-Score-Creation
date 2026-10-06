@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import hashlib
 import json
 import math
@@ -24,6 +25,9 @@ MODEL_REVISIONS = {"easy_15": "e04b14ad772a4e091a0df65780ddc4011f43409b",
                    "expert_15": "0cfd41f330f47eba81106684255a916934da3ae7"}
 MODEL_PREFIXES = ("tf_model_enc_", "tf_model_mapper_", "tf_beat_gen_", "tf_event_gen_")
 MODEL_PICKLES = ("notes_class_dict.pkl", "onehot_encoder_beats.pkl", "onehot_encoder_events.pkl")
+RHYTHM_GAP_POLICY = {"mode": "model_actions_with_local_rhythm_gap_fill_v1", "minimumGapSeconds": 4.0,
+                     "minimumGapBeats": 4.0, "minimumReferenceEvents": 3, "minimumReferenceSpanSeconds": 3.0,
+                     "nearEventToleranceSeconds": 1 / 16, "edgeToleranceSeconds": 0.15}
 
 
 class TrialError(RuntimeError):
@@ -248,48 +252,375 @@ def inventory_matches(directory, inventory):
 
 
 def load_generator(source, notes_only):
-    """Disable lighting only in memory; keep the pinned upstream tree untouched."""
+    """Patch exact pinned blocks in memory; never change the upstream checkout."""
     import importlib
-    if not notes_only:
-        return importlib.import_module("map_creation.gen_beats"), {}
     import types
     source_file = Path(source) / "map_creation/gen_beats.py"
     text = source_file.read_text(encoding="utf-8")
     begin = "    if True:\n        # (TODO: add furious_lighting to increase effect frequency)"
     end = "    if config.bs_mapping_version != \"v3\":"
-    if text.count(begin) != 1 or text.count(end) != 1:
-        raise TrialError("上游灯光代码与固定版本不一致，拒绝猜测修改")
-    start_index = text.index(begin)
-    end_index = text.index(end, start_index)
-    replacement = "    events = np.zeros((len(map_times), 2), dtype=int)\n"
-    patched = text[:start_index] + replacement + text[end_index:]
+    crop = ("    map_times = map_times[config.lstm_len:]     # required by lstm start-up\n"
+            "    map_times = map_times[:len(y_class_map)]    # rest from sectioning into lstm len batches\n")
+    if text.count(crop) != 1:
+        raise TrialError("上游动作窗口配对与固定版本不一致，拒绝猜测修改")
+    patched = text.replace(crop, "    assert len(map_times) == len(y_class_map), 'Padded action timing mismatch'\n")
+    preprocessing = ("    song_ar, rm_index = run_music_preprocessing(name_ar, time_ar=[map_times], save_file=False,\n"
+                     "                                                song_combined=False, predict_path=True)  # 7.8\n")
+    if patched.count(preprocessing) != 1:
+        raise TrialError("上游音乐窗口调用与固定版本不一致，拒绝猜测修改")
+    patched = patched.replace(preprocessing, "    map_times = trial_complete_rhythm(map_times)\n" + preprocessing)
+    if notes_only:
+        if patched.count(begin) != 1 or patched.count(end) != 1:
+            raise TrialError("上游灯光代码与固定版本不一致，拒绝猜测修改")
+        start_index = patched.index(begin)
+        end_index = patched.index(end, start_index)
+        replacement = "    events = np.zeros((len(map_times), 2), dtype=int)\n"
+        patched = patched[:start_index] + replacement + patched[end_index:]
     parent = importlib.import_module("map_creation")
     module = types.ModuleType("map_creation.gen_beats")
     module.__file__ = str(source_file)
     module.__package__ = "map_creation"
     sys.modules[module.__name__] = module
     exec(compile(patched, str(source_file), "exec"), module.__dict__)
+    module.trial_complete_rhythm = lambda timings: timings
     parent.gen_beats = module
-    return module, {"componentMode": "notes-only", "lightingPolicy": "跳过灯光模型，仅生成空灯光事件",
+    return module, {"componentMode": "notes-only" if notes_only else "full",
+                    "lightingPolicy": "跳过灯光模型，仅生成空灯光事件" if notes_only else "上游灯光模型",
+                    "actionBoundaryPolicy": "首16事件复制首特征作上下文；尾复制末特征补齐；输出按原事件时间配对",
+                    "rhythmGapHookPolicy": "调用者先更新 map_times，再创建音乐窗口和编码；无参考时保持原模型时间",
                     "compatibilitySourceSha256": hashlib.sha256(text.encode()).hexdigest(),
                     "compatibilityPatchedSha256": hashlib.sha256(patched.encode()).hexdigest()}
 
 
+def action_padding_indices(timings, lstm_len):
+    """The trained previous-window -> next-window decoder needs one prefix block."""
+    timings = [float(value) for value in timings]
+    if not timings or lstm_len < 1 or any(not math.isfinite(value) for value in timings):
+        raise TrialError("动作输入时间为空或无效")
+    if any(second < first for first, second in zip(timings, timings[1:])):
+        raise TrialError("动作输入事件时间必须升序")
+    deltas = sorted(second - first for first, second in zip(timings, timings[1:]) if second > first)
+    step = deltas[len(deltas) // 2] if deltas else 1.0
+    tail = (-len(timings)) % lstm_len
+    indices = [0] * lstm_len + list(range(len(timings))) + [len(timings) - 1] * tail
+    # The original first real event has time_diff=1. Keep that value exactly.
+    prefix = [timings[0] - 1.0 - (lstm_len - 1 - index) * step for index in range(lstm_len)]
+    suffix = [timings[-1] + (index + 1) * step for index in range(tail)]
+    return indices, prefix + timings + suffix, {"prefixContextEvents": lstm_len, "tailPaddingEvents": tail,
+                                               "contextIntervalSeconds": step, "outputEvents": len(timings)}
+
+
 def guard_action_generation(generate, diagnostics):
-    """Expose insufficient input without changing model inputs or generated actions."""
+    """Pad feature context only, trim synthetic targets, preserve all real timings."""
     def guarded(features, timings, model_path, lstm_len, encoder_file):
         if Path(model_path).name.startswith("tf_model_mapper_"):
             count = len(timings)
             diagnostics.update(actionModelInputEvents=count, encodedAudioWindows=len(features),
                                requiredActionInputEvents=2 * lstm_len,
-                               usableActionSequenceBlocks=max(0, count // lstm_len - 1))
+                               usableActionSequenceBlocks=(count + lstm_len - 1) // lstm_len)
             status("action_input", **diagnostics)
             if min(count, len(features)) < 2 * lstm_len:
                 raise TrialError("当前音频在静音过滤和边界窗口检查后仅剩 %d 个动作输入事件，"
                                  "模型至少需要 %d 个；保留失败记录，请使用更长或包含更多有效音乐变化的音频"
                                  % (min(count, len(features)), 2 * lstm_len))
+            if len(features) != count:
+                raise TrialError("编码音乐窗口与动作事件数量不一致")
+            import numpy as np
+            indices, padded_times, padding = action_padding_indices(timings, lstm_len)
+            diagnostics.update(padding)
+            decoded = generate(np.asarray(features)[indices], np.asarray(padded_times),
+                               model_path, lstm_len, encoder_file)
+            expected = count + padding["tailPaddingEvents"]
+            if len(decoded) != expected:
+                raise TrialError("补齐动作输出数量不一致: 预期 %d，实际 %d" % (expected, len(decoded)))
+            status("action_padding", **padding)
+            return decoded[:count]
         return generate(features, timings, model_path, lstm_len, encoder_file)
     return guarded
+
+
+def pcm_silence_intervals(rms_frames, frame_seconds=0.05, duration=None, threshold_dbfs=-70.0,
+                          minimum_seconds=0.20, padding_seconds=0.10):
+    """Conservative absolute PCM silence; protect both edges of each quiet run."""
+    if duration is None:
+        duration = len(rms_frames) * frame_seconds
+    threshold = 10 ** (threshold_dbfs / 20.0)
+    intervals = []
+    start = None
+    for index in range(len(rms_frames) + 1):
+        quiet = index < len(rms_frames) and float(rms_frames[index]) <= threshold
+        if quiet and start is None:
+            start = index * frame_seconds
+        elif not quiet and start is not None:
+            end = min(index * frame_seconds, duration)
+            if end - start + 1e-9 >= minimum_seconds and end - start > 2 * padding_seconds:
+                intervals.append((start + padding_seconds, end - padding_seconds))
+            start = None
+    return intervals
+
+
+def install_pcm_silence_filter(module, audio, diagnostics):
+    """Analyze the read-only job audio without normalization or changing its bytes."""
+    import aubio
+    import numpy as np
+    samplerate = 16000
+    source = aubio.source(str(audio), samplerate=samplerate, channels=0)
+    chunks = []
+    try:
+        while True:
+            samples, read = source.do_multi()
+            samples = np.asarray(samples)
+            if samples.shape != (source.channels, source.hop_size):
+                raise TrialError("PCM 声道形状不符合 aubio 固定接口")
+            if read:
+                chunks.append(samples[:, :read].copy())
+            if read < source.hop_size:
+                break
+    finally:
+        source.close()
+    channels = source.channels
+    pcm = np.concatenate(chunks, axis=1) if chunks else np.zeros((channels, 0))
+    if not pcm.shape[1]:
+        raise TrialError("音乐解码为空，不能判断真实静音")
+    frame = int(samplerate * 0.05)
+    rms = [pcm_frame_rms(pcm[:, start:start + frame]) for start in range(0, pcm.shape[1], frame)]
+    duration = pcm.shape[1] / samplerate
+    intervals = pcm_silence_intervals(rms, duration=duration)
+    diagnostics.update(policy="actual_pcm_rms", thresholdDbfs=-70.0, frameSeconds=0.05,
+                       minimumSilenceSeconds=0.20, boundaryProtectionSeconds=0.10,
+                       sampleRate=samplerate, sourceChannels=channels, channelPolicy="mean_square_before_channel_average",
+                       audioDurationSeconds=duration, silenceIntervals=intervals,
+                       silenceSeconds=sum(end - start for start, end in intervals))
+
+    def silent_times(_spectrogram, timings):
+        times = np.asarray(timings)
+        mask = np.zeros(len(times), dtype=bool)
+        for start, end in intervals:
+            mask |= (times >= start) & (times <= end)
+        return times[mask]
+
+    def remove_silent_times(timings, _silent_samples):
+        # Use the actual protected intervals, without the old +/-30ms expansion.
+        times = np.asarray(timings)
+        mask = np.zeros(len(times), dtype=bool)
+        for start, end in intervals:
+            mask |= (times >= start) & (times <= end)
+        diagnostics.update(inputEvents=len(times), removedEvents=int(mask.sum()), retainedEvents=int((~mask).sum()))
+        status("pcm_silence", **diagnostics)
+        return times[~mask]
+
+    module.get_silent_times = silent_times
+    module.remove_silent_times = remove_silent_times
+
+
+def pcm_frame_rms(channel_samples):
+    import numpy as np
+    samples = np.asarray(channel_samples, dtype=float)
+    return float(np.sqrt(np.mean(samples ** 2)))
+
+
+def load_rhythm_reference(directory, audio_sha256, bpm, difficulty):
+    """Accept a same-audio, fixed-BPM, zero-offset Standard v2 reference."""
+    if type(bpm) not in (int, float) or not math.isfinite(bpm) or bpm <= 0 or difficulty not in PROFILES:
+        raise TrialError("节奏参考需要有效 BPM 和目标难度")
+    directory = Path(directory).resolve(strict=True)
+    info_path = directory / "info.dat"
+    def read_snapshot(path):
+        content = path.read_bytes()
+        value = json.loads(content.decode("utf-8-sig"))
+        if not isinstance(value, dict):
+            raise TrialError("节奏参考 JSON 根必须为对象")
+        return value, hashlib.sha256(content).hexdigest()
+    info, info_sha256 = read_snapshot(info_path)
+    if not str(info.get("_version", "")).startswith("2."):
+        raise TrialError("节奏参考必须为基础 v2 歌曲")
+    reference_bpm = info.get("_beatsPerMinute")
+    if (type(reference_bpm) not in (int, float) or not math.isfinite(reference_bpm)
+            or abs(reference_bpm - bpm) > max(1e-7, abs(bpm) * 1e-9)):
+        raise TrialError("节奏参考 BPM 与当前音乐不一致")
+    offset = info.get("_songTimeOffset", 0)
+    if type(offset) not in (int, float) or not math.isfinite(offset) or abs(offset) > 1e-7:
+        raise TrialError("节奏参考只接受零偏移，不得重复平移首拍")
+
+    def asset(name):
+        if not isinstance(name, str) or not name or Path(name).is_absolute():
+            raise TrialError("节奏参考资源路径无效")
+        path = (directory / name).resolve(strict=True)
+        if not path.is_relative_to(directory) or not path.is_file():
+            raise TrialError("节奏参考资源必须位于歌曲目录内")
+        return path
+
+    reference_audio = asset(info.get("_songFilename"))
+    if sha256(reference_audio) != audio_sha256:
+        raise TrialError("节奏参考音频 SHA256 与原音乐不一致")
+    entries = [entry for group in info.get("_difficultyBeatmapSets", [])
+               if group.get("_beatmapCharacteristicName") == "Standard"
+               for entry in group.get("_difficultyBeatmaps", []) if entry.get("_difficulty") == difficulty]
+    if len(entries) != 1:
+        raise TrialError("节奏参考缺少唯一目标 Standard 难度")
+    chart_path = asset(entries[0].get("_beatmapFilename"))
+    chart, chart_sha256 = read_snapshot(chart_path)
+    if not str(chart.get("_version", "")).startswith("2."):
+        raise TrialError("节奏参考谱必须为基础 v2")
+    def reject_timing_changes(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key.lower().lstrip("_") in ("bpmchanges", "bpmevents") and child:
+                    raise TrialError("节奏参考必须为固定 BPM，不能包含变速事件")
+                reject_timing_changes(child)
+        elif isinstance(value, list):
+            for child in value:
+                reject_timing_changes(child)
+    reject_timing_changes(info)
+    reject_timing_changes(chart)
+    if any(event.get("_type") == 100 for event in chart.get("_events", [])):
+        raise TrialError("节奏参考不能包含 BPM 灯光事件")
+    times = []
+    for note in chart.get("_notes", []):
+        if note.get("_type") not in (0, 1):
+            continue
+        beat = note.get("_time")
+        if type(beat) not in (int, float) or not math.isfinite(beat) or beat < 0:
+            raise TrialError("节奏参考包含无效音符时间")
+        seconds = beat * 60 / bpm
+        if not math.isfinite(seconds):
+            raise TrialError("节奏参考音符时间超出有效范围")
+        times.append(seconds)
+    times.sort()
+    unique = []
+    for value in times:
+        if not unique or value - unique[-1] > 1e-7:
+            unique.append(value)
+    identity = {"audioSha256": audio_sha256, "infoSha256": info_sha256, "chartSha256": chart_sha256,
+                "difficulty": difficulty, "bpm": reference_bpm, "songTimeOffset": offset,
+                "eventCount": len(unique), "policy": RHYTHM_GAP_POLICY}
+    return {"directory": str(directory), "identity": identity, "eventSeconds": unique}
+
+
+def fill_long_rhythm_gaps(timings, reference, bpm, duration, silence_intervals):
+    """Only use actual local events inside a supported long hole in model timing."""
+    if not math.isfinite(bpm) or bpm <= 0 or not math.isfinite(duration) or duration <= 0:
+        raise TrialError("音乐补缺需要有效 BPM 和音频时长")
+    original = sorted(float(value) for value in timings)
+    if any(not math.isfinite(value) for value in original):
+        raise TrialError("模型音乐点包含无效时间")
+    anchors = sorted(set(value for value in original if 0 < value < duration))
+    boundaries = [0.0] + anchors + [duration]
+    threshold = max(RHYTHM_GAP_POLICY["minimumGapSeconds"], RHYTHM_GAP_POLICY["minimumGapBeats"] * 60 / bpm)
+    merged = original[:]
+    intervals, total = [], 0
+    reference = sorted(set(float(value) for value in reference))
+    if any(not math.isfinite(value) for value in reference):
+        raise TrialError("本地参考音乐点包含无效时间")
+    for start, end in zip(boundaries, boundaries[1:]):
+        if end - start < threshold - 1e-7:
+            continue
+        left = start + (RHYTHM_GAP_POLICY["edgeToleranceSeconds"] if start else 0)
+        right = end - (RHYTHM_GAP_POLICY["edgeToleranceSeconds"] if end < duration else 0)
+        candidates = reference[bisect.bisect_left(reference, left):bisect.bisect_right(reference, right)]
+        candidates = [value for value in candidates if 0 < value < duration and math.isfinite(value)
+                      and not any(silent_start <= value <= silent_end for silent_start, silent_end in silence_intervals)]
+        added = []
+        for value in candidates:
+            insertion = bisect.bisect_left(merged, value)
+            neighbors = merged[max(0, insertion - 1):insertion + 1]
+            if any(abs(value - neighbor) < RHYTHM_GAP_POLICY["nearEventToleranceSeconds"] for neighbor in neighbors):
+                continue
+            if added and value - added[-1] < RHYTHM_GAP_POLICY["nearEventToleranceSeconds"]:
+                continue
+            added.append(value)
+        if (len(added) < RHYTHM_GAP_POLICY["minimumReferenceEvents"] or
+                added[-1] - added[0] < RHYTHM_GAP_POLICY["minimumReferenceSpanSeconds"] - 1e-7):
+            continue
+        for value in added:
+            bisect.insort(merged, value)
+        total += len(added)
+        intervals.append({"startSeconds": start, "endSeconds": end, "addedEvents": len(added),
+                          "firstAddedSeconds": added[0], "lastAddedSeconds": added[-1],
+                          "referenceSpanSeconds": added[-1] - added[0]})
+    return merged, {"policy": RHYTHM_GAP_POLICY, "thresholdSeconds": threshold, "addedEvents": total,
+                    "inputEvents": len(original), "outputEvents": len(merged), "filledIntervals": intervals}
+
+
+def timing_summary(timings):
+    values = sorted(float(value) for value in timings if float(value) > 0)
+    gaps = sorted(({"seconds": second - first, "from": first, "to": second}
+                   for first, second in zip(values, values[1:])), key=lambda item: item["seconds"], reverse=True)
+    return {"events": len(values), "firstSeconds": values[0] if values else None,
+            "lastSeconds": values[-1] if values else None, "firstEventSeconds": values[:24], "largestGaps": gaps[:8]}
+
+
+def install_generation_diagnostics(module, diagnostics):
+    def record(stage, timings, **details):
+        entry = {"stage": stage, **timing_summary(timings), **details}
+        diagnostics.append(entry)
+        status("timing_diagnostic", timingStage=stage, **{key: value for key, value in entry.items() if key != "stage"})
+
+    thresholding = module.apply_first_beat_thresholding
+    def threshold(values):
+        import numpy as np
+        scores = np.asarray(values).reshape(-1)
+        record("beat_probability_above_base_threshold",
+               np.flatnonzero(scores > module.config.thresh_beat) / module.config.beat_spacing,
+               baseThreshold=module.config.thresh_beat, introThresholdMultiplier=module.config.threshold_start,
+               initialAudioWindowExclusionSeconds=module.config.window)
+        result = thresholding(values)
+        record("beat_probability_after_intro_threshold",
+               np.flatnonzero(np.asarray(result).reshape(-1)) / module.config.beat_spacing)
+        return result
+    module.apply_first_beat_thresholding = threshold
+    for name in ("sanity_check_timing2", "add_start_end_beats", "fill_map_times_scale", "remove_silent_times", "trial_complete_rhythm"):
+        delegate = getattr(module, name)
+        def wrapped(*args, _delegate=delegate, _name=name, **kwargs):
+            before = args[1] if _name == "sanity_check_timing2" else args[0]
+            record(_name + "_before", before)
+            result = _delegate(*args, **kwargs)
+            record(_name + "_after", result, removedEvents=len(before) - len(result))
+            return result
+        setattr(module, name, wrapped)
+    preprocessing = module.run_music_preprocessing
+    def preprocess(*args, **kwargs):
+        before = kwargs["time_ar"][0]
+        record("audio_window_before", before, requiredWindowSeconds=module.config.window)
+        result = preprocessing(*args, **kwargs)
+        removed = set(result[1][0])
+        record("audio_window_after", [value for index, value in enumerate(before) if index not in removed],
+               removedEvents=len(removed))
+        return result
+    module.run_music_preprocessing = preprocess
+    generate = module.generate
+    def action(features, timings, *args):
+        record("action_input", timings)
+        result = generate(features, timings, *args)
+        record("action_output_aligned", timings, decodedEvents=len(result))
+        return result
+    module.generate = action
+    import map_creation.map_creator_deprecated as creator
+    safety = creator.sanity_check_notes
+    current_timings = []
+    def active(values, timings):
+        return [timings[index] for index, note in enumerate(values)
+                if any(note[offset] in (0, 1) for offset in range(2, len(note), 4))]
+    def note_safety(notes, timings):
+        nonlocal current_timings
+        current_timings = timings
+        before = active(notes, timings)
+        record("decoded_before_safe_rules", before)
+        result = safety(notes, timings)
+        after = active(result, timings)
+        record("after_safe_rules", after, removedEvents=len(before) - len(after))
+        return result
+    creator.sanity_check_notes = note_safety
+    import map_creation.sanity_check as safety_module
+    for name in ("correct_notes", "turn_notes_single"):
+        delegate = getattr(safety_module, name)
+        def safe_stage(notes, *args, _delegate=delegate, _name=name, **kwargs):
+            before = active(notes, current_timings)
+            result = _delegate(notes, *args, **kwargs)
+            after = active(result[0] if _name == "turn_notes_single" else result, current_timings)
+            record(_name + "_after", after, removedEvents=len(before) - len(after))
+            return result
+        setattr(safety_module, name, safe_stage)
 
 
 def bind_generated_difficulty(song_directory, difficulty):
@@ -315,6 +646,8 @@ def bind_generated_difficulty(song_directory, difficulty):
 
 def worker(args):
     """Called in one fresh Python process per chart, with an isolated writable CWD."""
+    if not args.notes_only:
+        raise TrialError("本轮仅验证 notes-only；灯光模型的窗口配对未验证，不支持 --no-notes-only")
     source = Path(args.source or Path(args.runtime) / "source").resolve(strict=True)
     audio = Path(args.audio).resolve(strict=True)
     if args.ffmpeg:
@@ -330,13 +663,17 @@ def worker(args):
     manifest = verify_model(args.model_dir, args.model)
     if not args.notes_only and manifest.get("componentMode") == "notes-only":
         raise TrialError("此缓存未下载灯光模型，只支持 --notes-only")
+    source_audio_sha256 = sha256(audio)
+    reference = load_rhythm_reference(args.rhythm_reference, source_audio_sha256, args.bpm, args.difficulty) if args.rhythm_reference else None
     job.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
     result = {"complete": False, "upstreamCommit": UPSTREAM_COMMIT, "sourceIdentity": source_identity, "model": args.model,
               "modelRevision": manifest["revision"], "difficulty": args.difficulty,
               "strength": args.strength, "seed": args.seed, "bpm": args.bpm,
-              "sourceAudioSha256": sha256(audio), "audioTimeShiftSeconds": 0,
+              "sourceAudioSha256": source_audio_sha256, "audioTimeShiftSeconds": 0,
               "firstBeatPolicy": "以原音频绝对秒生成；未按工程首拍再次平移", "cpuThreads": args.threads}
+    result["rhythmPolicy"] = "模型动作＋本地补缺节奏" if reference else "原模型节奏（首尾窗口修复）"
+    result["rhythmReference"] = {key: value for key, value in reference.items() if key != "eventSeconds"} if reference else None
     try:
         status("prepare_audio", model=args.model, difficulty=args.difficulty)
         input_directory = job / "prediction" / "songs_predict"
@@ -357,6 +694,8 @@ def worker(args):
                         job / "audio-convert.log", timeout=120, environment=process_environment(args.threads))
             result["audioPreparation"] = "FFmpeg 转 Ogg；未归一化或平移"
         result["preparedAudioSha256"] = sha256(copied_audio)
+        if ogg and result["preparedAudioSha256"] != source_audio_sha256:
+            raise TrialError("音乐在只读复制期间改变，停止本次模型生成")
         os.environ.update(process_environment(args.threads, args.runtime, Path(args.ffmpeg).parent if args.ffmpeg else None))
         dll_directories = []
         if os.name == "nt" and hasattr(os, "add_dll_directory"):
@@ -380,6 +719,7 @@ def worker(args):
         config.add_obstacle_flag = False
         config.add_slider_flag = False
         config.allow_dot_notes = True
+        config.add_breaks_flag = False
         config.num_workers = 1
         config.random_seed = args.seed
         # Redirect every writable upstream path, including failure cleanup paths.
@@ -426,6 +766,20 @@ def worker(args):
         if hasattr(gen_beats, "generate"):
             result["inputDiagnostics"] = {}
             gen_beats.generate = guard_action_generation(gen_beats.generate, result["inputDiagnostics"])
+        if hasattr(gen_beats, "get_silent_times"):
+            result["silenceDiagnostics"] = {}
+            install_pcm_silence_filter(gen_beats, copied_audio, result["silenceDiagnostics"])
+            if reference:
+                def complete_rhythm(timings):
+                    completed, details = fill_long_rhythm_gaps(timings, reference["eventSeconds"], args.bpm,
+                        result["silenceDiagnostics"]["audioDurationSeconds"], result["silenceDiagnostics"]["silenceIntervals"])
+                    result["rhythmGapFill"] = details
+                    status("rhythm_gap_fill", **details)
+                    return np.asarray(completed)
+                gen_beats.trial_complete_rhythm = complete_rhythm
+            result["timingDiagnostics"] = []
+            install_generation_diagnostics(gen_beats, result["timingDiagnostics"])
+        result["syntheticBreaksEnabled"] = False
         status("generate", model=args.model, difficulty=args.difficulty)
         if gen_beats.main(["song"]):
             raise TrialError("上游未产生足够音符，当前歌曲生成失败")
@@ -446,7 +800,7 @@ def worker(args):
     return result
 
 
-def output_fingerprint(describe, model_manifest, args, difficulty):
+def output_fingerprint(describe, model_manifest, args, difficulty, rhythm_reference_identity=None):
     audio = Path(describe["audioPath"])
     cover = Path(describe["coverPath"]) if describe.get("coverPath") else None
     model, strength = PROFILES[difficulty]
@@ -458,6 +812,8 @@ def output_fingerprint(describe, model_manifest, args, difficulty):
                                   ("model", "repo", "revision", "componentMode", "files", "skippedFiles")},
                 "model": model, "strength": strength, "difficulty": difficulty, "seed": args.seed,
                 "upstreamCommit": UPSTREAM_COMMIT, "threads": args.threads,
+                "rhythmReferenceIdentity": rhythm_reference_identity,
+                "rhythmPolicy": RHYTHM_GAP_POLICY if rhythm_reference_identity else "model_rhythm_boundary_fixed",
                 "sourceIdentity": args.source_identity, "environmentInfoSha256": args.environment_info_sha256}
     return hashlib.sha256(json.dumps(material, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
@@ -557,7 +913,7 @@ def combined_package(output, project_dir, results, index, algorithm):
         shutil.copyfile(source_file, target_file)
         target_entries.append(entry)
     first["_songName"] = relevant[0]["songName"]
-    first["_songSubName"] = "纯本地算法对照" if algorithm == "local" else "InfernoSaber 现成模型试用"
+    first["_songSubName"] = "纯本地算法对照" if algorithm == "local" else "InfernoSaber 模型动作＋本地补缺节奏"
     write_json(destination / "info.dat", first)
     readiness = all(item["playableReady"] for item in relevant)
     category = "ready" if readiness else "editor-only"
@@ -627,6 +983,17 @@ def batch(args):
                     project_results.append(result)
                     status("chart_start", song=result["songName"], difficulty=difficulty, algorithm=algorithm)
                     try:
+                        if algorithm == "model":
+                            local_result = next((item for item in project_results if item["algorithm"] == "local"
+                                                 and item["difficulty"] == difficulty and item["complete"]), None)
+                            if not local_result:
+                                raise TrialError("同难度本地节奏基准未生成成功，不能进行已验证的混合补缺")
+                            rhythm_reference = output / local_result["songRelativePath"]
+                            reference = load_rhythm_reference(rhythm_reference, sha256(describe["audioPath"]), bpm, difficulty)
+                            result["rhythmReferenceIdentity"] = reference["identity"]
+                            result["rhythmPolicy"] = "模型动作＋本地补缺节奏"
+                            result["fingerprint"] = output_fingerprint(describe, report["models"][model], args,
+                                                                      difficulty, reference["identity"]) + ":model"
                         prior = reusable_result(args.resume, result["fingerprint"])
                         if prior:
                             old, old_song = prior
@@ -648,6 +1015,7 @@ def batch(args):
                                 command = [interpreter, Path(__file__).resolve(), "worker", "--runtime", runtime,
                                            "--source", source, "--model-dir", model_root / model, "--model", model,
                                            "--audio", describe["audioPath"], "--job-dir", job / "worker",
+                                           "--rhythm-reference", rhythm_reference,
                                            "--difficulty", difficulty, "--strength", strength,
                                            "--bpm", bpm, "--seed", args.seed,
                                            "--ffmpeg", Path(args.tools) / "ffmpeg.exe", "--threads", args.threads]
@@ -656,6 +1024,8 @@ def batch(args):
                                 run_process(command, job / "model.log", timeout=args.timeout, cancel_file=cancel_file,
                                             environment=process_environment(args.threads, runtime, args.tools))
                                 generated = read_json(job / "worker/worker-result.json")
+                                if (generated.get("rhythmReference") or {}).get("identity") != reference["identity"]:
+                                    raise TrialError("节奏参考在任务期间改变，原输出已保留，本次不应用")
                                 result["modelGeneration"] = generated
                                 remaining = max(1, args.timeout - (time.monotonic() - chart_start))
                                 run_process([args.core_cli, "check", "--song", generated["outputSongDirectory"],
@@ -743,6 +1113,7 @@ def parser():
     command.add_argument("--seed", type=int, default=20261005)
     command.add_argument("--ffmpeg")
     command.add_argument("--cover")
+    command.add_argument("--rhythm-reference", help="同音频、同 BPM、同难度的本地基准歌曲目录；只补音乐长空段")
     command.add_argument("--threads", type=int, default=4)
     command.add_argument("--notes-only", action=argparse.BooleanOptionalAction, default=True)
     return result

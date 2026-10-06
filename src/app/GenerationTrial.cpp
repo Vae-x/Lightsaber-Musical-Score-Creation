@@ -150,6 +150,91 @@ QJsonObject inspect(const QVector<BeatObject> &objects, const GenerationRequest 
         {"crossHalfViolations",crossHalf},{"fixed16LoopOccurrences",loops16},{"longestRepeatedActionRun",longestLoop},
         {"longestRepeatedPhraseRun",longestPhraseRun}};
 }
+void inspectCoverage(const QVector<BeatObject> &objects, const GenerationRequest &request,
+                     const MusicAnalysis &analysis, QJsonObject *report) {
+    constexpr double minimumGapSeconds=6.0, minimumGapBeats=8.0;
+    constexpr double minimumHitStrength=.05, minimumHitConfidence=.35, minimumHitSpanSeconds=3.0;
+    constexpr int minimumHitCount=3;
+    constexpr double edgeToleranceSeconds=.15;
+    QVector<double> notes;
+    for (const auto &object : objects) if (object.kind==ObjectKind::Note) {
+        const double seconds=request.timeMap.beatToSeconds(object.beat);
+        if (std::isfinite(seconds) && seconds>=0 && seconds<analysis.durationSeconds) notes.append(seconds);
+    }
+    std::sort(notes.begin(),notes.end());
+    notes.erase(std::unique(notes.begin(),notes.end(),[](double a,double b) { return std::abs(a-b)<1e-7; }),notes.end());
+    QVector<double> hits;
+    for (const auto &anchor : analysis.anchors)
+        if (anchor.kind==MusicAnchorKind::Hit && anchor.strength>=minimumHitStrength && anchor.confidence>=minimumHitConfidence)
+            hits.append(anchor.seconds);
+    std::sort(hits.begin(),hits.end());
+    QStringList warnings; int suspicious=0;
+    auto gap = [&](double start,double end,const QString &kind) {
+        const double startBeat=request.timeMap.secondsToBeat(start);
+        const double duration=qMax(0.0,end-start);
+        const double threshold=qMax(minimumGapSeconds,request.timeMap.beatToSeconds(startBeat+minimumGapBeats)-start);
+        const bool longGap=duration>=threshold-1e-7;
+        const double evidenceStart=start+(kind=="leading" ? 0.0 : edgeToleranceSeconds);
+        const double evidenceEnd=end-(kind=="trailing" ? 0.0 : edgeToleranceSeconds);
+        QJsonArray runs; QVector<double> run; int hitCount=0, bestCount=0; double bestSpan=0.0;
+        auto finishRun = [&] {
+            if (run.isEmpty()) return;
+            const double span=run.last()-run.first();
+            const bool supported=run.size()>=minimumHitCount && span>=minimumHitSpanSeconds-1e-7;
+            runs.append(QJsonObject{{"firstHitSeconds",run.first()},{"lastHitSeconds",run.last()},
+                                   {"hitCount",run.size()},{"hitSpanSeconds",span},{"supportsMissingMusic",supported}});
+            if (supported && span>bestSpan) { bestSpan=span; bestCount=run.size(); }
+            run.clear();
+        };
+        for (double hit : hits) {
+            if (hit<evidenceStart || hit>evidenceEnd) continue;
+            ++hitCount;
+            if (!run.isEmpty()) {
+                const double priorBeat=request.timeMap.secondsToBeat(run.last());
+                // Evidence on opposite sides of a real quiet break must not
+                // combine into a fictitious continuous musical interval.
+                const double mergeGap=qMax(2.0,request.timeMap.beatToSeconds(priorBeat+4.0)-run.last());
+                if (hit-run.last()>mergeGap+1e-7) finishRun();
+            }
+            run.append(hit);
+        }
+        finishRun();
+        const bool missing=longGap && bestCount>=minimumHitCount;
+        if (missing) {
+            ++suspicious;
+            const QString label=kind=="leading" ? QStringLiteral("开头") : kind=="trailing" ? QStringLiteral("结尾") : QStringLiteral("中间");
+            warnings.append(QStringLiteral("%1 %2–%3 秒没有音符，但有连续音乐起音证据（%4 个，跨度 %5 秒），请检查漏谱。")
+                .arg(label).arg(start,0,'f',1).arg(end,0,'f',1).arg(bestCount).arg(bestSpan,0,'f',1));
+        }
+        return QJsonObject{{"kind",kind},{"startSeconds",start},{"endSeconds",end},{"durationSeconds",duration},
+            {"gapBeats",request.timeMap.secondsToBeat(end)-startBeat},{"minimumLongGapSeconds",threshold},
+            {"longGap",longGap},{"validHitCount",hitCount},{"hitEvidenceRuns",runs},
+            {"supportedHitCount",bestCount},{"supportedHitSpanSeconds",bestSpan},{"suspectedMissingMusic",missing}};
+    };
+    report->insert("firstNoteSeconds",notes.isEmpty() ? QJsonValue(QJsonValue::Null) : QJsonValue(notes.first()));
+    report->insert("lastNoteSeconds",notes.isEmpty() ? QJsonValue(QJsonValue::Null) : QJsonValue(notes.last()));
+    const auto leading=gap(0.0,notes.isEmpty() ? analysis.durationSeconds : notes.first(),"leading");
+    const auto trailing=notes.isEmpty() ? QJsonObject{} : gap(notes.last(),analysis.durationSeconds,"trailing");
+    QJsonArray internal;
+    for (int i=1;i<notes.size();++i) {
+        const double start=notes[i-1],end=notes[i];
+        if (end-start<minimumGapSeconds-1e-7) continue;
+        const auto interval=gap(start,end,"internal");
+        if (interval.value("longGap").toBool()) internal.append(interval);
+    }
+    if (notes.isEmpty()) warnings.prepend(QStringLiteral("整曲没有有效音符，不能作为完整试用谱。"));
+    report->insert("coveragePass",!notes.isEmpty() && suspicious==0);
+    report->insert("coverageWarnings",strings(warnings));
+    report->insert("coverage",QJsonObject{{"thresholds",QJsonObject{{"minimumGapSeconds",minimumGapSeconds},
+        {"minimumGapBeats",minimumGapBeats},{"minimumHitCount",minimumHitCount},{"minimumHitStrength",minimumHitStrength},
+        {"minimumHitConfidence",minimumHitConfidence},{"minimumHitSpanSeconds",minimumHitSpanSeconds},
+        {"minimumHitRunMergeGapSeconds",2.0},{"hitRunMergeGapBeats",4.0},{"edgeToleranceSeconds",edgeToleranceSeconds}}},
+        {"leadingGap",leading},{"trailingGap",trailing},{"longInternalGaps",internal},{"suspiciousGapCount",suspicious},
+        {"policy",QStringLiteral("按起音证据提示疑似漏谱；安静休止不判失败，持续无起音的音乐可能无法检出。")}});
+    auto combinedWarnings=report->value("warnings").toArray();
+    for (const auto &warning : warnings) combinedWarnings.append(warning);
+    report->insert("warnings",combinedWarnings);
+}
 QString rawAsset(const QString &folder, const QString &relative);
 QJsonObject sourceInfo(const BeatmapDocument &document) {
     QJsonArray changes;
@@ -266,6 +351,7 @@ void checkSong(const QString &source, const QString &difficulty, const QString &
     report->insert("formatValid",true); report->insert("playabilityPass",errors.isEmpty()); report->insert("errors",strings(errors));
     report->insert("removedBombs",bombs); report->insert("removedWalls",walls);
     report->insert("warnings",strings(analysis.warnings));
+    inspectCoverage(document.objects(),request,analysis,report);
     require(treeHashes(source)==before,QStringLiteral("模型源目录在处理过程中改变，已停止导出。"));
     require(SongExporter::exportSong(document,output,0,audio.toolsDirectory(),&error),error);
     require(digest(QDir(output).filePath("song.ogg"))==digest(audioPath),QStringLiteral("导出音频与模型源音频不同。"));
@@ -283,7 +369,7 @@ int main(int argc, char **argv) {
     if (!parser.parse(app.arguments())) { std::fprintf(stderr,"%s\n",parser.errorText().toUtf8().constData()); return 2; }
     if (parser.isSet("help")) parser.showHelp();
     const auto commands=parser.positionalArguments(); const auto reportPath=parser.value("report");
-    QJsonObject report{{"schemaVersion",1},{"formatValid",false},{"playabilityPass",false},{"playableReady",false},{"valid",false}};
+    QJsonObject report{{"schemaVersion",1},{"formatValid",false},{"playabilityPass",false},{"coveragePass",false},{"playableReady",false},{"valid",false}};
     QElapsedTimer elapsed; elapsed.start(); int exitCode=0; bool reportWritable=false;
     try {
         require(commands.size()==1 && QStringList{"describe","local","check"}.contains(commands.first()),QStringLiteral("需要 describe、local 或 check 命令。"));
@@ -308,6 +394,7 @@ int main(int argc, char **argv) {
                 for(int count:draft.metrics.actionFamilyCounts) families.append(count); metrics.insert("actionFamilyCounts",families);
                 report.insert("metrics",metrics); report.insert("formatValid",true); report.insert("playabilityPass",errors.isEmpty()); report.insert("errors",strings(errors));
                 report.insert("warnings",strings(draft.warnings)); report.insert("difficulty",difficulty); report.insert("seed",double(seed));
+                inspectCoverage(draft.objects,request,analysis,&report);
                 BeatmapDocument generated;
                 require(generated.createNew(source.audioPath(),source.title(),source.timeMap().baseBpm(),source.timeMap().firstBeatSeconds(),source.coverPath(),&error),error);
                 require(generated.applyGeneratedChart(draft.objects,difficulty,request.profile.rank,generated.revision(),&error),error);
@@ -322,7 +409,7 @@ int main(int argc, char **argv) {
             checkSong(parser.value("song"),difficulty,parser.value("output"),audio,&report);
             report.insert("difficulty",difficulty); report.insert("outputSongDirectory",QFileInfo(parser.value("output")).absoluteFilePath());
         }
-        const bool ready=report.value("formatValid").toBool() && report.value("playabilityPass").toBool()
+        const bool ready=report.value("formatValid").toBool() && report.value("playabilityPass").toBool() && report.value("coveragePass").toBool()
             && report.value("metrics").toObject().value("notes").toInt()>0;
         report.insert("playableReady",ready); report.insert("valid",ready);
     } catch (const std::exception &error) {

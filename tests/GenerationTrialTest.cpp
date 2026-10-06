@@ -25,6 +25,8 @@ private slots:
     void describeIsReadOnlyAndKeepsTiming();
     void checkKeepsActionsAndFiltersHazards();
     void checkKeepsLegacyTimingProtection();
+    void coverageRejectsMissingMusic();
+    void coverageAcceptsRealRests();
     void unsafeModelRemainsEditableAndFailsBackstroke();
     void repeatedPatternIsReported();
     void rejectsExistingOutputAndInvalidNotes();
@@ -32,7 +34,7 @@ private slots:
     void localIsDeterministicAndPreservesAudio();
 private:
     int invoke(const QStringList &arguments);
-    QString rawSong(const QString &name,const QJsonArray &notes);
+    QString rawSong(const QString &name,const QJsonArray &notes,const QString &audio = {});
     QString path(const QString &name) const { return QDir(m_temp.path()).filePath(name); }
     QTemporaryDir m_temp; QString m_audio,m_project;
 };
@@ -57,8 +59,8 @@ void GenerationTrialTest::initTestCase() {
     m_project=path(QStringLiteral("原始工程 中文/project.lmsc"));
     QVERIFY2(document.saveProject(m_project,&error),qPrintable(error));
 }
-QString GenerationTrialTest::rawSong(const QString &name,const QJsonArray &notes) {
-    const auto folder=path(name); QDir().mkpath(folder); QFile::copy(m_audio,QDir(folder).filePath("music.egg"));
+QString GenerationTrialTest::rawSong(const QString &name,const QJsonArray &notes,const QString &audio) {
+    const auto folder=path(name); QDir().mkpath(folder); QFile::copy(audio.isEmpty()?m_audio:audio,QDir(folder).filePath("music.egg"));
     QJsonObject descriptor{{"_difficulty","ExpertPlus"},{"_difficultyRank",9},{"_beatmapFilename","ExpertPlus.dat"},
         {"_noteJumpMovementSpeed",12},{"_noteJumpStartBeatOffset",0}};
     write(QDir(folder).filePath("Info.dat"),{{"_version","2.0.0"},{"_songName",QStringLiteral("现成模型合成谱")},
@@ -82,11 +84,14 @@ void GenerationTrialTest::describeIsReadOnlyAndKeepsTiming() {
     QCOMPARE(result.value("sourceHashes").toObject().value("audioSha256").toString(),QString::fromLatin1(hash(m_audio).toHex()));
 }
 void GenerationTrialTest::checkKeepsActionsAndFiltersHazards() {
-    QJsonArray notes{note(1,0,1,1),note(1,1,2,1),note(2,0,1,0),note(2,1,2,0),note(5,3,0,8)};
+    QJsonArray notes{note(1,0,1,1),note(1,1,2,1),note(2,0,1,0),note(2,1,2,0),
+        note(6,0,1,1),note(10,1,2,1),note(14,0,1,0),note(18,1,2,0),
+        note(22,0,1,1),note(26,1,2,1),note(30,0,1,0),note(5,3,0,8)};
     const auto source=rawSong("raw valid 中文",notes), output=path("checked valid 中文"), report=path("checked.json");
     const auto mapBefore=hash(QDir(source).filePath("ExpertPlus.dat"));
     QCOMPARE(invoke({"check","--song",source,"--difficulty","Hard","--output",output,"--report",report,"--tools",QString::fromUtf8(LMSC_TRIAL_TOOLS)}),0);
     const auto result=json(report); QVERIFY(result.value("formatValid").toBool()); QVERIFY(result.value("playabilityPass").toBool()); QVERIFY(result.value("playableReady").toBool());
+    QVERIFY(result.value("coveragePass").toBool());
     QCOMPARE(result.value("removedBombs").toInt(),1); QCOMPARE(result.value("removedWalls").toInt(),1);
     const auto exported=json(QDir(output).filePath("Hard.dat")); notes.removeLast(); QCOMPARE(exported.value("_notes").toArray(),notes);
     QCOMPARE(exported.value("_version").toString(),QStringLiteral("2.2.0"));
@@ -106,6 +111,48 @@ void GenerationTrialTest::checkKeepsLegacyTimingProtection() {
     QCOMPARE(invoke({"check","--song",source,"--difficulty","Hard","--output",output,"--report",report,"--tools",QString::fromUtf8(LMSC_TRIAL_TOOLS)}),2);
     QCOMPARE(hash(mapPath),before); QVERIFY(!QFileInfo::exists(output));
     QVERIFY(!json(report).value("formatValid").toBool()); QVERIFY(!json(report).value("playableReady").toBool());
+}
+void GenerationTrialTest::coverageRejectsMissingMusic() {
+    const QVector<QVector<double>> times{{8,10,12,14},{1,2,12,14},{1,2,3,4}};
+    for (int index=0;index<times.size();++index) {
+        QJsonArray notes; int hand=0;
+        for (double seconds : times[index]) { notes.append(note(seconds*2,hand,hand==0?1:2,1)); hand=1-hand; }
+        const auto name="missing-music-"+QString::number(index);
+        const auto source=rawSong("raw-"+name,notes),output=path(name),report=path(name+".json");
+        QCOMPARE(invoke({"check","--song",source,"--difficulty","Expert","--output",output,"--report",report,"--tools",QString::fromUtf8(LMSC_TRIAL_TOOLS)}),0);
+        const auto result=json(report); QVERIFY(result.value("formatValid").toBool()); QVERIFY(result.value("playabilityPass").toBool());
+        QVERIFY(!result.value("coveragePass").toBool()); QVERIFY(!result.value("playableReady").toBool());
+        QCOMPARE(result.value("firstNoteSeconds").toDouble(),times[index].first());
+        QCOMPARE(result.value("lastNoteSeconds").toDouble(),times[index].last());
+        const auto coverage=result.value("coverage").toObject();
+        const auto gap=index==0 ? coverage.value("leadingGap").toObject()
+            : index==1 ? coverage.value("longInternalGaps").toArray().first().toObject() : coverage.value("trailingGap").toObject();
+        QVERIFY(gap.value("suspectedMissingMusic").toBool()); QVERIFY(gap.value("supportedHitCount").toInt()>=3);
+        QVERIFY(gap.value("supportedHitSpanSeconds").toDouble()>=3); QVERIFY(!result.value("coverageWarnings").toArray().isEmpty());
+        QCOMPARE(json(QDir(output).filePath("Expert.dat")).value("_notes").toArray(),notes);
+    }
+}
+void GenerationTrialTest::coverageAcceptsRealRests() {
+    const QVector<QVector<double>> times{{8.5,10.5,12.5,14.5},{1,2,3,13,14,15},{1,2,3,4,5,6,7,7.5}};
+    const QVector<QPair<int,int>> quiet{{0,8},{4,12},{8,16}};
+    for (int index=0;index<times.size();++index) {
+        const auto name="real-rest-"+QString::number(index),audio=path(name+".ogg");
+        const auto filter=QStringLiteral("volume=if(between(t\\,%1\\,%2)\\,0\\,1):eval=frame").arg(quiet[index].first).arg(quiet[index].second);
+        QProcess ffmpeg; ffmpeg.start(QDir(QString::fromUtf8(LMSC_TRIAL_TOOLS)).filePath("ffmpeg.exe"),
+            {"-hide_banner","-v","error","-nostdin","-n","-i",m_audio,"-af",filter,"-c:a","libvorbis",audio});
+        QVERIFY(ffmpeg.waitForStarted(10000)); QVERIFY(ffmpeg.waitForFinished(30000));
+        QVERIFY2(ffmpeg.exitCode()==0,ffmpeg.readAllStandardError().constData());
+        QJsonArray notes; int hand=0;
+        for (double seconds : times[index]) { notes.append(note(seconds*2,hand,hand==0?1:2,1)); hand=1-hand; }
+        const auto source=rawSong("raw-"+name,notes,audio),output=path(name),report=path(name+".json");
+        QCOMPARE(invoke({"check","--song",source,"--difficulty","Expert","--output",output,"--report",report,"--tools",QString::fromUtf8(LMSC_TRIAL_TOOLS)}),0);
+        const auto result=json(report); QVERIFY(result.value("playabilityPass").toBool()); QVERIFY(result.value("coveragePass").toBool());
+        QVERIFY(result.value("playableReady").toBool()); QVERIFY(result.value("coverageWarnings").toArray().isEmpty());
+        const auto coverage=result.value("coverage").toObject();
+        const auto gap=index==0 ? coverage.value("leadingGap").toObject()
+            : index==1 ? coverage.value("longInternalGaps").toArray().first().toObject() : coverage.value("trailingGap").toObject();
+        QVERIFY(gap.value("longGap").toBool()); QVERIFY(!gap.value("suspectedMissingMusic").toBool());
+    }
 }
 void GenerationTrialTest::unsafeModelRemainsEditableAndFailsBackstroke() {
     const QJsonArray notes{note(1,0,1,1),note(2,0,1,1)};
