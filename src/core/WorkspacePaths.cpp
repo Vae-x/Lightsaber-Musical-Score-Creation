@@ -3,6 +3,7 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QRegularExpression>
+#include <QSettings>
 #include <QStandardPaths>
 #include <QTemporaryFile>
 
@@ -12,6 +13,22 @@ bool ensureWritable(const QString &path) {
     if (!QDir().mkpath(path)) return false;
     QTemporaryFile probe(QDir(path).filePath(".write-check-XXXXXX"));
     return probe.open();
+}
+bool isInstalledDirectory(const QDir &directory) {
+    const QFileInfo marker(directory.filePath("installed-mode.ini"));
+    if (!marker.isFile() || marker.isSymLink()) return false;
+    QSettings settings(marker.absoluteFilePath(), QSettings::IniFormat);
+    settings.setIniCodec("UTF-8");
+    const QVariant mode = settings.value(QStringLiteral("Deployment/Mode"));
+    return settings.status() == QSettings::NoError && mode.type() == QVariant::String
+        && mode.toString() == QStringLiteral("Installed");
+}
+QString documentsProjectsDirectory(const QString &documentsDirectory) {
+    const QString documents = documentsDirectory.isEmpty()
+        ? QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) : documentsDirectory;
+    if (documents.isEmpty() || !QDir::isAbsolutePath(documents)) return {};
+    const QString fallback = QDir(documents).filePath(QStringLiteral("光剑曲谱制作/工程"));
+    return ensureWritable(fallback) ? QDir(fallback).absolutePath() : QString();
 }
 QString projectName(QString name) {
     name.replace(QRegularExpression(QStringLiteral("[<>:\"/\\\\|?*\\x00-\\x1f]")), "_");
@@ -25,9 +42,10 @@ QString projectName(QString name) {
 }
 }
 
-QString WorkspacePaths::projectsDirectory(const QString &executableDirectory) {
+QString WorkspacePaths::projectsDirectory(const QString &executableDirectory, const QString &documentsDirectory) {
     const QString location = executableDirectory.isEmpty() ? QCoreApplication::applicationDirPath() : executableDirectory;
     QDir cursor(location);
+    if (isInstalledDirectory(cursor)) return documentsProjectsDirectory(documentsDirectory);
     QString preferred = cursor.filePath("projects");
     if (!QFileInfo(cursor.filePath("package-manifest.json")).isFile()) {
         for (int level = 0; level < 8; ++level) {
@@ -40,9 +58,7 @@ QString WorkspacePaths::projectsDirectory(const QString &executableDirectory) {
         }
     }
     if (ensureWritable(preferred)) return QDir(preferred).absolutePath();
-    const QString fallback = QDir(QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation))
-        .filePath(QStringLiteral("光剑曲谱制作/工程"));
-    return ensureWritable(fallback) ? QDir(fallback).absolutePath() : QString();
+    return documentsProjectsDirectory(documentsDirectory);
 }
 
 QString WorkspacePaths::suggestedProjectFile(const QString &title, const QString &projectsRoot) {

@@ -7,6 +7,12 @@
 #include <QTemporaryDir>
 #include <QTimer>
 #include <memory>
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include "core/AppInfo.h"
 #include "core/AppSettings.h"
 #include "gui/MainWindow.h"
@@ -16,6 +22,12 @@ int main(int argc, char *argv[]) {
     QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
     QCoreApplication::setAttribute(Qt::AA_UseHighDpiPixmaps);
     QApplication application(argc, argv);
+#ifdef Q_OS_WIN
+    // 安装和卸载等待使用者关闭程序，避免更新正在使用的文件或丢失未保存工程。
+    // 只保持命名对象，不取得互斥所有权；正常多开仍然可用。
+    std::unique_ptr<void, decltype(&CloseHandle)> runningMutex(
+        CreateMutexW(nullptr, FALSE, L"Local\\LmscLightsaberScoreRunning"), &CloseHandle);
+#endif
     application.setApplicationName(lmsc::AppInfo::name());
     application.setApplicationDisplayName(lmsc::AppInfo::name());
     application.setApplicationVersion(lmsc::AppInfo::version());

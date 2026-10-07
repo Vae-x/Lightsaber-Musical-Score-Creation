@@ -3,6 +3,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QList>
 #include <QRegularExpression>
 #include <QTemporaryDir>
 #include <QTextStream>
@@ -39,12 +40,13 @@ bool samePath(const QString &first, const QString &second) {
 }
 
 void sourceAndPortableLocations(const QString &temporaryRoot) {
+    const QString documents = QDir(temporaryRoot).filePath("documents-fallback");
     const QString source = QDir(temporaryRoot).filePath("source");
     check(writeFile(QDir(source).filePath("CMakeLists.txt")), QStringLiteral("创建源码根标记"));
     check(writeFile(QDir(source).filePath("src/core/BeatmapDocument.h")), QStringLiteral("创建源码结构标记"));
     const QString build = QDir(source).filePath("build/debug/src/tests");
     check(QDir().mkpath(build), QStringLiteral("创建源码构建目录"));
-    const QString sourceProjects = lmsc::WorkspacePaths::projectsDirectory(build);
+    const QString sourceProjects = lmsc::WorkspacePaths::projectsDirectory(build, documents);
     check(samePath(sourceProjects, QDir(source).filePath("projects")),
           QStringLiteral("从深层构建目录找到仓库根的 projects"));
     check(QFileInfo(sourceProjects).isDir(), QStringLiteral("默认源码工程目录自动创建"));
@@ -53,16 +55,86 @@ void sourceAndPortableLocations(const QString &temporaryRoot) {
     const QString portable = QDir(source).filePath("dist/portable");
     check(writeFile(QDir(portable).filePath("package-manifest.json"), "{}"),
           QStringLiteral("创建便携包清单"));
-    const QString portableProjects = lmsc::WorkspacePaths::projectsDirectory(portable);
+    const QString portableProjects = lmsc::WorkspacePaths::projectsDirectory(portable, documents);
     check(samePath(portableProjects, QDir(portable).filePath("projects")),
           QStringLiteral("便携工程保存到清单旁的 projects，不回溯到源码仓库"));
     check(!samePath(sourceProjects, portableProjects), QStringLiteral("源码与便携包默认工程目录各自独立"));
 
     const QString standalone = QDir(temporaryRoot).filePath("standalone");
     check(QDir().mkpath(standalone), QStringLiteral("创建独立程序目录"));
-    check(samePath(lmsc::WorkspacePaths::projectsDirectory(standalone),
+    check(samePath(lmsc::WorkspacePaths::projectsDirectory(standalone, documents),
                    QDir(standalone).filePath("projects")),
           QStringLiteral("没有仓库标记时使用程序旁的 projects"));
+
+    const QString blockedPortable = QDir(temporaryRoot).filePath("blocked-portable");
+    check(writeFile(QDir(blockedPortable).filePath("projects"), "keep existing file"),
+          QStringLiteral("模拟程序旁的工程根被普通文件占用"));
+    check(samePath(lmsc::WorkspacePaths::projectsDirectory(blockedPortable, documents),
+                   QDir(documents).filePath(QStringLiteral("光剑曲谱制作/工程"))),
+          QStringLiteral("便携工程目录不可写时仍回退文档目录"));
+    check(readFile(QDir(blockedPortable).filePath("projects")) == "keep existing file",
+          QStringLiteral("回退不覆盖程序旁占用路径的文件"));
+}
+
+void installedLocations(const QString &temporaryRoot) {
+    const QString documents = QDir(temporaryRoot).filePath("documents");
+    const QString expected = QDir(documents).filePath(QStringLiteral("光剑曲谱制作/工程"));
+    const QString installed = QDir(temporaryRoot).filePath("programs/installed");
+    check(writeFile(QDir(installed).filePath("installed-mode.ini"), "[Deployment]\nMode=Installed\n"),
+          QStringLiteral("创建安装版固定标记"));
+    check(writeFile(QDir(installed).filePath("package-manifest.json"), "{}"),
+          QStringLiteral("安装版保留发布清单"));
+    check(writeFile(QDir(installed).filePath("writable-check"), "writable"),
+          QStringLiteral("模拟安装目录确实可写"));
+    check(samePath(lmsc::WorkspacePaths::projectsDirectory(installed, documents), expected),
+          QStringLiteral("安装目录可写时仍将工程放到文档目录"));
+    check(QFileInfo(expected).isDir(), QStringLiteral("安装版建立文档工程根目录"));
+    check(!QFileInfo::exists(QDir(installed).filePath("projects")),
+          QStringLiteral("安装版不在程序目录创建 projects"));
+
+    const QList<QByteArray> invalidMarkers = {"[Deployment]\nMode=Portable\n", "[Deployment]\nMode=installed\n",
+        "[Other]\nMode=Installed\n", "[Deployment]\n", "[Deployment]\nMode=@ByteArray(Installed)\n", ""};
+    for (int index = 0; index < invalidMarkers.size(); ++index) {
+        const QString portable = QDir(temporaryRoot).filePath("invalid-marker-" + QString::number(index));
+        check(writeFile(QDir(portable).filePath("installed-mode.ini"), invalidMarkers.at(index)),
+              QStringLiteral("创建无效安装标记"));
+        check(samePath(lmsc::WorkspacePaths::projectsDirectory(portable, documents),
+                       QDir(portable).filePath("projects")),
+              QStringLiteral("未知值、错误分组与非字符串标记保持便携版路径：") + QString::number(index));
+    }
+
+    const QString directoryMarker = QDir(temporaryRoot).filePath("directory-marker");
+    check(QDir().mkpath(QDir(directoryMarker).filePath("installed-mode.ini")),
+          QStringLiteral("模拟同名目录占用安装标记"));
+    check(samePath(lmsc::WorkspacePaths::projectsDirectory(directoryMarker, documents),
+                   QDir(directoryMarker).filePath("projects")),
+          QStringLiteral("同名目录不能作为安装版标记"));
+
+    const QString nestedPortable = QDir(installed).filePath("nested-portable");
+    check(QDir().mkpath(nestedPortable), QStringLiteral("创建安装目录下的独立便携目录"));
+    check(samePath(lmsc::WorkspacePaths::projectsDirectory(nestedPortable, documents),
+                   QDir(nestedPortable).filePath("projects")),
+          QStringLiteral("安装标记只识别程序旁的固定文件，不继承上级标记"));
+
+    const QString blockedDocuments = QDir(temporaryRoot).filePath("blocked-documents");
+    check(writeFile(blockedDocuments, "keep existing file"), QStringLiteral("模拟不可用文档目录"));
+    check(lmsc::WorkspacePaths::projectsDirectory(installed, blockedDocuments).isEmpty(),
+          QStringLiteral("安装版文档工程目录不可用时报告失败"));
+    check(!QFileInfo::exists(QDir(installed).filePath("projects")),
+          QStringLiteral("文档目录失败时也不回写安装目录"));
+    check(readFile(blockedDocuments) == "keep existing file", QStringLiteral("保留占用文档路径的原文件"));
+
+    const QString previousCurrent = QDir::currentPath();
+    check(QDir::setCurrent(installed), QStringLiteral("隔离当前工作目录到临时安装目录"));
+    for (const QString &relativeDocuments : {QStringLiteral("."), QStringLiteral("relative-documents")}) {
+        check(lmsc::WorkspacePaths::projectsDirectory(installed, relativeDocuments).isEmpty(),
+              QStringLiteral("安装版拒绝相对文档目录：") + relativeDocuments);
+    }
+    check(!QFileInfo::exists(QDir(installed).filePath(QStringLiteral("光剑曲谱制作")))
+          && !QFileInfo::exists(QDir(installed).filePath("relative-documents"))
+          && !QFileInfo::exists(QDir(installed).filePath("projects")),
+          QStringLiteral("拒绝相对文档路径时不写安装目录或当前工作目录"));
+    check(QDir::setCurrent(previousCurrent), QStringLiteral("恢复路径测试前的工作目录"));
 }
 
 void safeNamesAndContainment(const QString &root) {
@@ -170,10 +242,11 @@ int main(int argc, char **argv) {
         return 1;
     }
     sourceAndPortableLocations(temporary.path());
+    installedLocations(QDir(temporary.path()).filePath("installed"));
     songExportNames(QDir(temporary.path()).filePath("export"));
     safeNamesAndContainment(QDir(temporary.path()).filePath("safe-names"));
     sameNameDoesNotOverwrite(QDir(temporary.path()).filePath("same-name"));
     printLine(stdout, failures ? QStringLiteral("工程路径验证失败：") + QString::number(failures)
-                             : QStringLiteral("通过：源码与便携工程位置、中文和非法名称、路径范围、同名工程保护"));
+                             : QStringLiteral("通过：源码、便携与安装工程位置、安装标记、中文和非法名称、路径范围、同名工程保护"));
     return failures ? 1 : 0;
 }
