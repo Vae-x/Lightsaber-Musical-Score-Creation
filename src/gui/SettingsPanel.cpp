@@ -16,11 +16,15 @@
 #include <QTcpSocket>
 #include <QTimer>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QFormLayout>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QIcon>
 #include <QLabel>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QPushButton>
@@ -232,6 +236,14 @@ void SettingsPanel::selectPage(int index) {
     }
 }
 
+void SettingsPanel::showInfernoSettings() {
+    selectPage(1);
+    auto scroll = qobject_cast<QScrollArea *>(m_pages->widget(1));
+    auto card = findChild<QFrame *>(QStringLiteral("infernoModelCard"));
+    if (scroll && card) scroll->ensureWidgetVisible(card, 16, 16);
+    m_infernoRuntime->setFocus(Qt::OtherFocusReason);
+}
+
 QWidget *SettingsPanel::buildAppearancePage() {
     auto page = new QWidget;
     auto layout = pageLayout(page, tr("外观"), tr("选择适合工作环境的配色，让编辑更舒适。"));
@@ -273,6 +285,7 @@ QWidget *SettingsPanel::buildAppearancePage() {
 QWidget *SettingsPanel::buildModelPage() {
     auto page = new QWidget;
     auto layout = pageLayout(page, tr("大语言模型"), tr("选择连接方式，配置提供商与可用模型。"));
+    layout->addWidget(buildInfernoCard(page));
     auto connectionCard = settingsCard(page, tr("连接方式"));
     auto connectionForm = settingsForm();
     m_connection = new QComboBox(connectionCard);
@@ -367,7 +380,7 @@ QWidget *SettingsPanel::buildModelPage() {
     m_connectionPages->setCurrentIndex(m_connection->currentIndex());
     connect(m_connection, QOverload<int>::of(&QComboBox::currentIndexChanged), m_connectionPages, &QStackedWidget::setCurrentIndex);
     layout->addWidget(m_connectionPages);
-    layout->addWidget(description(tr("当前完成连接与模型配置，自动制谱将在后续接入。Windows 会为当前用户加密保存 API Key；设置不会进入歌曲工程或导出包。"), page));
+    layout->addWidget(description(tr("Windows 会为当前用户加密保存 API Key；连接设置和本地模型目录不会进入歌曲工程或导出包。"), page));
     layout->addStretch();
     connect(m_provider, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this] {
         if (!m_loadingProvider) selectProvider(m_provider->currentData().toString());
@@ -404,6 +417,100 @@ QWidget *SettingsPanel::buildModelPage() {
         setApiStatus(tr("已取消模型读取。"));
     });
     return page;
+}
+
+QWidget *SettingsPanel::buildInfernoCard(QWidget *parent) {
+    auto card = settingsCard(parent, tr("本地模型 · InfernoSaber"),
+            tr("在曲谱编辑页选择本地模型生成。支持 Hard / Expert 的方向方块和 Dot；生成结果仍需检查、编辑与头显试玩。"));
+    card->setObjectName(QStringLiteral("infernoModelCard"));
+    auto layout = qobject_cast<QVBoxLayout *>(card->layout());
+    auto form = settingsForm();
+    const auto directoryRow = [this, card](QLineEdit **field, const char *name,
+            const char *browseName, const QString &initial, const QString &title) {
+        auto row = new QWidget(card);
+        auto rowLayout = new QHBoxLayout(row);
+        rowLayout->setContentsMargins(0, 0, 0, 0);
+        auto edit = new QLineEdit(initial, row);
+        edit->setObjectName(QString::fromLatin1(name));
+        edit->setMinimumWidth(0);
+        edit->setAccessibleName(title);
+        edit->setToolTip(tr("可先保存尚未安装的完整绝对目录；不使用盘符根目录。"));
+        auto browse = new QPushButton(tr("选择目录"), row);
+        browse->setObjectName(QString::fromLatin1(browseName));
+        rowLayout->addWidget(edit, 1);
+        rowLayout->addWidget(browse);
+        connect(browse, &QPushButton::clicked, this, [this, edit, title] {
+            const QString selected = QFileDialog::getExistingDirectory(this, title, edit->text());
+            if (!selected.isEmpty()) edit->setText(QDir::fromNativeSeparators(selected));
+        });
+        connect(edit, &QLineEdit::textChanged, this, [this] { refreshInfernoStatus(); });
+        *field = edit;
+        return row;
+    };
+    form->addRow(tr("运行环境目录"), directoryRow(&m_infernoRuntime, "infernoRuntimeDirectory",
+            "browseInfernoRuntimeDirectory", m_preferences.infernoRuntimeDirectory, tr("选择本地模型运行环境目录")));
+    form->addRow(tr("模型缓存目录"), directoryRow(&m_infernoModels, "infernoModelCacheDirectory",
+            "browseInfernoModelCacheDirectory", m_preferences.infernoModelCacheDirectory, tr("选择本地模型缓存目录")));
+    m_infernoThreads = new QSpinBox(card);
+    m_infernoThreads->setObjectName(QStringLiteral("infernoThreads"));
+    m_infernoThreads->setRange(1, 16);
+    m_infernoThreads->setValue(m_preferences.infernoThreads);
+    form->addRow(tr("CPU 线程"), m_infernoThreads);
+    layout->addLayout(form);
+    auto check = new QPushButton(tr("检查环境与模型缓存"), card);
+    check->setObjectName(QStringLiteral("checkInfernoRuntime"));
+    layout->addWidget(check, 0, Qt::AlignLeft);
+    m_infernoStatus = description({}, card);
+    m_infernoStatus->setObjectName(QStringLiteral("infernoRuntimeStatus"));
+    layout->addWidget(m_infernoStatus);
+    layout->addWidget(description(tr("默认安装在 E 盘。这里仅检查本机文件；环境准备和模型缓存说明见使用说明，不会自动安装或联网下载。"), card));
+    connect(check, &QPushButton::clicked, this, &SettingsPanel::refreshInfernoStatus);
+    refreshInfernoStatus();
+    return card;
+}
+
+void SettingsPanel::refreshInfernoStatus() {
+    if (!m_infernoRuntime || !m_infernoModels || !m_infernoStatus) return;
+    AppPreferences preferences = m_preferences;
+    preferences.infernoRuntimeDirectory = m_infernoRuntime->text();
+    preferences.infernoModelCacheDirectory = m_infernoModels->text();
+    preferences.infernoThreads = m_infernoThreads->value();
+    const QString error = AppSettings::validateInfernoSettings(preferences);
+    if (!error.isEmpty()) {
+        statusText(m_infernoStatus, error, "warning");
+        return;
+    }
+    const QDir runtime(preferences.infernoRuntimeDirectory.trimmed());
+    const bool environmentPresent = QFileInfo(runtime.filePath(QStringLiteral("env/python.exe"))).isFile()
+            && QFileInfo(runtime.filePath(QStringLiteral("source/map_creation/gen_beats.py"))).isFile()
+            && QFileInfo(runtime.filePath(QStringLiteral("runtime-ready.json"))).isFile();
+    const auto cachePresent = [&preferences](const QString &model) {
+        const QDir directory(QDir(preferences.infernoModelCacheDirectory.trimmed()).filePath(model));
+        QFile manifest(directory.filePath(QStringLiteral(".trial-model-manifest.json")));
+        if (!manifest.open(QIODevice::ReadOnly) || manifest.size() > 64 * 1024) return false;
+        const QJsonObject json = QJsonDocument::fromJson(manifest.readAll()).object();
+        const QJsonArray files = json.value(QStringLiteral("files")).toArray();
+        if (json.value(QStringLiteral("complete")).toBool() != true
+                || json.value(QStringLiteral("model")).toString() != model
+                || files.size() < 7 || files.size() > 8) return false;
+        for (const QJsonValue &entry : files) {
+            const QJsonObject item = entry.toObject();
+            const QString name = item.value(QStringLiteral("name")).toString();
+            if (name.isEmpty() || name == QStringLiteral(".") || name == QStringLiteral("..")
+                    || name.contains(QLatin1Char('/')) || name.contains(QLatin1Char('\\'))
+                    || name.contains(QLatin1Char(':'))) return false;
+            const QFileInfo info(directory.filePath(name));
+            if (!info.isFile() || info.size() <= 0
+                    || item.value(QStringLiteral("size")).toDouble(-1) != info.size()) return false;
+        }
+        return true;
+    };
+    const bool hard = cachePresent(QStringLiteral("easy_15"));
+    const bool expert = cachePresent(QStringLiteral("expert_15"));
+    const QString message = tr("运行环境：%1。模型缓存：Hard %2；Expert %3。生成时会校验版本与文件完整性。")
+            .arg(environmentPresent ? tr("已找到") : tr("未准备"),
+                 hard ? tr("文件齐备") : tr("未准备"), expert ? tr("文件齐备") : tr("未准备"));
+    statusText(m_infernoStatus, message, environmentPresent && hard && expert ? "success" : "muted");
 }
 
 QWidget *SettingsPanel::buildAccountPage() {
@@ -748,6 +855,9 @@ bool SettingsPanel::applyPreferences() {
     m_preferences.providerId = m_currentProvider;
     m_preferences.codexExecutable = m_codexPath->text().trimmed();
     m_preferences.codexModel = m_codexModels->currentText().trimmed();
+    m_preferences.infernoRuntimeDirectory = QDir::fromNativeSeparators(m_infernoRuntime->text().trimmed());
+    m_preferences.infernoModelCacheDirectory = QDir::fromNativeSeparators(m_infernoModels->text().trimmed());
+    m_preferences.infernoThreads = m_infernoThreads->value();
     m_preferences.networkProxy = proxyConfig();
     m_preferences.requestTimeoutMinutes=m_requestTimeout->value();
     m_preferences.diagnosticLogEnabled=m_logEnabled->isChecked();
@@ -757,6 +867,7 @@ bool SettingsPanel::applyPreferences() {
         return false;
     }
     m_savedPreferences = m_preferences;
+    refreshInfernoStatus();
     DiagnosticLog::instance().setEnabled(m_preferences.diagnosticLogEnabled);
     m_savedTheme = m_preferences.themeMode;
     ThemeManager::apply(m_savedTheme);
@@ -788,6 +899,10 @@ void SettingsPanel::discardChanges() {
     m_logEnabled->setChecked(m_preferences.diagnosticLogEnabled);
     m_manualProxy->setEnabled(m_proxyMode->currentData().toString() == QStringLiteral("manual"));
     m_codexPath->setText(m_preferences.codexExecutable);
+    m_infernoRuntime->setText(m_preferences.infernoRuntimeDirectory);
+    m_infernoModels->setText(m_preferences.infernoModelCacheDirectory);
+    m_infernoThreads->setValue(m_preferences.infernoThreads);
+    refreshInfernoStatus();
     replaceModelList(m_codexModels, {}, m_preferences.codexModel);
     // Prevent selectProvider from capturing the canceled fields into the restored snapshot.
     m_currentProvider.clear();

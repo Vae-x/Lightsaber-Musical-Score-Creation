@@ -36,6 +36,9 @@ struct AppPreferences {
     QMap<QString, AiProviderConfig> providers;
     QString codexExecutable;
     QString codexModel;
+    QString infernoRuntimeDirectory = QStringLiteral("E:/lmsc-infernosaber-runtime");
+    QString infernoModelCacheDirectory = QStringLiteral("E:/lmsc-infernosaber-runtime/models");
+    int infernoThreads = 4;
     NetworkProxyConfig networkProxy;
     int requestTimeoutMinutes = 10;
     bool diagnosticLogEnabled = true;
@@ -51,6 +54,7 @@ public:
     QString filePath() const;
     static QVector<AiProviderPreset> providerPresets();
     static QString validateProxy(const NetworkProxyConfig &proxy);
+    static QString validateInfernoSettings(const AppPreferences &preferences);
 
 private:
     QString m_filePath;

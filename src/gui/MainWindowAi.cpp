@@ -327,8 +327,9 @@ void MainWindow::refreshDraftPanel() {
     state.hasRefinement = m_editorSession->hasBeforeRefinement();
     state.running = !m_pendingRefinement.generation.jobId.isEmpty();
     state.canRefine = state.available && currentChartSupportsRefinement();
+    QString applicationReason;
     state.canApply = !m_busy && view == Controller::View::Working
-        && m_editorSession->isApplicable() && !m_editorSession->isApplied();
+        && m_editorSession->canApplyDraft(&applicationReason);
     state.manualModified = m_editorSession->isManualModified();
     state.durationSeconds = m_audio->duration();
     state.version = static_cast<lmsc::EditorRefinementPanel::Version>(view);
@@ -343,6 +344,8 @@ void MainWindow::refreshDraftPanel() {
         const auto draft = m_editorSession->generationDraft();
         if (!draft.summary.isEmpty()) state.summary = draft.summary + QStringLiteral("\n") + state.summary;
         if (!draft.warnings.isEmpty()) state.summary += QStringLiteral("\n") + draft.warnings.join('\n');
+        if (!applicationReason.isEmpty() && view == Controller::View::Working && !m_editorSession->isApplied())
+            state.summary += QStringLiteral("\n") + applicationReason;
         state.summary += (state.summary.isEmpty() ? QString() : QStringLiteral("\n"))
             + tr("未应用草稿不会导出。保存工程会同时保存工作草稿和对比版本。");
     }

@@ -1,5 +1,6 @@
 #include "EditorSessionController.h"
 #include "core/MusicFeatureAnalyzer.h"
+#include "core/BeatmapPlayabilityValidator.h"
 #include <QCryptographicHash>
 #include <QFile>
 #include <QFileInfo>
@@ -91,6 +92,8 @@ QJsonObject draftMetadata(const GenerationDraft &draft) {
     const auto &source = draft.source; const auto &profile = source.profile;
     QJsonObject json{{"summary", draft.summary}, {"warnings", QJsonArray::fromStringList(draft.warnings)},
         {"hasThemeWarnings", draft.hasThemeWarnings}, {"seed", QString::number(source.arrangementSeed)},
+        {"requiresPlayabilityReview", draft.requiresPlayabilityReview},
+        {"playabilityActiveSeconds", draft.playabilityActiveSeconds},
         {"allowedTypes", int(source.allowedTypes)}, {"durationSeconds", source.audio.durationSeconds},
         {"profile", QJsonObject{{"name", profile.name}, {"rank", profile.rank},
             {"targetMinNps", profile.targetMinNps}, {"targetMaxNps", profile.targetMaxNps},
@@ -131,6 +134,14 @@ bool readMetadata(const QJsonValue &value, const QString &key, GenerationDraft *
     if (!validSeed) return false;
     draft->source.allowedTypes = GeneratedTypes(types); draft->summary = json.value("summary").toString();
     draft->hasThemeWarnings = json.value("hasThemeWarnings").toBool();
+    if (json.contains("requiresPlayabilityReview")) {
+        if (!json.value("requiresPlayabilityReview").isBool()) return false;
+        draft->requiresPlayabilityReview = json.value("requiresPlayabilityReview").toBool();
+    }
+    if (json.contains("playabilityActiveSeconds")
+            && (!number(json, "playabilityActiveSeconds", &draft->playabilityActiveSeconds)
+                || draft->playabilityActiveSeconds < 0
+                || draft->playabilityActiveSeconds > draft->source.audio.durationSeconds)) return false;
     for (const auto &warning : json.value("warnings").toArray()) {
         if (!warning.isString()) return false;
         draft->warnings.append(warning.toString());
@@ -176,6 +187,9 @@ struct EditorSessionController::Impl {
         QJsonObject resources, raw;
         quint64 baselineRevision = 0, pendingRevision = 0, lastRefinementRevision = 0;
         bool parsed = true, applied = false, refinementPending = false;
+        mutable bool reviewCached = false;
+        mutable quint64 reviewRevision = 0;
+        mutable QStringList reviewErrors;
         QStringList warnings;
         GenerationDraft metadata;
         std::unique_ptr<BeatmapDocument> baseline, initial, working, before;
@@ -344,6 +358,26 @@ bool EditorSessionController::isApplicable(QString *reason) const {
     if (record->applied) return fail(reason, QStringLiteral("草稿已应用，保留版本仅供对比。"));
     return d->matches(*record, reason);
 }
+bool EditorSessionController::canApplyDraft(QString *reason) const {
+    if (!isApplicable(reason)) return false;
+    const auto record = d->current();
+    if (!record->metadata.requiresPlayabilityReview) return true;
+    if (!record->reviewCached || record->reviewRevision != record->working->revision()) {
+        MusicAnalysis analysis;
+        analysis.durationSeconds = record->metadata.source.audio.durationSeconds;
+        analysis.activeSeconds = record->metadata.playabilityActiveSeconds > 0
+                ? record->metadata.playabilityActiveSeconds : analysis.durationSeconds;
+        auto request = record->metadata.source;
+        request.timeMap = record->working->timeMap();
+        request.allowedTypes |= BombType | WallType; // Manual additions still receive path and obstruction checks.
+        BeatmapPlayabilityValidator::validateLearnedObjects(record->working->objects(), request, analysis, &record->reviewErrors);
+        record->reviewRevision = record->working->revision(); record->reviewCached = true;
+    }
+    if (!record->reviewErrors.isEmpty())
+        return fail(reason, QStringLiteral("模型草稿尚未通过动作检查，修正后才能应用：\n%1")
+                    .arg(record->reviewErrors.join('\n')));
+    return true;
+}
 QStringList EditorSessionController::warnings() const {
     auto output = d->warnings; const auto record = d->current();
     if (record) {
@@ -426,6 +460,8 @@ bool EditorSessionController::mergeRefinementResult(const RefinementResult &resu
     if (!staged || !staged->replaceEditingSnapshotObjects(result.candidate.objects, true, error)) return false;
     const auto plan = record->metadata.arrangement; const auto source = record->metadata.source;
     auto metadata = result.candidate; metadata.source = source;
+    metadata.requiresPlayabilityReview = record->metadata.requiresPlayabilityReview;
+    metadata.playabilityActiveSeconds = record->metadata.playabilityActiveSeconds;
     if (!metadata.arrangement) metadata.arrangement = plan;
     metadata.objects = staged->objects();
     const auto proposed = d->withCurrentFields({{"working", objectsJson(metadata.objects)},
@@ -455,7 +491,7 @@ bool EditorSessionController::restoreInitial(QString *error) {
     emit changed(); return true;
 }
 bool EditorSessionController::applyDraft(QString *error) {
-    if (!isApplicable(error)) return false;
+    if (!canApplyDraft(error)) return false;
     const auto record = d->current(); EditingDraftApplication application;
     application.targetDifficultyId = record->targetId; application.targetDifficultyName = record->key;
     application.targetDifficultyRank = record->rank; application.baselineHash = record->baselineHash;

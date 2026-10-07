@@ -83,6 +83,8 @@ private slots:
     void oversizedApplyDoesNotTouchFormalOrSession();
     void oversizedSessionMutationsPreserveCandidates();
     void oversizedRefinementResultDoesNotConsumePendingWork();
+    void modelDraftMustPassMotionReviewBeforeAtomicApply();
+    void modelReviewSurvivesSaveAndRejectsCorruptMetadata();
 };
 
 void EditorSessionControllerTest::emptySessionUsesFormalWithoutDirtying() {
@@ -365,6 +367,53 @@ void EditorSessionControllerTest::oversizedRefinementResultDoesNotConsumePending
     QVERIFY(!session.workingDocument()->canUndo());
     result.candidate.summary=QStringLiteral("在同一精修请求中重试合规结果");
     QVERIFY2(session.mergeRefinementResult(result,&error),qPrintable(error)); QCOMPARE(hash(*session.workingDocument()),refinementBaselineHash(objects));
+}
+
+void EditorSessionControllerTest::modelDraftMustPassMotionReviewBeforeAtomicApply() {
+    QTemporaryDir root; BeatmapDocument document; QString error;
+    QVERIFY(initialize(root,&document,&error));
+    EditorSessionController session; session.setFormalDocument(&document,"formal-session");
+    auto draft = generated(document); draft.requiresPlayabilityReview = true; draft.playabilityActiveSeconds = 20;
+    draft.objects = {note(2,1),note(3,1)}; // Legal gap and connection, but a same-direction backstroke.
+    const auto formal = hash(document); const auto revision = document.revision();
+    QVERIFY2(session.acceptGenerationDraft(draft,&error),qPrintable(error));
+    QVERIFY(session.isApplicable()); QVERIFY(!session.viewReadOnly());
+    QVERIFY(!session.canApplyDraft(&error)); QVERIFY(error.contains("动作检查"));
+    QVERIFY(error.contains("同向回刀"));
+    QVERIFY(!session.applyDraft(&error)); QCOMPARE(hash(document),formal); QCOMPARE(document.revision(),revision);
+    const auto badId = session.workingDocument()->objects().last().id;
+    QVERIFY(session.workingDocument()->removeObjects({badId},&error)); session.notifyWorkingChanged();
+    QVERIFY2(session.canApplyDraft(&error),qPrintable(error));
+    const auto repaired = hash(*session.workingDocument());
+    QVERIFY2(session.applyDraft(&error),qPrintable(error)); QCOMPARE(hash(document),repaired);
+    QVERIFY(document.undo()); QCOMPARE(hash(document),formal);
+    QVERIFY(document.redo()); QCOMPARE(hash(document),repaired);
+}
+
+void EditorSessionControllerTest::modelReviewSurvivesSaveAndRejectsCorruptMetadata() {
+    QTemporaryDir root; BeatmapDocument document; QString error;
+    QVERIFY(initialize(root,&document,&error)); EditorSessionController session;
+    session.setFormalDocument(&document,"formal-session");
+    auto draft = generated(document); draft.requiresPlayabilityReview = true; draft.playabilityActiveSeconds = 18;
+    draft.objects = {note(2,1),note(2.1,1)};
+    QVERIFY(session.acceptGenerationDraft(draft,&error));
+    QVERIFY(session.beginRefinement(false,&error));
+    auto result = refined(session.generationDraft(),session.generationDraft().objects);
+    result.candidate.requiresPlayabilityReview = false; result.candidate.playabilityActiveSeconds = 0;
+    QVERIFY(session.mergeRefinementResult(result,&error));
+    QVERIFY(session.generationDraft().requiresPlayabilityReview);
+    QCOMPARE(session.generationDraft().playabilityActiveSeconds,18.0);
+    const auto project = root.filePath("model/project.lmsc");
+    QVERIFY2(document.saveProject(project,&error),qPrintable(error));
+    BeatmapDocument reopened; QVERIFY2(reopened.loadProject(project,&error),qPrintable(error));
+    EditorSessionController restored; restored.setFormalDocument(&reopened,"formal-session");
+    QVERIFY(restored.generationDraft().requiresPlayabilityReview);
+    QCOMPARE(restored.generationDraft().playabilityActiveSeconds,18.0);
+    QVERIFY(restored.isApplicable()); QVERIFY(!restored.canApplyDraft(&error)); QVERIFY(!restored.applyDraft(&error));
+    auto row = firstRecord(restored); auto metadata = row.value("metadata").toObject();
+    metadata.insert("requiresPlayabilityReview","false"); row.insert("metadata",metadata);
+    QVERIFY(restored.restoreFromJson(replaceFirstRecord(restored,row)));
+    QVERIFY(!restored.isApplicable()); QCOMPARE(firstRecord(restored),row);
 }
 
 QTEST_GUILESS_MAIN(EditorSessionControllerTest)

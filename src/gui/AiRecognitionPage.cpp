@@ -2,8 +2,11 @@
 #include "DiagnosticLogDialog.h"
 #include "TaskProgressView.h"
 #include "core/HybridAiGenerationService.h"
+#include "core/InfernoSaberGenerationService.h"
 
 #include <QFileInfo>
+#include <QDesktopServices>
+#include <QUrl>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QFrame>
@@ -19,6 +22,7 @@
 #include <QVBoxLayout>
 #include <QSignalBlocker>
 #include <QToolButton>
+#include <QStandardItemModel>
 #include <cmath>
 
 namespace lmsc {
@@ -108,7 +112,7 @@ AiRecognitionPage::AiRecognitionPage(QWidget *parent)
     m_serviceStatus = label({}, service);
     m_serviceStatus->setObjectName(QStringLiteral("aiServiceStatus"));
     serviceLayout->addWidget(m_serviceStatus);
-    serviceLayout->addWidget(label(tr("AI 建议音乐段落和动作主题，本地编排完整初稿；试听后可选择重点和片段进行 AI 精修。也可使用纯本地或大语言模型制谱。自动制谱仅支持新建歌曲。"), service));
+    serviceLayout->addWidget(label(tr("AI 建议音乐段落和动作主题，本地编排完整初稿；试听后可选择重点和片段进行 AI 精修。也可使用纯本地、本地模型或大语言模型制谱。自动制谱仅支持新建歌曲。"), service));
     auto modes = new QVBoxLayout;
     modes->addWidget(label(tr("生成方式"), service));
     m_mode = new QComboBox(service);
@@ -118,6 +122,7 @@ AiRecognitionPage::AiRecognitionPage(QWidget *parent)
     m_mode->addItem(tr("AI 建议 + 本地编排"), Hybrid);
     m_mode->addItem(tr("本地快速制谱"), LocalQuick);
     m_mode->addItem(tr("大语言模型制谱"), LanguageModel);
+    m_mode->addItem(tr("本地模型 · InfernoSaber"), InfernoSaber);
     modes->addWidget(m_mode);
     serviceLayout->addLayout(modes);
     auto options = new QVBoxLayout;
@@ -206,7 +211,18 @@ AiRecognitionPage::AiRecognitionPage(QWidget *parent)
         m_generationService->resume(m_pendingGeneration.jobId);
     });
     connect(m_preview, &QPushButton::clicked, this, [this] { if (m_hasDraft) emit generationDraftReady(m_cachedDraft); });
-    connect(m_logs, &QPushButton::clicked, this, [this] { showDiagnosticLog(this,m_lastGeneration.jobId); });
+    connect(m_logs, &QPushButton::clicked, this, [this] {
+        if (usesInfernoGeneration()) {
+            if (auto inferno = qobject_cast<InfernoSaberGenerationService *>(m_generationService.data())) {
+                const auto directory = inferno->jobDirectory(m_lastGeneration.jobId);
+                if (directory.isEmpty()) setStatus(tr("本次尚无模型日志目录。"), "warning");
+                else if (!QDesktopServices::openUrl(QUrl::fromLocalFile(directory)))
+                    setStatus(tr("无法打开模型日志目录：%1").arg(directory), "warning");
+                return;
+            }
+        }
+        showDiagnosticLog(this,m_lastGeneration.jobId);
+    });
     connect(m_skipPlanning, &QPushButton::clicked, this, [this] {
         const QString jobId = m_pendingGeneration.jobId;
         if (m_skipPlanning->isEnabled() && !jobId.isEmpty()) emit skipPlanningRequested(jobId);
@@ -219,17 +235,34 @@ AiRecognitionPage::AiRecognitionPage(QWidget *parent)
     connect(m_mode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
         const auto next = static_cast<GenerationMode>(m_mode->currentData().toInt());
         if (next == m_generationMode) return;
+        const auto previous = m_generationMode;
         m_generationMode = next;
+        updateInfernoOptions(previous);
         activateGenerationService(true);
     });
     const auto optionsChanged = [this] {
         if (m_updatingOptions) return;
+        if (usesInfernoGeneration()) {
+            m_updatingOptions = true;
+            m_directional->setChecked(true); m_dots->setChecked(true);
+            m_bombs->setChecked(false); m_walls->setChecked(false);
+            m_updatingOptions = false;
+        }
         invalidateGeneration();
         refreshControls();
         showIdleStatus();
     };
     connect(m_difficulty, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
-            [optionsChanged](int) { optionsChanged(); });
+            [this, optionsChanged](int) {
+                if (!m_updatingOptions && usesInfernoGeneration()
+                    && m_difficulty->currentData().toString() != QStringLiteral("Hard")
+                    && m_difficulty->currentData().toString() != QStringLiteral("Expert")) {
+                    m_updatingOptions = true;
+                    m_difficulty->setCurrentIndex(m_difficulty->findData(QStringLiteral("Expert")));
+                    m_updatingOptions = false;
+                }
+                optionsChanged();
+            });
     for (auto box : {m_directional, m_dots, m_bombs, m_walls})
         connect(box, &QCheckBox::toggled, this, [optionsChanged](bool) { optionsChanged(); });
     setService(nullptr);
@@ -265,7 +298,7 @@ void AiRecognitionPage::setContext(const QString &audioFile, const QString &titl
                                    double offsetSeconds, double durationSeconds, bool busy) {
     const bool changed = m_audioFile != audioFile || m_title != title || m_bpm != bpm
         || m_offsetSeconds != offsetSeconds || m_durationSeconds != durationSeconds;
-    if (changed || (busy && m_legacyOverride)) {
+    if (changed || (busy && m_legacyOverride && !usesInfernoGeneration())) {
         cancelRecognition();
         invalidateGeneration();
     }
@@ -381,6 +414,52 @@ void AiRecognitionPage::setHybridGenerationService(AiGenerationService *service,
     if (usesHybridGeneration()) activateGenerationService();
 }
 
+void AiRecognitionPage::setInfernoGenerationService(AiGenerationService *service, AiGenerationService *fallback) {
+    m_infernoGenerationFallback = fallback;
+    m_infernoGenerationService = service;
+    if (usesInfernoGeneration()) activateGenerationService();
+}
+
+void AiRecognitionPage::updateInfernoOptions(GenerationMode previous) {
+    m_updatingOptions = true;
+    if (usesInfernoGeneration()) {
+        m_nonInfernoTypes = {};
+        if (m_directional->isChecked()) m_nonInfernoTypes |= DirectionalType;
+        if (m_dots->isChecked()) m_nonInfernoTypes |= DotType;
+        if (m_bombs->isChecked()) m_nonInfernoTypes |= BombType;
+        if (m_walls->isChecked()) m_nonInfernoTypes |= WallType;
+        m_nonInfernoDifficulty = m_difficulty->currentData().toString();
+        m_directional->setChecked(true); m_dots->setChecked(true);
+        m_bombs->setChecked(false); m_walls->setChecked(false);
+        if (m_nonInfernoDifficulty != QStringLiteral("Hard") && m_nonInfernoDifficulty != QStringLiteral("Expert"))
+            m_difficulty->setCurrentIndex(m_difficulty->findData(QStringLiteral("Expert")));
+    } else if (previous == InfernoSaber) {
+        m_directional->setChecked(m_nonInfernoTypes.testFlag(DirectionalType));
+        m_dots->setChecked(m_nonInfernoTypes.testFlag(DotType));
+        m_bombs->setChecked(m_nonInfernoTypes.testFlag(BombType));
+        m_walls->setChecked(m_nonInfernoTypes.testFlag(WallType));
+        const int index = m_difficulty->findData(m_nonInfernoDifficulty);
+        if (index >= 0) m_difficulty->setCurrentIndex(index);
+    }
+    if (auto model = qobject_cast<QStandardItemModel *>(m_difficulty->model())) {
+        for (int i = 0; i < m_difficulty->count(); ++i) {
+            const auto name = m_difficulty->itemData(i).toString();
+            model->item(i)->setEnabled(!usesInfernoGeneration() || name == QStringLiteral("Hard") || name == QStringLiteral("Expert"));
+        }
+    }
+    m_updatingOptions = false;
+}
+
+QString AiRecognitionPage::generationUnavailableReason() const {
+    if (usesInfernoGeneration()) {
+        if (auto inferno = qobject_cast<InfernoSaberGenerationService *>(m_generationService.data()))
+            return inferno->availabilityReason();
+        return tr("本地模型环境尚未就绪，请在设置中检查运行环境和模型目录。");
+    }
+    return usesLocalGeneration() && !m_legacyOverride ? tr("本地制谱服务尚未准备就绪。")
+        : tr("请先配置并保存可用的模型连接。");
+}
+
 void AiRecognitionPage::setGenerationMode(GenerationMode mode) {
     const int index = m_mode->findData(mode);
     if (index >= 0) m_mode->setCurrentIndex(index);
@@ -389,6 +468,8 @@ void AiRecognitionPage::setGenerationMode(GenerationMode mode) {
 void AiRecognitionPage::activateGenerationService(bool force) {
     auto service = usesLocalGeneration()
         ? (m_localGenerationService ? m_localGenerationService.data() : m_localGenerationFallback.data())
+        : usesInfernoGeneration()
+            ? (m_infernoGenerationService ? m_infernoGenerationService.data() : m_infernoGenerationFallback.data())
         : usesHybridGeneration()
             ? (m_hybridGenerationService ? m_hybridGenerationService.data() : m_hybridGenerationFallback.data())
             : (m_modelGenerationService ? m_modelGenerationService.data() : m_generationFallback.data());
@@ -427,8 +508,9 @@ void AiRecognitionPage::activateGenerationService(bool force) {
                 if (!draft.warnings.isEmpty()) output += QStringLiteral("\n\n") + draft.warnings.join(QStringLiteral("\n"));
                 m_result->setPlainText(output.isEmpty() ? tr("分析完成，未返回可展示的建议。") : output);
                 setStatus(draft.source.analysisOnly ? tr("分析完成，曲谱未改变。")
+                    : draft.requiresPlayabilityReview ? tr("模型工作稿已生成，请在编辑区检查和修正动作后应用。")
                     : draft.hasThemeWarnings ? tr("候选谱已生成，部分乐句建议试听") : tr("工作稿已生成，可在编辑区试听、修改后确认应用。"),
-                    draft.hasThemeWarnings ? "warning" : "success");
+                    draft.hasThemeWarnings || draft.requiresPlayabilityReview ? "warning" : "success");
                 refreshControls();
                 if (!draft.source.analysisOnly) emit generationDraftReady(draft);
             }));
@@ -438,7 +520,8 @@ void AiRecognitionPage::activateGenerationService(bool force) {
                 m_pendingGeneration = {};
                 const auto state=m_generationService ? m_generationService->status() : AiGenerationService::Status{};
                 const QString retained=state.resumable ? tr("\n已保留 %1/%2 个乐句；处理上述原因后可继续。").arg(state.completedSegments).arg(state.totalSegments) : QString();
-                const QString fallback = usesLocalGeneration() ? tr("本地分析或生成失败，请检查音频与时间参数。")
+                const QString fallback = usesInfernoGeneration() ? tr("本地模型生成失败，请检查运行环境、模型和音频。")
+                    : usesLocalGeneration() ? tr("本地分析或生成失败，请检查音频与时间参数。")
                     : tr("分析或生成失败，请检查模型连接。");
                 setStatus((message.isEmpty() ? fallback : message)+retained, "error");
                 refreshControls();
@@ -454,7 +537,7 @@ void AiRecognitionPage::activateGenerationService(bool force) {
             [this, revision](const QString &jobId) {
                 if (revision != m_generationServiceRevision || jobId != m_pendingGeneration.jobId || jobId.isEmpty()) return;
                 m_pendingGeneration = {};
-                setStatus(usesLocalGeneration() ? tr("本地任务已取消，可重新生成。")
+                setStatus(usesOfflineGeneration() ? tr("本地任务已取消，可重新生成。")
                     : tr("任务已停止，已完成进度保留。"));
                 refreshControls();
             }));
@@ -471,7 +554,7 @@ void AiRecognitionPage::activateGenerationService(bool force) {
                 m_pendingGeneration = {};
                 m_generationService.clear();
                 activateGenerationService(true);
-                setStatus(usesLocalGeneration() ? tr("本地制谱服务已断开。")
+                setStatus(usesOfflineGeneration() ? tr("本地制谱服务已断开。")
                     : tr("生成服务已断开，请检查模型连接。"), "warning");
             }));
     }
@@ -495,7 +578,11 @@ void AiRecognitionPage::setGenerationContext(const GenerationRequest &context, b
         || context.profile.name != m_generationContext.profile.name) {
         m_updatingOptions = true;
         const int index = m_difficulty->findData(context.profile.name);
-        if (index >= 0) m_difficulty->setCurrentIndex(index);
+        if (index >= 0) {
+            const auto name = context.profile.name;
+            m_difficulty->setCurrentIndex(usesInfernoGeneration() && name != QStringLiteral("Hard") && name != QStringLiteral("Expert")
+                ? m_difficulty->findData(QStringLiteral("Expert")) : index);
+        }
         m_updatingOptions = false;
     }
     m_generationContext = context;
@@ -506,6 +593,7 @@ void AiRecognitionPage::setGenerationContext(const GenerationRequest &context, b
 }
 
 GeneratedTypes AiRecognitionPage::selectedTypes() const {
+    if (usesInfernoGeneration()) return GeneratedTypes(DirectionalType | DotType);
     GeneratedTypes types;
     if (m_directional->isChecked()) types |= DirectionalType;
     if (m_dots->isChecked()) types |= DotType;
@@ -567,11 +655,11 @@ void AiRecognitionPage::invalidateGeneration() {
     emit generationInvalidated();
 }
 void AiRecognitionPage::pauseGenerationForConnectionChange() {
-    if (!usesLocalGeneration()) cancelRecognition();
+    if (!usesOfflineGeneration()) cancelRecognition();
 }
 
 void AiRecognitionPage::invalidateGenerationForConnectionChange() {
-    if (usesLocalGeneration()) return;
+    if (usesOfflineGeneration()) return;
     if (!usesHybridGeneration()) { invalidateGeneration(); return; }
     QPointer<AiRecognitionPage> guard(this); cancelRecognition(); if (!guard) return;
     const auto service = m_generationService;
@@ -587,7 +675,7 @@ void AiRecognitionPage::showGenerationApplied() {
 }
 
 void AiRecognitionPage::startRecognition() {
-    if (!m_legacyOverride && m_generationService) { startGeneration(true); return; }
+    if ((!m_legacyOverride || usesInfernoGeneration()) && m_generationService) { startGeneration(true); return; }
     refreshControls();
     if (!m_start->isEnabled()) return;
     m_pendingContextId = QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -611,7 +699,7 @@ void AiRecognitionPage::cancelRecognition() {
     const auto jobId = m_pendingGeneration.jobId;
     m_pendingContextId.clear();
     m_pendingGeneration = {};
-    setStatus(!contextId.isEmpty() ? tr("识别已取消。") : usesLocalGeneration()
+    setStatus(!contextId.isEmpty() ? tr("识别已取消。") : usesOfflineGeneration()
         ? tr("本地任务已取消，可重新生成。") : tr("任务已停止，已完成进度保留。"));
     refreshControls();
     QPointer<AiRecognitionPage> guard(this);
@@ -626,7 +714,7 @@ bool AiRecognitionPage::accepts(const QString &contextId) const {
 }
 
 void AiRecognitionPage::refreshControls() {
-    const bool available = m_legacyOverride || !m_generationService
+    const bool available = (m_legacyOverride && !usesInfernoGeneration()) || !m_generationService
         ? m_service && m_service->isAvailable() : m_generationService->isAvailable();
     const auto file = QFileInfo(m_audioFile);
     const bool hasAudio = !m_audioFile.isEmpty() && file.isFile() && file.isReadable();
@@ -634,31 +722,42 @@ void AiRecognitionPage::refreshControls() {
         && std::isfinite(m_offsetSeconds) && std::isfinite(m_durationSeconds);
     const bool hasSnapshot = m_generationContext.audio.isValid() && !m_generationContext.documentId.isEmpty()
         && QFileInfo(m_generationContext.audio.path).isFile();
-    const bool legacy = m_legacyOverride || !m_generationService;
-    m_start->setEnabled(available && hasAudio && validTiming && (legacy || hasSnapshot)
+    const bool legacy = (m_legacyOverride && !usesInfernoGeneration()) || !m_generationService;
+    // Music analysis is local and remains usable while the model installation
+    // is missing; only inference requires the external environment.
+    const bool analysisAvailable = available || (usesInfernoGeneration() && m_generationService);
+    m_start->setEnabled(analysisAvailable && hasAudio && validTiming && (legacy || hasSnapshot)
                         && !m_contextBusy && !isRecognizing());
     m_generate->setEnabled(m_generationService && m_generationService->isAvailable() && hasSnapshot
-        && validTiming && m_newSong && selectedTypes() != GeneratedTypes() && !m_contextBusy && !isRecognizing());
+        && validTiming && (!usesInfernoGeneration() || m_generationContext.timeMap.changes().isEmpty())
+        && m_newSong && selectedTypes() != GeneratedTypes() && !m_contextBusy && !isRecognizing());
     m_difficulty->setEnabled(m_newSong && !m_contextBusy);
     m_mode->setEnabled(!m_contextBusy);
-    for (auto box : {m_directional, m_dots, m_bombs, m_walls}) box->setEnabled(m_newSong && !m_contextBusy);
+    for (auto box : {m_directional, m_dots, m_bombs, m_walls})
+        box->setEnabled(!usesInfernoGeneration() && m_newSong && !m_contextBusy);
     m_cancel->setEnabled(isRecognizing());
     m_cancel->setVisible(isRecognizing());
     const auto state=m_generationService ? m_generationService->status() : AiGenerationService::Status{};
-    const bool canResume=!usesLocalGeneration() && !m_lastGeneration.jobId.isEmpty()
+    const bool canResume=!usesOfflineGeneration() && !m_lastGeneration.jobId.isEmpty()
         && state.jobId==m_lastGeneration.jobId && state.resumable;
     m_resume->setVisible(canResume); m_resume->setEnabled(canResume && available && !m_contextBusy && !isRecognizing());
     m_preview->setVisible(m_hasDraft); m_preview->setEnabled(m_hasDraft && !m_contextBusy && !isRecognizing());
     m_logs->setVisible(!m_lastGeneration.jobId.isEmpty());
+    m_logs->setText(usesInfernoGeneration() ? tr("查看模型日志目录") : tr("查看本次日志"));
     m_generate->setText(!m_lastGeneration.jobId.isEmpty() && !m_lastGeneration.analysisOnly ? tr("重新生成") : tr("生成候选谱"));
     m_taskProgress->setProgressVisible(isRecognizing() || !m_lastGeneration.jobId.isEmpty());
-    m_configure->setEnabled((usesLocalGeneration() || !isRecognizing()) && !m_contextBusy);
-    m_configure->setText(usesLocalGeneration() ? tr("模型连接（可选）") : tr("配置 AI 连接"));
+    m_configure->setEnabled((usesOfflineGeneration() || !isRecognizing()) && !m_contextBusy);
+    m_configure->setText(usesInfernoGeneration() ? tr("配置本地模型")
+        : usesLocalGeneration() ? tr("模型连接（可选）") : tr("配置 AI 连接"));
     m_skipPlanning->setVisible(usesHybridGeneration() && isRecognizing() && !m_pendingGeneration.analysisOnly);
     m_skipPlanning->setEnabled(usesHybridGeneration() && isRecognizing() && !m_pendingGeneration.analysisOnly);
     m_changeArrangement->setVisible(m_generationMode != LanguageModel);
     m_changeArrangement->setEnabled(m_generate->isEnabled() && m_hasDraft);
-    if (m_legacyOverride) {
+    if (usesInfernoGeneration()) {
+        m_serviceStatus->setText((available ? tr("InfernoSaber 已就绪 · 本地 CPU 推理，首次生成需要等待")
+            : generationUnavailableReason())
+            + tr("\n仅支持 Hard / Expert 的方向和无方向方块。模型结果先进入可编辑草稿；请检查动作风险并试听后应用。"));
+    } else if (m_legacyOverride) {
         m_serviceStatus->setText(available ? tr("已连接音频分析服务") : tr("音频分析服务尚未接入。"));
     } else if (usesLocalGeneration()) {
         m_serviceStatus->setText(available ? tr("本地快速制谱已就绪 · 离线运行，无需配置模型连接")
@@ -670,9 +769,8 @@ void AiRecognitionPage::refreshControls() {
         m_serviceStatus->setText(available ? tr("已连接模型分析与编排服务")
             : tr("请先配置并保存模型连接，或完成账号授权。"));
     }
-    const QString unavailableTip = usesLocalGeneration() && !m_legacyOverride
-        ? tr("本地制谱服务尚未准备就绪。") : tr("请先配置并保存可用的模型连接。");
-    if (!available) m_start->setToolTip(unavailableTip);
+    const QString unavailableTip = generationUnavailableReason();
+    if (!analysisAvailable) m_start->setToolTip(unavailableTip);
     else if (!hasAudio) m_start->setToolTip(tr("请打开带有可用本地音频的歌曲或工程。"));
     else if (m_contextBusy) m_start->setToolTip(tr("请等待当前任务结束。"));
     else if (!validTiming) m_start->setToolTip(tr("请先确认歌曲的 BPM 和时间参数。"));
@@ -680,17 +778,18 @@ void AiRecognitionPage::refreshControls() {
     if (!m_newSong) m_generate->setToolTip(tr("自动制谱首版仅支持新建歌曲；已有歌曲可使用分析音乐。"));
     else if (selectedTypes() == GeneratedTypes()) m_generate->setToolTip(tr("请至少勾选一种物件类型。"));
     else if (!hasSnapshot) m_generate->setToolTip(tr("请等待当前歌曲音频准备完成。"));
+    else if (usesInfernoGeneration() && !m_generationContext.timeMap.changes().isEmpty())
+        m_generate->setToolTip(tr("本地模型暂不支持工程变速，请使用本地快速制谱；仍可分析音乐。"));
     else if (!m_generationService || !m_generationService->isAvailable()) m_generate->setToolTip(unavailableTip);
     else m_generate->setToolTip({});
 }
 
 void AiRecognitionPage::showIdleStatus() {
     if (isRecognizing() || !m_lastGeneration.jobId.isEmpty()) return;
-    const bool available = m_legacyOverride || !m_generationService
+    const bool available = (m_legacyOverride && !usesInfernoGeneration()) || !m_generationService
         ? m_service && m_service->isAvailable() : m_generationService->isAvailable();
     if (!available) {
-        setStatus(usesLocalGeneration() && !m_legacyOverride ? tr("本地制谱服务尚未准备就绪。")
-            : tr("请先配置并保存模型连接。"));
+        setStatus(generationUnavailableReason());
     } else if (m_contextBusy) {
         setStatus(tr("请等待当前任务结束。"));
     } else if (m_audioFile.isEmpty() || !QFileInfo(m_audioFile).isFile()

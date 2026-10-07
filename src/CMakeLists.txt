@@ -40,6 +40,7 @@ add_library(lmsc_core STATIC
         core/CodexTextSession.cpp core/CodexTextSession.h
         core/AiGenerationService.cpp core/AiGenerationService.h
         core/LocalAiGenerationService.cpp core/LocalAiGenerationService.h
+        core/InfernoSaberGenerationService.cpp core/InfernoSaberGenerationService.h
         core/LocalChartGenerator.cpp core/LocalChartGenerator.h
         core/SongArrangementPlan.cpp core/SongArrangementPlan.h
         core/HybridAiGenerationService.cpp core/HybridAiGenerationService.h
@@ -110,6 +111,13 @@ target_link_libraries(src
 )
 
 get_filename_component(LMSC_REPOSITORY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+set_property(TARGET src APPEND PROPERTY LINK_DEPENDS "${LMSC_REPOSITORY_DIR}/scripts/infernosaber_trial.py")
+add_custom_command(TARGET src POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:src>/tools/infernosaber"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "${LMSC_REPOSITORY_DIR}/scripts/infernosaber_trial.py" "$<TARGET_FILE_DIR:src>/tools/infernosaber"
+        COMMENT "Deploying the offline InfernoSaber runner"
+        VERBATIM)
 set(LMSC_AUDIO_TOOLS_DIR "${LMSC_REPOSITORY_DIR}/third_party/ffmpeg" CACHE PATH
         "Directory containing FFmpeg bin/, LICENSE.txt and README.md")
 option(LMSC_DEPLOY_AUDIO_TOOLS "Deploy the bundled offline audio tools with the application" ON)
@@ -224,6 +232,11 @@ if (BUILD_TESTING)
     set_target_properties(local_generation_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
     add_test(NAME local_generation COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:local_generation_tests>")
     set_tests_properties(local_generation PROPERTIES TIMEOUT 180 LABELS "core;audio;generation")
+    add_executable(infernosaber_generation_tests "${LMSC_REPOSITORY_DIR}/tests/InfernoSaberGenerationTest.cpp")
+    target_link_libraries(infernosaber_generation_tests PRIVATE lmsc_core Qt5::Test)
+    set_target_properties(infernosaber_generation_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_test(NAME infernosaber_generation COMMAND ${LMSC_TEST_ENVIRONMENT} "$<TARGET_FILE:infernosaber_generation_tests>")
+    set_tests_properties(infernosaber_generation PROPERTIES TIMEOUT 180 LABELS "core;audio;generation;model")
     add_executable(generation_trial_tests "${LMSC_REPOSITORY_DIR}/tests/GenerationTrialTest.cpp")
     target_link_libraries(generation_trial_tests PRIVATE lmsc_core Qt5::Test)
     target_compile_definitions(generation_trial_tests PRIVATE

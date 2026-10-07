@@ -21,7 +21,7 @@ class TaskProgressView;
 class AiRecognitionPage : public QWidget {
     Q_OBJECT
 public:
-    enum GenerationMode { LocalQuick, LanguageModel, Hybrid };
+    enum GenerationMode { LocalQuick = 0, LanguageModel = 1, Hybrid = 2, InfernoSaber = 3 };
     explicit AiRecognitionPage(QWidget *parent = nullptr);
     ~AiRecognitionPage() override;
 
@@ -35,6 +35,7 @@ public:
     void setGenerationService(AiGenerationService *service, AiGenerationService *fallback = nullptr);
     void setLocalGenerationService(AiGenerationService *service, AiGenerationService *fallback = nullptr);
     void setHybridGenerationService(AiGenerationService *service, AiGenerationService *fallback = nullptr);
+    void setInfernoGenerationService(AiGenerationService *service, AiGenerationService *fallback = nullptr);
     void setGenerationMode(GenerationMode mode);
     GenerationMode generationMode() const { return m_generationMode; }
     void setGenerationContext(const GenerationRequest &context, bool newSong, bool busy);
@@ -74,8 +75,12 @@ private:
     bool acceptsGeneration(const GenerationRequest &source) const;
     GeneratedTypes selectedTypes() const;
     void activateGenerationService(bool force = false);
+    void updateInfernoOptions(GenerationMode previous);
+    QString generationUnavailableReason() const;
     bool usesLocalGeneration() const { return m_generationMode == LocalQuick; }
     bool usesHybridGeneration() const { return m_generationMode == Hybrid; }
+    bool usesInfernoGeneration() const { return m_generationMode == InfernoSaber; }
+    bool usesOfflineGeneration() const { return usesLocalGeneration() || usesInfernoGeneration(); }
 
     UnavailableAiRecognitionService *m_unavailable;
     QPointer<AiRecognitionService> m_service;
@@ -87,6 +92,8 @@ private:
     QPointer<AiGenerationService> m_localGenerationFallback;
     QPointer<AiGenerationService> m_hybridGenerationService;
     QPointer<AiGenerationService> m_hybridGenerationFallback;
+    QPointer<AiGenerationService> m_infernoGenerationService;
+    QPointer<AiGenerationService> m_infernoGenerationFallback;
     QVector<QMetaObject::Connection> m_generationConnections;
     GenerationRequest m_generationContext;
     GenerationRequest m_pendingGeneration;
@@ -99,6 +106,8 @@ private:
     bool m_newSong = false;
     bool m_legacyOverride = false;
     bool m_updatingOptions = false;
+    GeneratedTypes m_nonInfernoTypes = DirectionalType;
+    QString m_nonInfernoDifficulty;
     QString m_audioFile;
     QString m_title;
     QString m_pendingContextId;

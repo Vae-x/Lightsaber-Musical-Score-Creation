@@ -45,6 +45,7 @@ class ConfiguredAiTextTransport;
 class LlmAiGenerationService;
 class LocalAiGenerationService;
 class HybridAiGenerationService;
+class InfernoSaberGenerationService;
 class AiRefinementService;
 class EditorSessionController;
 class EditorRefinementPanel;
@@ -76,6 +77,7 @@ public:
     // application's offline backend.
     void setAiLocalGenerationService(lmsc::AiGenerationService *service);
     void setAiHybridGenerationService(lmsc::AiGenerationService *service);
+    void setInfernoGenerationService(lmsc::AiGenerationService *service);
     void setAiRefinementService(lmsc::AiRefinementService *service);
 signals:
     void documentReady();
@@ -87,6 +89,7 @@ private:
     void buildWorkspace();
     void selectWorkspacePage(int row);
     void refreshRecognitionContext();
+    void configureInfernoGeneration(const lmsc::AppPreferences &preferences);
     bool generationSourceIsCurrent(const lmsc::GenerationRequest &source) const;
     void previewGeneratedChart(const lmsc::GenerationDraft &draft);
     lmsc::BeatmapDocument *editingDocument() const;
@@ -149,6 +152,7 @@ private:
     lmsc::LlmAiGenerationService *m_defaultGenerationService = nullptr;
     lmsc::LocalAiGenerationService *m_localGenerationService = nullptr;
     lmsc::HybridAiGenerationService *m_hybridGenerationService = nullptr;
+    lmsc::InfernoSaberGenerationService *m_infernoGenerationService = nullptr;
     lmsc::AiRefinementService *m_defaultRefinementService = nullptr;
     QPointer<lmsc::AiRefinementService> m_refinementService;
     std::unique_ptr<lmsc::RefinementResult> m_cachedRefinement;

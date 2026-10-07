@@ -247,7 +247,7 @@ void EditorRefinementPanelTest::compactGenerationKeepsTaskVisible() {
     QVERIFY(panel.isExpanded());
     QVERIFY(details->isVisible());
     QVERIFY(percentage->isVisible());
-    QCOMPARE(panel.findChild<QComboBox *>(QStringLiteral("aiGenerationMode"))->count(), 3);
+    QCOMPARE(panel.findChild<QComboBox *>(QStringLiteral("aiGenerationMode"))->count(), 4);
     auto progress = panel.findChild<QProgressBar *>(QStringLiteral("aiRecognitionProgress"));
     QCOMPARE(progress, panel.taskProgress()->progressBar());
     for (auto ancestor = progress->parentWidget(); ancestor; ancestor = ancestor->parentWidget())

@@ -37,6 +37,7 @@ public:
     bool isApplied() const;
     bool isManualModified() const;
     bool isApplicable(QString *reason = nullptr) const;
+    bool canApplyDraft(QString *reason = nullptr) const;
     QStringList warnings() const;
     GenerationDraft generationDraft() const;
 

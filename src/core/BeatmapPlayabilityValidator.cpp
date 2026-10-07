@@ -202,6 +202,26 @@ bool BeatmapPlayabilityValidator::validateObjects(const QVector<BeatObject> &obj
     return errors->isEmpty();
 }
 
+bool BeatmapPlayabilityValidator::validateLearnedObjects(const QVector<BeatObject> &objects,
+                                                        const GenerationRequest &request,
+                                                        const MusicAnalysis &analysis, QStringList *errors) {
+    QStringList localErrors;
+    if (!errors) errors = &localErrors;
+    validateObjects(objects, request, analysis, errors);
+    const auto notes = orderedNotes(objects); const BeatObject *prior[2]{nullptr,nullptr};
+    int backstrokes = 0;
+    for (const auto &note : notes) {
+        if (note.color < 0 || note.color > 1) continue;
+        const auto *previous = prior[note.color];
+        if (previous && note.direction != 8 && previous->direction != 8
+                && request.timeMap.beatToSeconds(note.beat)-request.timeMap.beatToSeconds(previous->beat) <= 1.0+epsilon
+                && QPointF::dotProduct(cutVector(note.direction), cutVector(previous->direction)) > .1) ++backstrokes;
+        prior[note.color] = &note;
+    }
+    if (backstrokes) errors->append(QStringLiteral("检测到 %1 次一秒内同手连续同向回刀。").arg(backstrokes));
+    return errors->isEmpty();
+}
+
 bool BeatmapPlayabilityValidator::parseAndValidate(const QJsonObject &json, const GenerationRequest &request,
                                                   const MusicAnalysis &analysis, int segmentIndex,
                                                   const QString &motifId, const QVector<BeatObject> &previous,

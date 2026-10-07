@@ -42,6 +42,9 @@ struct GenerationDraft {
     QString summary;
     QStringList warnings;
     bool hasThemeWarnings = false;
+    // Learned candidates stay editable but must pass motion checks before use.
+    bool requiresPlayabilityReview = false;
+    double playabilityActiveSeconds = 0.0;
     GenerationMetrics metrics;
     std::shared_ptr<const SongArrangementPlan> arrangement;
 };

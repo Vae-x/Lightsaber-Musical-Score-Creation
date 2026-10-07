@@ -17,6 +17,7 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QTemporaryDir>
+#include <QStandardItemModel>
 
 namespace {
 class FakeGenerationService final : public lmsc::AiGenerationService {
@@ -100,6 +101,8 @@ private slots:
     void modelChangesPreserveLocalTasksAndDrafts();
     void inactiveBackendDestructionAndSharedBackendsAreSafe();
     void hybridModeDefaultsToPlanningAndChangesSeed();
+    void infernoModeRestrictsTypesAndRestoresOtherOptions();
+    void infernoTasksIgnoreAiConnectionsAndRejectCancelledResults();
     void refinementPreviewComparesRestoresAndPreservesIds();
     void refinementCancelSettingsAndResumeRejectLateResults();
     void refinementCallbacksMayDestroyPreview();
@@ -518,7 +521,7 @@ void AiGenerationPageTest::localModeIsDefaultAndDoesNotRequireModelConnection() 
     lmsc::AiRecognitionPage page;
     auto *mode = page.findChild<QComboBox *>(QStringLiteral("aiGenerationMode"));
     QVERIFY(mode);
-    QCOMPARE(mode->count(), 3);
+    QCOMPARE(mode->count(), 4);
     QCOMPARE(mode->currentData().toInt(), int(lmsc::AiRecognitionPage::Hybrid));
     page.setGenerationMode(lmsc::AiRecognitionPage::LocalQuick);
     QCOMPARE(page.generationMode(), lmsc::AiRecognitionPage::LocalQuick);
@@ -709,6 +712,75 @@ void AiGenerationPageTest::hybridModeDefaultsToPlanningAndChangesSeed() {
     QCOMPARE(hybrid.requests.last().arrangementSeed,quint32(1));
     const auto late=hybrid.requests.last(); page.invalidateGenerationForConnectionChange();
     hybrid.finish(late,QStringLiteral("过期模型编排")); QCOMPARE(drafts.count(),1);
+}
+
+void AiGenerationPageTest::infernoModeRestrictsTypesAndRestoresOtherOptions() {
+    FakeGenerationService local, inferno;
+    lmsc::AiRecognitionPage page;
+    page.setLocalGenerationService(&local);
+    page.setInfernoGenerationService(&inferno);
+    page.setGenerationMode(lmsc::AiRecognitionPage::LocalQuick);
+    page.setContext(m_audio, {}, 120, .25, 16, false);
+    page.setGenerationContext(context(), true, false);
+    auto difficulty = page.findChild<QComboBox *>("aiGenerationDifficulty");
+    auto directional = page.findChild<QCheckBox *>("aiDirectionalType");
+    auto dots = page.findChild<QCheckBox *>("aiDotType");
+    auto bombs = page.findChild<QCheckBox *>("aiBombType");
+    auto walls = page.findChild<QCheckBox *>("aiWallType");
+    auto generate = page.findChild<QPushButton *>("aiGenerateButton");
+    auto analyze = page.findChild<QPushButton *>("aiRecognizeButton");
+    difficulty->setCurrentIndex(difficulty->findData(QStringLiteral("Normal")));
+    directional->setChecked(false); bombs->setChecked(true); walls->setChecked(true);
+    page.setGenerationMode(lmsc::AiRecognitionPage::InfernoSaber);
+    QCOMPARE(difficulty->currentData().toString(), QStringLiteral("Expert"));
+    auto model = qobject_cast<QStandardItemModel *>(difficulty->model()); QVERIFY(model);
+    for (int i = 0; i < difficulty->count(); ++i)
+        QCOMPARE(model->item(i)->isEnabled(), difficulty->itemData(i).toString() == "Hard" || difficulty->itemData(i).toString() == "Expert");
+    QVERIFY(directional->isChecked() && dots->isChecked());
+    QVERIFY(!bombs->isChecked() && !walls->isChecked());
+    for (auto box : {directional, dots, bombs, walls}) QVERIFY(!box->isEnabled());
+    QVERIFY(page.findChild<QLabel *>("aiServiceStatus")->text().contains(QStringLiteral("CPU")));
+    QCOMPARE(page.findChild<QPushButton *>("aiConfigureConnection")->text(), QStringLiteral("配置本地模型"));
+    difficulty->setCurrentIndex(difficulty->findData(QStringLiteral("Hard")));
+    generate->click(); QCOMPARE(inferno.requests.size(), 1); QVERIFY(local.requests.isEmpty());
+    QCOMPARE(inferno.requests.last().profile.name, QStringLiteral("Hard"));
+    QCOMPARE(inferno.requests.last().allowedTypes, lmsc::GeneratedTypes(lmsc::DirectionalType | lmsc::DotType));
+    inferno.finish(inferno.requests.last());
+    page.findChild<QPushButton *>("aiChangeArrangement")->click();
+    QCOMPARE(inferno.requests.size(), 2); QCOMPARE(inferno.requests.last().arrangementSeed, quint32(1));
+    page.cancelRecognition();
+    inferno.available = false; emit inferno.availabilityChanged();
+    QVERIFY(!generate->isEnabled()); QVERIFY(analyze->isEnabled());
+    analyze->click(); QCOMPARE(inferno.requests.size(), 3); QVERIFY(inferno.requests.last().analysisOnly);
+    inferno.finish(inferno.requests.last());
+    page.setGenerationMode(lmsc::AiRecognitionPage::LocalQuick);
+    QCOMPARE(difficulty->currentData().toString(), QStringLiteral("Normal"));
+    QVERIFY(!directional->isChecked() && !dots->isChecked()); QVERIFY(bombs->isChecked() && walls->isChecked());
+    for (int i = 0; i < difficulty->count(); ++i) QVERIFY(model->item(i)->isEnabled());
+}
+
+void AiGenerationPageTest::infernoTasksIgnoreAiConnectionsAndRejectCancelledResults() {
+    FakeGenerationService inferno, model;
+    lmsc::AiRecognitionPage page;
+    page.setInfernoGenerationService(&inferno); page.setGenerationService(&model);
+    page.setGenerationMode(lmsc::AiRecognitionPage::InfernoSaber);
+    page.setContext(m_audio, {}, 120, .25, 16, false); page.setGenerationContext(context(), true, false);
+    auto generate = page.findChild<QPushButton *>("aiGenerateButton");
+    QSignalSpy drafts(&page, &lmsc::AiRecognitionPage::generationDraftReady);
+    generate->click(); const auto original = inferno.requests.last();
+    page.pauseGenerationForConnectionChange(); page.invalidateGenerationForConnectionChange();
+    page.setGenerationService(nullptr); QVERIFY(page.isRecognizing()); QVERIFY(inferno.cancelledJobs.isEmpty());
+    emit inferno.progress(original.jobId, 71, QStringLiteral("正在运行本地模型"));
+    QCOMPARE(page.findChild<QProgressBar *>("aiRecognitionProgress")->value(), 71);
+    inferno.finish(original); QCOMPARE(drafts.count(), 1);
+    generate->click(); const auto cancelled = inferno.requests.last(); page.cancelRecognition();
+    inferno.finish(cancelled); QCOMPARE(drafts.count(), 1);
+    generate->click(); const auto stale = inferno.requests.last();
+    auto changed = context(); QVERIFY(changed.timeMap.configure(121, .25)); page.setGenerationContext(changed, true, false);
+    QVERIFY(inferno.cancelledJobs.contains(stale.jobId)); inferno.finish(stale); QCOMPARE(drafts.count(), 1);
+    generate->click(); const auto switched = inferno.requests.last();
+    page.setGenerationMode(lmsc::AiRecognitionPage::LanguageModel);
+    QVERIFY(inferno.cancelledJobs.contains(switched.jobId)); inferno.finish(switched); QCOMPARE(drafts.count(), 1);
 }
 
 void AiGenerationPageTest::refinementPreviewComparesRestoresAndPreservesIds() {

@@ -1,4 +1,5 @@
 #include "gui/SettingsDialog.h"
+#include "gui/SettingsPanel.h"
 #include "gui/NavigationSidebar.h"
 #include "gui/ThemeManager.h"
 #include "gui/EditorViews.h"
@@ -13,9 +14,13 @@
 #include <QDesktopServices>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QFont>
 #include <QFrame>
 #include <QLabel>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMenu>
@@ -56,6 +61,9 @@ private slots:
     void aboutHomepage();
     void painterViewsFollowTheme();
     void captureSettings();
+    void infernoSettingsSaveCancelAndValidation();
+    void infernoFileStatusDoesNotPrepareEnvironment();
+    void unknownSettingsVersionRemainsIntactThroughUi();
 };
 
 void SettingsDialogTest::navigationCollapsePreservesDraft() {
@@ -734,6 +742,142 @@ void SettingsDialogTest::captureSettings() {
             QVERIFY(capture(QStringLiteral("settings-ai-%1-%2-760x500.png").arg(mode, suffix)));
         }
     }
+}
+
+void SettingsDialogTest::infernoSettingsSaveCancelAndValidation() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString file = directory.filePath(QStringLiteral("preferences.json"));
+    {
+        lmsc::SettingsDialog dialog(nullptr, file);
+        dialog.show();
+        auto panel = dialog.findChild<lmsc::SettingsPanel *>(QStringLiteral("settingsPanel"));
+        auto nav = dialog.findChild<QListWidget *>(QStringLiteral("settingsNavigation"));
+        auto pages = dialog.findChild<QStackedWidget *>(QStringLiteral("settingsPages"));
+        auto runtime = dialog.findChild<QLineEdit *>(QStringLiteral("infernoRuntimeDirectory"));
+        auto models = dialog.findChild<QLineEdit *>(QStringLiteral("infernoModelCacheDirectory"));
+        auto threads = dialog.findChild<QSpinBox *>(QStringLiteral("infernoThreads"));
+        auto card = dialog.findChild<QFrame *>(QStringLiteral("infernoModelCard"));
+        auto buttons = dialog.findChild<QDialogButtonBox *>(QStringLiteral("settingsButtons"));
+        QVERIFY(panel && nav && pages && runtime && models && threads && card && buttons);
+        QCOMPARE(nav->count(), 5);
+        panel->showInfernoSettings();
+        QCOMPARE(nav->currentItem()->text(), QStringLiteral("大语言模型"));
+        QCOMPARE(pages->currentIndex(), 1);
+        QVERIFY(pages->widget(1)->isAncestorOf(card));
+        QTRY_VERIFY(runtime->hasFocus());
+        QCOMPARE(runtime->text(), QStringLiteral("E:/lmsc-infernosaber-runtime"));
+        QCOMPARE(models->text(), QStringLiteral("E:/lmsc-infernosaber-runtime/models"));
+        QCOMPARE(threads->value(), 4);
+        QCOMPARE(threads->minimum(), 1);
+        QCOMPARE(threads->maximum(), 16);
+        QVERIFY(dialog.findChild<QPushButton *>(QStringLiteral("browseInfernoRuntimeDirectory")));
+        QVERIFY(dialog.findChild<QPushButton *>(QStringLiteral("browseInfernoModelCacheDirectory")));
+        runtime->setText(QStringLiteral("E:/"));
+        buttons->button(QDialogButtonBox::Apply)->click();
+        QVERIFY(!QFile::exists(file));
+        QVERIFY(dialog.findChild<QLabel *>(QStringLiteral("settingsSaveStatus"))->text().contains(QStringLiteral("本地模型")));
+        const QString expectedRuntime = directory.filePath(QStringLiteral("later-runtime"));
+        const QString expectedModels = directory.filePath(QStringLiteral("later-models"));
+        runtime->setText(expectedRuntime);
+        models->setText(expectedModels);
+        threads->setValue(8);
+        dialog.findChild<QComboBox *>(QStringLiteral("aiModel"))->setEditText(QStringLiteral("preserved-api-model"));
+        buttons->button(QDialogButtonBox::Apply)->click();
+        const auto saved = lmsc::AppSettings(file).load();
+        QCOMPARE(saved.infernoRuntimeDirectory, expectedRuntime);
+        QCOMPARE(saved.infernoModelCacheDirectory, expectedModels);
+        QCOMPARE(saved.infernoThreads, 8);
+        QCOMPARE(saved.providers[QStringLiteral("deepseek")].model, QStringLiteral("preserved-api-model"));
+        QVERIFY(!QFile::exists(expectedRuntime));
+        QVERIFY(!QFile::exists(expectedModels));
+        runtime->setText(directory.filePath(QStringLiteral("unsaved-runtime")));
+        models->setText(directory.filePath(QStringLiteral("unsaved-models")));
+        threads->setValue(2);
+        nav->setCurrentRow(0);
+        nav->setCurrentRow(1);
+        QCOMPARE(threads->value(), 2);
+        panel->discardChanges();
+        QCOMPARE(runtime->text(), expectedRuntime);
+        QCOMPARE(models->text(), expectedModels);
+        QCOMPARE(threads->value(), 8);
+        buttons->button(QDialogButtonBox::Cancel)->click();
+        QCOMPARE(lmsc::AppSettings(file).load().infernoThreads, 8);
+    }
+    lmsc::SettingsDialog reopened(nullptr, file);
+    QCOMPARE(reopened.findChild<QLineEdit *>(QStringLiteral("infernoRuntimeDirectory"))->text(),
+            directory.filePath(QStringLiteral("later-runtime")));
+    QCOMPARE(reopened.findChild<QLineEdit *>(QStringLiteral("infernoModelCacheDirectory"))->text(),
+            directory.filePath(QStringLiteral("later-models")));
+    QCOMPARE(reopened.findChild<QSpinBox *>(QStringLiteral("infernoThreads"))->value(), 8);
+}
+
+void SettingsDialogTest::infernoFileStatusDoesNotPrepareEnvironment() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString runtimePath = directory.filePath(QStringLiteral("runtime"));
+    const QString modelPath = directory.filePath(QStringLiteral("models"));
+    lmsc::SettingsDialog dialog(nullptr, directory.filePath(QStringLiteral("preferences.json")));
+    auto runtime = dialog.findChild<QLineEdit *>(QStringLiteral("infernoRuntimeDirectory"));
+    auto models = dialog.findChild<QLineEdit *>(QStringLiteral("infernoModelCacheDirectory"));
+    auto status = dialog.findChild<QLabel *>(QStringLiteral("infernoRuntimeStatus"));
+    auto check = dialog.findChild<QPushButton *>(QStringLiteral("checkInfernoRuntime"));
+    QVERIFY(runtime && models && status && check);
+    runtime->setText(runtimePath);
+    models->setText(modelPath);
+    check->click();
+    QVERIFY(status->text().contains(QStringLiteral("未准备")));
+    QVERIFY(!QFile::exists(runtimePath));
+    QVERIFY(!QFile::exists(modelPath));
+    QVERIFY(!QFile::exists(directory.filePath(QStringLiteral("preferences.json"))));
+    const auto write = [](const QString &path, const QByteArray &contents) {
+        if (!QDir().mkpath(QFileInfo(path).absolutePath())) return false;
+        QFile file(path);
+        return file.open(QIODevice::WriteOnly) && file.write(contents) == contents.size();
+    };
+    QVERIFY(write(QDir(runtimePath).filePath(QStringLiteral("env/python.exe")), "fixture"));
+    QVERIFY(write(QDir(runtimePath).filePath(QStringLiteral("source/map_creation/gen_beats.py")), "fixture"));
+    QVERIFY(write(QDir(runtimePath).filePath(QStringLiteral("runtime-ready.json")), "{}"));
+    for (const QString &model : {QStringLiteral("easy_15"), QStringLiteral("expert_15")}) {
+        QJsonArray files;
+        const QDir modelDirectory(QDir(modelPath).filePath(model));
+        for (int i = 0; i < 7; ++i) {
+            const QString name = QStringLiteral("fixture-%1.bin").arg(i);
+            QVERIFY(write(modelDirectory.filePath(name), "model"));
+            files.append(QJsonObject{{QStringLiteral("name"), name}, {QStringLiteral("size"), 5}});
+        }
+        const QJsonObject manifest{{QStringLiteral("complete"), true},
+                {QStringLiteral("model"), model}, {QStringLiteral("files"), files}};
+        QVERIFY(write(modelDirectory.filePath(QStringLiteral(".trial-model-manifest.json")), QJsonDocument(manifest).toJson()));
+    }
+    check->click();
+    QVERIFY(status->text().contains(QStringLiteral("运行环境：已找到")));
+    QVERIFY(status->text().contains(QStringLiteral("Hard 文件齐备")));
+    QVERIFY(status->text().contains(QStringLiteral("Expert 文件齐备")));
+    QVERIFY(status->text().contains(QStringLiteral("生成时会校验")));
+    // A cache receipt cannot hide a missing/truncated component.
+    QVERIFY(write(QDir(modelPath).filePath(QStringLiteral("easy_15/fixture-0.bin")), "x"));
+    check->click();
+    QVERIFY(status->text().contains(QStringLiteral("Hard 未准备")));
+    QVERIFY(status->text().contains(QStringLiteral("Expert 文件齐备")));
+    QVERIFY(!QFile::exists(directory.filePath(QStringLiteral("preferences.json"))));
+}
+
+void SettingsDialogTest::unknownSettingsVersionRemainsIntactThroughUi() {
+    QTemporaryDir directory;
+    const QString path = directory.filePath(QStringLiteral("preferences.json"));
+    lmsc::SettingsDialog dialog(nullptr, path);
+    const QByteArray unknown = "{\"schemaVersion\":2,\"futureSettings\":\"retain\"}";
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    QCOMPARE(file.write(unknown), qint64(unknown.size()));
+    file.close();
+    auto panel = dialog.findChild<lmsc::SettingsPanel *>(QStringLiteral("settingsPanel"));
+    QVERIFY(panel);
+    QVERIFY(!panel->applyPreferences());
+    QVERIFY(dialog.findChild<QLabel *>(QStringLiteral("settingsSaveStatus"))->text().contains(QStringLiteral("版本")));
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    QCOMPARE(file.readAll(), unknown);
 }
 
 QTEST_MAIN(SettingsDialogTest)

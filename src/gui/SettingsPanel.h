@@ -24,6 +24,7 @@ public:
     ~SettingsPanel() override;
 
     void selectPage(int index);
+    void showInfernoSettings();
     bool applyPreferences();
     void discardChanges();
 
@@ -36,6 +37,7 @@ signals:
 private:
     QWidget *buildAppearancePage();
     QWidget *buildModelPage();
+    QWidget *buildInfernoCard(QWidget *parent);
     QWidget *buildAccountPage();
     QWidget *buildNetworkPage();
     QWidget *buildAboutPage();
@@ -47,6 +49,7 @@ private:
     void setApiStatus(const QString &text, const char *role = "muted");
     void setAccountStatus(const QString &text, const char *role = "muted");
     bool configureCodex();
+    void refreshInfernoStatus();
 
     AppSettings m_store;
     AppPreferences m_preferences;
@@ -68,6 +71,10 @@ private:
     QSpinBox *m_requestTimeout;
     QCheckBox *m_logEnabled;
     QComboBox *m_connection;
+    QLineEdit *m_infernoRuntime = nullptr;
+    QLineEdit *m_infernoModels = nullptr;
+    QSpinBox *m_infernoThreads = nullptr;
+    QLabel *m_infernoStatus = nullptr;
     QComboBox *m_provider;
     QComboBox *m_models;
     QSpinBox *m_maxOutputTokens;

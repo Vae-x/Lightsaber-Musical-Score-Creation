@@ -20,6 +20,7 @@
 #include "core/AiTextTransport.h"
 #include "core/LocalAiGenerationService.h"
 #include "core/HybridAiGenerationService.h"
+#include "core/InfernoSaberGenerationService.h"
 #include "core/AiRefinementService.h"
 #include "core/BeatmapPlayabilityValidator.h"
 #include <QtConcurrent>
@@ -155,6 +156,8 @@ MainWindow::MainWindow(QWidget *parent, const QString &settingsFile)
     m_defaultGenerationService = new lmsc::LlmAiGenerationService(m_aiTransport, this);
     m_localGenerationService = new lmsc::LocalAiGenerationService(this);
     m_hybridGenerationService = new lmsc::HybridAiGenerationService(m_aiTransport, this);
+    m_infernoGenerationService = new lmsc::InfernoSaberGenerationService(this);
+    configureInfernoGeneration(preferences);
     m_defaultRefinementService = new lmsc::AiRefinementService(m_aiTransport, this);
     m_refinementService = m_defaultRefinementService;
     lmsc::ThemeManager::watchSystemChanges(qApp);
@@ -575,6 +578,7 @@ void MainWindow::buildWorkspace() {
     m_aiPage->setGenerationService(m_defaultGenerationService, m_defaultGenerationService);
     m_aiPage->setLocalGenerationService(m_localGenerationService, m_localGenerationService);
     m_aiPage->setHybridGenerationService(m_hybridGenerationService, m_hybridGenerationService);
+    m_aiPage->setInfernoGenerationService(m_infernoGenerationService, m_infernoGenerationService);
     toolsLayout->addWidget(m_aiPage, 1);
     m_draftReplacement = new QWidget(m_generationTools);
     m_draftReplacement->setObjectName(QStringLiteral("draftReplacementPrompt"));
@@ -651,14 +655,24 @@ void MainWindow::buildWorkspace() {
             if (sameGenerationModel(m_generationPreferences, preferences)) m_aiPage->pauseGenerationForConnectionChange();
             else m_aiPage->invalidateGenerationForConnectionChange();
             cancelRefinement(true);
-            m_generationPreferences = preferences;
             m_aiTransport->configure(preferences);
             refreshRecognitionContext();
         }
+        if (m_generationPreferences.infernoRuntimeDirectory != preferences.infernoRuntimeDirectory
+            || m_generationPreferences.infernoModelCacheDirectory != preferences.infernoModelCacheDirectory
+            || m_generationPreferences.infernoThreads != preferences.infernoThreads) {
+            if (m_aiPage->generationMode() == lmsc::AiRecognitionPage::InfernoSaber)
+                m_aiPage->invalidateGeneration();
+            configureInfernoGeneration(preferences);
+            refreshRecognitionContext();
+        }
+        m_generationPreferences = preferences;
         statusBar()->showMessage(tr("设置已保存"), 5000);
     });
-    connect(m_aiPage, &lmsc::AiRecognitionPage::configureConnectionRequested, this, [navigation] {
+    connect(m_aiPage, &lmsc::AiRecognitionPage::configureConnectionRequested, this, [this, navigation] {
         navigation->setCurrentRow(3);
+        if (m_aiPage->generationMode() == lmsc::AiRecognitionPage::InfernoSaber)
+            m_settingsPanel->showInfernoSettings();
     });
     connect(m_aiPage, &lmsc::AiRecognitionPage::generationDraftReady, this, &MainWindow::previewGeneratedChart);
     connect(m_aiPage, &lmsc::AiRecognitionPage::generationInvalidated, this, [this] {
@@ -728,6 +742,24 @@ void MainWindow::setAiHybridGenerationService(lmsc::AiGenerationService *service
     m_aiPage->setHybridGenerationService(service ? service : m_hybridGenerationService, m_hybridGenerationService);
     m_aiPage->setGenerationMode(lmsc::AiRecognitionPage::Hybrid);
     refreshRecognitionContext();
+}
+
+void MainWindow::setInfernoGenerationService(lmsc::AiGenerationService *service) {
+    m_aiPage->setInfernoGenerationService(service ? service : m_infernoGenerationService, m_infernoGenerationService);
+    m_aiPage->setGenerationMode(lmsc::AiRecognitionPage::InfernoSaber);
+    refreshRecognitionContext();
+}
+
+void MainWindow::configureInfernoGeneration(const lmsc::AppPreferences &preferences) {
+    lmsc::InfernoSaberGenerationService::Config config;
+    config.runtimeDirectory = preferences.infernoRuntimeDirectory;
+    config.modelCacheDirectory = preferences.infernoModelCacheDirectory;
+    config.threads = preferences.infernoThreads;
+    config.runnerPath = QDir(QCoreApplication::applicationDirPath())
+        .filePath(QStringLiteral("tools/infernosaber/infernosaber_trial.py"));
+    config.toolsDirectory = m_audio->toolsDirectory();
+    config.workDirectory = QDir(config.runtimeDirectory).filePath(QStringLiteral("jobs"));
+    m_infernoGenerationService->setConfig(config);
 }
 
 void MainWindow::updateWorkspaceActions() {

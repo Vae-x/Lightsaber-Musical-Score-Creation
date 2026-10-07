@@ -94,6 +94,36 @@ bool validChoice(const QString &choice, const QStringList &choices) {
     return choices.contains(choice);
 }
 
+bool safeLocalDirectory(const QString &value) {
+    const QString path = QDir::fromNativeSeparators(value.trimmed());
+    if (path.isEmpty() || path.size() > 1024) return false;
+    for (const QChar character : path) {
+        if (character.unicode() < 32 || character.unicode() == 127
+                || QStringLiteral("\"<>|*?").contains(character)) return false;
+    }
+#ifdef Q_OS_WIN
+    // Require a complete drive path; drive-relative and device/UNC paths are
+    // unsuitable for the local runtime and mutable model cache.
+    static const QRegularExpression absoluteDrive(QStringLiteral("^[A-Za-z]:/"));
+    if (!absoluteDrive.match(path).hasMatch() || path.mid(2).contains(QLatin1Char(':'))) return false;
+    const QStringList segments = path.mid(3).split(QLatin1Char('/'), QString::SkipEmptyParts);
+#else
+    if (!path.startsWith(QLatin1Char('/')) || path.startsWith(QStringLiteral("//"))) return false;
+    const QStringList segments = path.mid(1).split(QLatin1Char('/'), QString::SkipEmptyParts);
+#endif
+    if (segments.isEmpty()) return false;
+    static const QRegularExpression deviceName(
+            QStringLiteral("^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\\..*)?$"),
+            QRegularExpression::CaseInsensitiveOption);
+    for (const QString &segment : segments) {
+        if (segment == QStringLiteral(".") || segment == QStringLiteral("..")
+                || segment.endsWith(QLatin1Char('.')) || segment.endsWith(QLatin1Char(' '))
+                || deviceName.match(segment).hasMatch()) return false;
+    }
+    const QFileInfo info(path);
+    return !info.exists() || (info.isDir() && !QDir(info.canonicalFilePath()).isRoot());
+}
+
 } // namespace
 
 AppSettings::AppSettings(const QString &filePath) {
@@ -160,6 +190,16 @@ QString AppSettings::validateProxy(const NetworkProxyConfig &proxy) {
     return {};
 }
 
+QString AppSettings::validateInfernoSettings(const AppPreferences &preferences) {
+    if (!safeLocalDirectory(preferences.infernoRuntimeDirectory))
+        return QStringLiteral("本地模型运行目录必须为完整绝对目录，不能是盘符根目录、文件或包含无效字符的路径。");
+    if (!safeLocalDirectory(preferences.infernoModelCacheDirectory))
+        return QStringLiteral("本地模型缓存目录必须为完整绝对目录，不能是盘符根目录、文件或包含无效字符的路径。");
+    if (preferences.infernoThreads < 1 || preferences.infernoThreads > 16)
+        return QStringLiteral("本地模型 CPU 线程数必须在 1 到 16 之间。");
+    return {};
+}
+
 AppPreferences AppSettings::load(QString *error) const {
     if (error) error->clear();
     AppPreferences preferences = defaults();
@@ -196,6 +236,24 @@ AppPreferences AppSettings::load(QString *error) const {
     else warnings.append(QStringLiteral("AI 连接方式无效，已使用 API。"));
     preferences.codexExecutable = root.value(QStringLiteral("codexExecutable")).toString();
     preferences.codexModel = root.value(QStringLiteral("codexModel")).toString();
+    for (const QString &key : {QStringLiteral("infernoRuntimeDirectory"), QStringLiteral("infernoModelCacheDirectory")}) {
+        if (!root.contains(key)) continue;
+        const QJsonValue value = root.value(key);
+        if (!value.isString() || !safeLocalDirectory(value.toString())) {
+            warnings.append(QStringLiteral("本地模型目录设置无效，已使用 E 盘默认目录。"));
+            continue;
+        }
+        const QString path = QDir::cleanPath(QDir::fromNativeSeparators(value.toString().trimmed()));
+        if (key == QStringLiteral("infernoRuntimeDirectory")) preferences.infernoRuntimeDirectory = path;
+        else preferences.infernoModelCacheDirectory = path;
+    }
+    if (root.contains(QStringLiteral("infernoThreads"))) {
+        const QJsonValue value = root.value(QStringLiteral("infernoThreads"));
+        const int threads = value.toInt(-1);
+        if (value.isDouble() && value.toDouble() == threads && threads >= 1 && threads <= 16)
+            preferences.infernoThreads = threads;
+        else warnings.append(QStringLiteral("本地模型线程数设置无效，已使用 4 个线程。"));
+    }
     if (root.contains("requestTimeoutMinutes")) {
         const auto value = root.value("requestTimeoutMinutes");
         const int minutes = value.toInt(-1);
@@ -268,6 +326,28 @@ AppPreferences AppSettings::load(QString *error) const {
 
 bool AppSettings::save(const AppPreferences &preferences, QString *error) const {
     if (error) error->clear();
+    // A newer application may have written settings since this panel opened.
+    // Refuse to replace an unknown schema instead of losing its fields.
+    QFile existing(m_filePath);
+    if (existing.exists()) {
+        if (!existing.open(QIODevice::ReadOnly) || existing.size() > maximumSettingsSize) {
+            if (error) *error = QStringLiteral("无法核对原应用设置，设置未保存。");
+            return false;
+        }
+        const QJsonDocument document = QJsonDocument::fromJson(existing.readAll());
+        if (document.isObject() && document.object().contains(QStringLiteral("schemaVersion"))
+                && (!document.object().value(QStringLiteral("schemaVersion")).isDouble()
+                    || document.object().value(QStringLiteral("schemaVersion")).toDouble() != 1)) {
+            if (error) *error = QStringLiteral("原应用设置版本不受支持，已保留原文件，设置未保存。");
+            return false;
+        }
+        existing.close();
+    }
+    const QString infernoError = validateInfernoSettings(preferences);
+    if (!infernoError.isEmpty()) {
+        if (error) *error = infernoError;
+        return false;
+    }
     if (preferences.requestTimeoutMinutes < 1 || preferences.requestTimeoutMinutes > 30) {
         if (error) *error = QStringLiteral("请求超时必须为一至三十分钟。");
         return false;
@@ -312,6 +392,9 @@ bool AppSettings::save(const AppPreferences &preferences, QString *error) const 
     root.insert(QStringLiteral("providerId"), preferences.providerId);
     root.insert(QStringLiteral("codexExecutable"), preferences.codexExecutable);
     root.insert(QStringLiteral("codexModel"), preferences.codexModel);
+    root.insert(QStringLiteral("infernoRuntimeDirectory"), QDir::cleanPath(QDir::fromNativeSeparators(preferences.infernoRuntimeDirectory.trimmed())));
+    root.insert(QStringLiteral("infernoModelCacheDirectory"), QDir::cleanPath(QDir::fromNativeSeparators(preferences.infernoModelCacheDirectory.trimmed())));
+    root.insert(QStringLiteral("infernoThreads"), preferences.infernoThreads);
     root.insert("requestTimeoutMinutes", preferences.requestTimeoutMinutes);
     root.insert("diagnosticLogEnabled", preferences.diagnosticLogEnabled);
     root.insert(QStringLiteral("networkProxy"), QJsonObject{

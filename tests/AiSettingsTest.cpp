@@ -5,6 +5,7 @@
 #endif
 
 #include <QFile>
+#include <QDir>
 #include <QElapsedTimer>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -107,6 +108,11 @@ private slots:
     void oversizedResponseIsRejected();
     void destroyingClientCancelsPendingRequest();
     void outputLimitsRoundTripAndValidate();
+    void infernoSettingsRoundTripAndBackwardCompatibility();
+    void invalidInfernoSettings_data();
+    void invalidInfernoSettings();
+    void invalidStoredInfernoSettingsUseDefaults();
+    void unknownSettingsVersionCannotBeOverwritten();
 };
 
 void AiSettingsTest::missingSettingsUseProviderDefaults() {
@@ -120,6 +126,9 @@ void AiSettingsTest::missingSettingsUseProviderDefaults() {
     QCOMPARE(preferences.providerId, QStringLiteral("deepseek"));
     QCOMPARE(preferences.aiConnection, QStringLiteral("api"));
     QCOMPARE(preferences.networkProxy.mode, QStringLiteral("system"));
+    QCOMPARE(preferences.infernoRuntimeDirectory, QStringLiteral("E:/lmsc-infernosaber-runtime"));
+    QCOMPARE(preferences.infernoModelCacheDirectory, QStringLiteral("E:/lmsc-infernosaber-runtime/models"));
+    QCOMPARE(preferences.infernoThreads, 4);
     QVERIFY(preferences.networkProxy.host.isEmpty());
     QVERIFY(preferences.providers.contains(QStringLiteral("mimo")));
     QCOMPARE(preferences.providers.value(QStringLiteral("kimi")).baseUrl,
@@ -598,5 +607,115 @@ void AiSettingsTest::outputLimitsRoundTripAndValidate() {
     QVERIFY(writeFile(settings.filePath(),QJsonDocument(root).toJson())); QCOMPARE(settings.load(&error).providers["deepseek"].maxOutputTokens,0);
     QVERIFY(!error.isEmpty());
 }
+void AiSettingsTest::infernoSettingsRoundTripAndBackwardCompatibility() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    lmsc::AppSettings settings(directory.filePath(QStringLiteral("preferences.json")));
+    auto preferences = settings.load();
+    preferences.infernoRuntimeDirectory = directory.filePath(QStringLiteral("future-runtime"));
+    preferences.infernoModelCacheDirectory = directory.filePath(QStringLiteral("future-models"));
+    preferences.infernoThreads = 16;
+    preferences.providers[QStringLiteral("deepseek")].model = QStringLiteral("keep-cloud-model");
+    preferences.codexModel = QStringLiteral("keep-account-model");
+    preferences.networkProxy.mode = QStringLiteral("direct");
+    QString error;
+    QVERIFY2(settings.save(preferences, &error), qPrintable(error));
+    QVERIFY(!QFile::exists(preferences.infernoRuntimeDirectory));
+    QVERIFY(!QFile::exists(preferences.infernoModelCacheDirectory));
+    auto loaded = settings.load(&error);
+    QVERIFY2(error.isEmpty(), qPrintable(error));
+    QCOMPARE(loaded.infernoRuntimeDirectory, preferences.infernoRuntimeDirectory);
+    QCOMPARE(loaded.infernoModelCacheDirectory, preferences.infernoModelCacheDirectory);
+    QCOMPARE(loaded.infernoThreads, 16);
+    QCOMPARE(loaded.providers[QStringLiteral("deepseek")].model, QStringLiteral("keep-cloud-model"));
+    QCOMPARE(loaded.codexModel, QStringLiteral("keep-account-model"));
+    QCOMPARE(loaded.networkProxy.mode, QStringLiteral("direct"));
+    QJsonObject root = QJsonDocument::fromJson(readFile(settings.filePath())).object();
+    QCOMPARE(root.value(QStringLiteral("schemaVersion")).toInt(), 1);
+    root.remove(QStringLiteral("infernoRuntimeDirectory"));
+    root.remove(QStringLiteral("infernoModelCacheDirectory"));
+    root.remove(QStringLiteral("infernoThreads"));
+    QVERIFY(writeFile(settings.filePath(), QJsonDocument(root).toJson()));
+    loaded = settings.load(&error);
+    QVERIFY2(error.isEmpty(), qPrintable(error));
+    QCOMPARE(loaded.infernoRuntimeDirectory, QStringLiteral("E:/lmsc-infernosaber-runtime"));
+    QCOMPARE(loaded.infernoModelCacheDirectory, QStringLiteral("E:/lmsc-infernosaber-runtime/models"));
+    QCOMPARE(loaded.infernoThreads, 4);
+    QCOMPARE(loaded.providers[QStringLiteral("deepseek")].model, QStringLiteral("keep-cloud-model"));
+}
+
+void AiSettingsTest::invalidInfernoSettings_data() {
+    QTest::addColumn<QString>("runtimePath");
+    QTest::addColumn<QString>("modelPath");
+    QTest::addColumn<int>("threads");
+    QTest::newRow("relative-runtime") << QStringLiteral("relative/runtime") << QString() << 4;
+    QTest::newRow("relative-models") << QString() << QStringLiteral("relative/models") << 4;
+    QTest::newRow("empty-runtime") << QStringLiteral(" ") << QString() << 4;
+    QTest::newRow("root") << QDir::rootPath() << QString() << 4;
+    QTest::newRow("traversal") << QStringLiteral("E:/runtime/../outside") << QString() << 4;
+    QTest::newRow("control") << QStringLiteral("E:/runtime\nsub") << QString() << 4;
+    QTest::newRow("device-name") << QStringLiteral("E:/CON/model") << QString() << 4;
+    QTest::newRow("device-path") << QStringLiteral("\\\\?\\E:\\runtime") << QString() << 4;
+    QTest::newRow("invalid-character") << QStringLiteral("E:/runtime|other") << QString() << 4;
+    QTest::newRow("alternate-stream") << QStringLiteral("E:/runtime:stream") << QString() << 4;
+    QTest::newRow("zero-threads") << QString() << QString() << 0;
+    QTest::newRow("too-many-threads") << QString() << QString() << 17;
+}
+
+void AiSettingsTest::invalidInfernoSettings() {
+    QFETCH(QString, runtimePath);
+    QFETCH(QString, modelPath);
+    QFETCH(int, threads);
+    QTemporaryDir directory;
+    lmsc::AppSettings settings(directory.filePath(QStringLiteral("preferences.json")));
+    auto preferences = settings.load();
+    QString error;
+    QVERIFY2(settings.save(preferences, &error), qPrintable(error));
+    const QByteArray original = readFile(settings.filePath());
+    if (!runtimePath.isEmpty()) preferences.infernoRuntimeDirectory = runtimePath;
+    if (!modelPath.isEmpty()) preferences.infernoModelCacheDirectory = modelPath;
+    preferences.infernoThreads = threads;
+    QVERIFY(!lmsc::AppSettings::validateInfernoSettings(preferences).isEmpty());
+    QVERIFY(!settings.save(preferences, &error));
+    QVERIFY(error.contains(QStringLiteral("本地模型")));
+    QCOMPARE(readFile(settings.filePath()), original);
+}
+
+void AiSettingsTest::invalidStoredInfernoSettingsUseDefaults() {
+    QTemporaryDir directory;
+    lmsc::AppSettings settings(directory.filePath(QStringLiteral("preferences.json")));
+    auto preferences = settings.load();
+    preferences.providers[QStringLiteral("deepseek")].model = QStringLiteral("retained-model");
+    QString error;
+    QVERIFY2(settings.save(preferences, &error), qPrintable(error));
+    QJsonObject root = QJsonDocument::fromJson(readFile(settings.filePath())).object();
+    root.insert(QStringLiteral("infernoRuntimeDirectory"), QStringLiteral("E:/"));
+    root.insert(QStringLiteral("infernoModelCacheDirectory"), QJsonObject{});
+    root.insert(QStringLiteral("infernoThreads"), 4.5);
+    QVERIFY(writeFile(settings.filePath(), QJsonDocument(root).toJson()));
+    const auto loaded = settings.load(&error);
+    QVERIFY(error.contains(QStringLiteral("本地模型")));
+    QCOMPARE(loaded.infernoRuntimeDirectory, QStringLiteral("E:/lmsc-infernosaber-runtime"));
+    QCOMPARE(loaded.infernoModelCacheDirectory, QStringLiteral("E:/lmsc-infernosaber-runtime/models"));
+    QCOMPARE(loaded.infernoThreads, 4);
+    QCOMPARE(loaded.providers[QStringLiteral("deepseek")].model, QStringLiteral("retained-model"));
+    preferences.infernoRuntimeDirectory = settings.filePath();
+    QVERIFY(!settings.save(preferences, &error));
+}
+
+void AiSettingsTest::unknownSettingsVersionCannotBeOverwritten() {
+    QTemporaryDir directory;
+    lmsc::AppSettings settings(directory.filePath(QStringLiteral("preferences.json")));
+    const auto preferences = settings.load();
+    const QByteArray unknown = "{\"schemaVersion\":2,\"futureModelSettings\":{\"keep\":true}}";
+    QVERIFY(writeFile(settings.filePath(), unknown));
+    QString error;
+    settings.load(&error);
+    QVERIFY(error.contains(QStringLiteral("版本")));
+    QVERIFY(!settings.save(preferences, &error));
+    QVERIFY(error.contains(QStringLiteral("版本")));
+    QCOMPARE(readFile(settings.filePath()), unknown);
+}
+
 QTEST_GUILESS_MAIN(AiSettingsTest)
 #include "AiSettingsTest.moc"

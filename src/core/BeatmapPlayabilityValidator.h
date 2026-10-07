@@ -21,6 +21,8 @@ public:
                                  QVector<BeatObject> *objects, QStringList *errors);
     static bool validateObjects(const QVector<BeatObject> &objects, const GenerationRequest &request,
                                 const MusicAnalysis &analysis, QStringList *errors);
+    static bool validateLearnedObjects(const QVector<BeatObject> &objects, const GenerationRequest &request,
+                                       const MusicAnalysis &analysis, QStringList *errors);
     static GenerationMetrics metrics(const QVector<BeatObject> &objects,
                                      const TimeMap &timeMap, double activeSeconds);
     static QJsonObject handContext(const QVector<BeatObject> &objects, const TimeMap &timeMap,
