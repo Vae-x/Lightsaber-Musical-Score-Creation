@@ -12,6 +12,9 @@
 class QAudioOutput;
 class QThread;
 class PcmPlaybackDevice;
+#ifdef Q_OS_ANDROID
+namespace lmsc { struct NativeAudioControl; }
+#endif
 
 struct AudioTrack {
     int index = 0;
@@ -29,7 +32,8 @@ struct MediaInfo {
 };
 Q_DECLARE_METATYPE(MediaInfo)
 
-// FFmpeg is an external bundled tool; the application never changes system PATH.
+// FFmpeg is bundled: desktop tools or Android native libraries. The application
+// never changes system PATH.
 // All positions use seconds in the original (already cropped) song timeline.
 class AudioService : public QObject {
     Q_OBJECT
@@ -100,6 +104,10 @@ private:
     QProcess m_process;
     QTimer m_timer;
     QThread *m_waveThread = nullptr;
+#ifdef Q_OS_ANDROID
+    QThread *m_nativeThread = nullptr;
+    std::shared_ptr<lmsc::NativeAudioControl> m_nativeControl;
+#endif
     Task m_task = Task::None;
     QByteArray m_stdout;
     QByteArray m_stderr;

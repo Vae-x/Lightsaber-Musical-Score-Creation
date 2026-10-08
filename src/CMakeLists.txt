@@ -17,9 +17,19 @@ set(CMAKE_AUTOUIC ON)
 if (WIN32 AND MINGW)
     get_filename_component(LMSC_MINGW_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
 endif ()
+if (ANDROID)
+    set(ANDROID_PACKAGE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../android")
+    set(ANDROID_MIN_SDK_VERSION "24" CACHE STRING "Android minimum SDK")
+    set(ANDROID_TARGET_SDK_VERSION "34" CACHE STRING "Android target SDK")
+endif ()
 find_package(Qt5 5.12 REQUIRED COMPONENTS Core Widgets Multimedia Concurrent Network)
+if (ANDROID)
+    find_package(Qt5 5.15 REQUIRED COMPONENTS AndroidExtras Svg)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif ()
 
 add_library(lmsc_core STATIC
+        core/WorkerThread.h
         core/AppInfo.h
         core/DiagnosticLog.cpp core/DiagnosticLog.h core/AiDiagnostics.h
         core/BeatmapDocument.cpp
@@ -57,16 +67,24 @@ add_library(lmsc_core STATIC
         core/MtpDeleteService.cpp core/MtpDeleteService.h)
 target_include_directories(lmsc_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(lmsc_core PUBLIC Qt5::Core Qt5::Multimedia Qt5::Network Qt5::Concurrent)
+if (ANDROID)
+    target_sources(lmsc_core PRIVATE
+            core/AndroidStorage.cpp core/AndroidStorage.h
+            core/NativeAudioTool.cpp core/NativeAudioTool.h)
+    target_link_libraries(lmsc_core PUBLIC Qt5::AndroidExtras)
+endif ()
 if (WIN32)
     target_link_libraries(lmsc_core PRIVATE crypt32 winhttp)
 endif ()
 
 # A console-only, local comparison harness; it never opens or writes a GUI project.
-add_executable(lmsc_generation_trial app/GenerationTrial.cpp)
-target_link_libraries(lmsc_generation_trial PRIVATE lmsc_core)
-set_target_properties(lmsc_generation_trial PROPERTIES OUTPUT_NAME "lmsc-generation-trial")
+if (NOT ANDROID)
+    add_executable(lmsc_generation_trial app/GenerationTrial.cpp)
+    target_link_libraries(lmsc_generation_trial PRIVATE lmsc_core)
+    set_target_properties(lmsc_generation_trial PROPERTIES OUTPUT_NAME "lmsc-generation-trial")
+endif ()
 
-add_executable(src WIN32
+set(LMSC_APP_SOURCES
         app/main.cpp
         gui/MainWindow.cpp
         gui/MainWindowAi.cpp
@@ -85,6 +103,13 @@ add_executable(src WIN32
         gui/NavigationSidebar.cpp gui/NavigationSidebar.h
         gui/ThemeManager.cpp gui/ThemeManager.h
         ../resources/app.qrc)
+if (ANDROID)
+    add_library(src SHARED ${LMSC_APP_SOURCES})
+    # Qt5's Android CMake integration appends the ABI to the library suffix.
+    set_target_properties(src PROPERTIES OUTPUT_NAME "LightsaberMusicalScoreCreation")
+else ()
+    add_executable(src WIN32 ${LMSC_APP_SOURCES})
+endif ()
 if (WIN32)
     if (MINGW)
         # MinGW 7 的 windres 会错误转义带空格的 -I 路径。此资源仅依赖系统头，独立编译无需继承 Qt 包含路径。
@@ -109,6 +134,22 @@ target_link_libraries(src
         Qt5::Widgets
         Qt5::Concurrent
 )
+if (ANDROID)
+    target_link_libraries(src Qt5::Svg)
+endif ()
+
+option(LMSC_ANDROID_PLATFORM_TESTS "Build the synthetic Android platform test APK library" OFF)
+if (ANDROID AND LMSC_ANDROID_PLATFORM_TESTS)
+    find_package(Qt5 5.15 REQUIRED COMPONENTS Test)
+    add_library(lmsc_android_platform_tests SHARED
+            ../tests/AndroidPlatformTestMain.cpp
+            ../tests/AndroidAudioTest.cpp
+            ../tests/AndroidStorageTest.cpp)
+    target_link_libraries(lmsc_android_platform_tests PRIVATE lmsc_core Qt5::Widgets Qt5::Test)
+    target_compile_definitions(lmsc_android_platform_tests PRIVATE LMSC_ANDROID_PLATFORM_TESTS)
+    set_target_properties(lmsc_android_platform_tests PROPERTIES
+            OUTPUT_NAME "LightsaberMusicalScoreCreationPlatformTests")
+endif ()
 
 get_filename_component(LMSC_REPOSITORY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 set_property(TARGET src APPEND PROPERTY LINK_DEPENDS "${LMSC_REPOSITORY_DIR}/scripts/infernosaber_trial.py")

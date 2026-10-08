@@ -1,4 +1,7 @@
 #include "AppSettings.h"
+#ifdef Q_OS_ANDROID
+#include "AndroidStorage.h"
+#endif
 
 #include <QDir>
 #include <QFile>
@@ -27,6 +30,11 @@ constexpr qint64 maximumSettingsSize = 4 * 1024 * 1024;
 
 AppPreferences defaults() {
     AppPreferences preferences;
+#ifdef Q_OS_ANDROID
+    const QString data = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    preferences.infernoRuntimeDirectory = QDir(data).filePath(QStringLiteral("infernosaber"));
+    preferences.infernoModelCacheDirectory = QDir(data).filePath(QStringLiteral("infernosaber/models"));
+#endif
     for (const auto &preset : AppSettings::providerPresets()) {
         AiProviderConfig config;
         config.baseUrl = preset.baseUrl;
@@ -35,10 +43,30 @@ AppPreferences defaults() {
     return preferences;
 }
 
+QString keyProtectionScheme() {
+#ifdef Q_OS_ANDROID
+    return QStringLiteral("android-keystore-aes-gcm-v1");
+#else
+    return QStringLiteral("dpapi-user");
+#endif
+}
+
+QString keyProtectionFailure(bool saving) {
+#ifdef Q_OS_ANDROID
+    return saving ? QStringLiteral("无法使用 Android Keystore 保护 API Key，设置未保存。")
+                  : QStringLiteral("有 API Key 无法解密，请在当前安卓设备重新填写。");
+#else
+    return saving ? QStringLiteral("无法使用 Windows 账户保护 API Key，设置未保存。")
+                  : QStringLiteral("有 API Key 无法解密，请在当前 Windows 账户下重新填写。");
+#endif
+}
+
 bool protectKey(const QString &key, QString *protectedKey) {
     protectedKey->clear();
     if (key.isEmpty()) return true;
-#ifdef Q_OS_WIN
+#ifdef Q_OS_ANDROID
+    return AndroidStorage::protectKey(key, protectedKey);
+#elif defined(Q_OS_WIN)
     QByteArray bytes = key.toUtf8();
     DATA_BLOB input = {static_cast<DWORD>(bytes.size()),
                        reinterpret_cast<BYTE *>(bytes.data())};
@@ -70,7 +98,9 @@ bool unprotectKey(const QString &protectedKey, QString *key) {
     if (!base64.match(protectedKey).hasMatch() || encoded.size() % 4 != 0) return false;
     QByteArray bytes = QByteArray::fromBase64(encoded);
     if (bytes.isEmpty() || bytes.toBase64() != encoded) return false;
-#ifdef Q_OS_WIN
+#ifdef Q_OS_ANDROID
+    return AndroidStorage::unprotectKey(protectedKey, key);
+#elif defined(Q_OS_WIN)
     DATA_BLOB input = {static_cast<DWORD>(bytes.size()),
                        reinterpret_cast<BYTE *>(bytes.data())};
     DATA_BLOB output = {};
@@ -240,7 +270,11 @@ AppPreferences AppSettings::load(QString *error) const {
         if (!root.contains(key)) continue;
         const QJsonValue value = root.value(key);
         if (!value.isString() || !safeLocalDirectory(value.toString())) {
+#ifdef Q_OS_ANDROID
+            warnings.append(QStringLiteral("本地模型目录设置无效，已使用应用默认目录。"));
+#else
             warnings.append(QStringLiteral("本地模型目录设置无效，已使用 E 盘默认目录。"));
+#endif
             continue;
         }
         const QString path = QDir::cleanPath(QDir::fromNativeSeparators(value.toString().trimmed()));
@@ -302,9 +336,9 @@ AppPreferences AppSettings::load(QString *error) const {
             const QJsonValue keyValue = json.value(QStringLiteral("apiKeyProtected"));
             const QString scheme = json.value(QStringLiteral("keyProtection")).toString();
             if ((!keyValue.isUndefined() && !keyValue.isString())
-                    || (!keyValue.toString().isEmpty() && scheme != QStringLiteral("dpapi-user"))
+                    || (!keyValue.toString().isEmpty() && scheme != keyProtectionScheme())
                     || !unprotectKey(keyValue.toString(), &config.apiKey)) {
-                warnings.append(QStringLiteral("有 API Key 无法解密，请在当前 Windows 账户下重新填写。"));
+                warnings.append(keyProtectionFailure(false));
             }
             for (const auto &model : json.value(QStringLiteral("models")).toArray()) {
                 if (model.isString() && !model.toString().trimmed().isEmpty())
@@ -373,7 +407,7 @@ bool AppSettings::save(const AppPreferences &preferences, QString *error) const 
         }
         QString protectedKey;
         if (!protectKey(it.value().apiKey, &protectedKey)) {
-            if (error) *error = QStringLiteral("无法使用 Windows 账户保护 API Key，设置未保存。");
+            if (error) *error = keyProtectionFailure(true);
             return false;
         }
         QJsonObject config;
@@ -381,7 +415,7 @@ bool AppSettings::save(const AppPreferences &preferences, QString *error) const 
         config.insert(QStringLiteral("model"), it.value().model);
         config.insert(QStringLiteral("models"), QJsonArray::fromStringList(it.value().models));
         config.insert("maxOutputTokens", it.value().maxOutputTokens);
-        config.insert(QStringLiteral("keyProtection"), QStringLiteral("dpapi-user"));
+        config.insert(QStringLiteral("keyProtection"), keyProtectionScheme());
         config.insert(QStringLiteral("apiKeyProtected"), protectedKey);
         providers.insert(it.key(), config);
     }

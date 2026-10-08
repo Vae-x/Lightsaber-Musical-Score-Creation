@@ -45,7 +45,7 @@ struct AppPreferences {
 };
 
 // Application-wide preferences are separate from songs and project documents.
-// API keys are protected for the current Windows user with DPAPI.
+// API keys use Windows DPAPI or the Android device's Keystore; never plaintext.
 class AppSettings {
 public:
     explicit AppSettings(const QString &filePath = {});

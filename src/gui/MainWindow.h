@@ -35,6 +35,9 @@ class QAction;
 class QStackedWidget;
 class QToolBar;
 class QTabWidget;
+class QVBoxLayout;
+class QSplitter;
+class QScrollArea;
 namespace lmsc {
 class NavigationSidebar;
 class SettingsPanel;
@@ -86,6 +89,11 @@ protected:
     void closeEvent(QCloseEvent *event) override;
 private:
     void buildEditor();
+    void openProjectDialog();
+#ifdef Q_OS_ANDROID
+    void buildMobileEditor(QVBoxLayout *layout, QSplitter *split, QScrollArea *files, QWidget *placement);
+    void shareProject();
+#endif
     void buildWorkspace();
     void selectWorkspacePage(int row);
     void refreshRecognitionContext();
@@ -159,6 +167,7 @@ private:
     lmsc::EditorSessionController *m_editorSession = nullptr;
     lmsc::EditorRefinementPanel *m_refinementPanel = nullptr;
     QTabWidget *m_toolsTabs = nullptr;
+    QTabWidget *m_mobileEditorTabs = nullptr;
     QWidget *m_generationTools = nullptr;
     QWidget *m_draftReplacement = nullptr;
     QLabel *m_draftReplacementLabel = nullptr;
@@ -212,6 +221,7 @@ private:
     bool m_queuedAudio = false;
     bool m_storageBusy = false, m_mediaFlow = false;
     bool m_mtpImportPending = false;
+    bool m_importedProjectPending = false;
     quint64 m_audioGeneration = 0;
     quint64 m_analysisGeneration = 0;
     QMetaObject::Connection m_rhythmConnection;

@@ -63,6 +63,7 @@ void MainWindow::editingChanged() {
 void MainWindow::showGenerationTools() {
     m_workspacePages->setCurrentWidget(m_editorPage);
     m_toolsTabs->setCurrentWidget(m_generationTools);
+    if (m_mobileEditorTabs) m_mobileEditorTabs->setCurrentIndex(4);
     m_aiPage->setExpanded(true);
     refreshRecognitionContext();
     refreshDraftPanel();

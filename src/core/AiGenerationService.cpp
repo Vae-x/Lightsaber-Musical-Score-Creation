@@ -1,3 +1,4 @@
+#include "WorkerThread.h"
 #include "AiGenerationService.h"
 #include "AiTextTransport.h"
 #include "BeatmapPlayabilityValidator.h"
@@ -533,7 +534,7 @@ struct LlmAiGenerationService::Impl {
         const quint64 epoch=generation;
         const auto result=std::make_shared<WorkerResult>();
         const auto snapshot=request;
-        QThread *thread=QThread::create([snapshot,result] {
+        QThread *thread=lmsc::createWorkerThread([snapshot,result] {
             result->success=MusicFeatureAnalyzer::analyze(snapshot, &result->analysis, &result->error,
                 [] { return QThread::currentThread()->isInterruptionRequested(); },
                 [result](int percent) { result->percent.store(percent); });

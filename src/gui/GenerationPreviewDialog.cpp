@@ -13,6 +13,7 @@
 #include <QProgressBar>
 #include <QScrollArea>
 #include <QSplitter>
+#include <QTabWidget>
 #include <QVBoxLayout>
 #include <QVariant>
 #include <QSignalBlocker>
@@ -29,6 +30,9 @@ GenerationPreviewDialog::GenerationPreviewDialog(const GenerationDraft &draft, i
     setWindowModality(Qt::WindowModal);
     setAttribute(Qt::WA_DeleteOnClose);
     resize(1080, 820);
+#ifdef Q_OS_ANDROID
+    if (parent) resize(parent->size());
+#endif
     QSet<QString> ids;
     for (const auto &object : m_draft.objects) if (!object.id.isEmpty()) ids.insert(object.id);
     int nextId = 0;
@@ -102,7 +106,11 @@ GenerationPreviewDialog::GenerationPreviewDialog(const GenerationDraft &draft, i
     auto explanation = new QLabel(tr("每次精修最多 5 个重点乐句，优先检查重复主题、段落衔接和动作过紧的位置；初稿始终保留，可比较和恢复。"), m_refinementPanel);
     explanation->setWordWrap(true);
     refinementLayout->addWidget(explanation);
+#ifdef Q_OS_ANDROID
+    auto range = new QVBoxLayout;
+#else
     auto range = new QHBoxLayout;
+#endif
     m_selectedOnly = new QCheckBox(tr("仅精修选段"), m_refinementPanel);
     m_selectedOnly->setObjectName(QStringLiteral("refinementSelectedOnly"));
     range->addWidget(m_selectedOnly);
@@ -116,9 +124,17 @@ GenerationPreviewDialog::GenerationPreviewDialog(const GenerationDraft &draft, i
     }
     m_rangeEnd->setValue(draft.source.audio.durationSeconds);
     range->addWidget(m_rangeStart); range->addWidget(new QLabel(tr("至"), m_refinementPanel)); range->addWidget(m_rangeEnd);
+#ifdef Q_OS_ANDROID
+    range->addWidget(new QLabel(tr("时间轴使用“循环”工具拖动也可选段"), m_refinementPanel));
+#else
     range->addWidget(new QLabel(tr("Shift 拖动时间轴也可选段"), m_refinementPanel));
+#endif
     range->addStretch(); refinementLayout->addLayout(range);
+#ifdef Q_OS_ANDROID
+    auto refinementActions = new QVBoxLayout;
+#else
     auto refinementActions = new QHBoxLayout;
+#endif
     m_refine = new QPushButton(tr("AI 精修重点片段"), m_refinementPanel);
     m_refine->setObjectName(QStringLiteral("generationRefineButton"));
     m_resumeRefinement = new QPushButton(tr("继续精修"), m_refinementPanel);
@@ -150,8 +166,13 @@ GenerationPreviewDialog::GenerationPreviewDialog(const GenerationDraft &draft, i
     m_timeline->setObjectName(QStringLiteral("generationPreviewTimeline"));
     m_timeline->setReadOnly(true);
     // Preview panes can shrink without changing the full editor's minimums.
+#ifdef Q_OS_ANDROID
+    m_track->setMinimumSize(0, 100);
+    m_timeline->setMinimumSize(0, 100);
+#else
     m_track->setMinimumSize(300, 100);
     m_timeline->setMinimumHeight(140);
+#endif
     const auto time = draft.source.timeMap;
     const auto toSeconds = [time](double beat) { return time.beatToSeconds(beat); };
     const auto toBeat = [time](double seconds) { return time.secondsToBeat(seconds); };
@@ -161,18 +182,38 @@ GenerationPreviewDialog::GenerationPreviewDialog(const GenerationDraft &draft, i
     m_timeline->setObjects(objects);
     m_timeline->setDuration(draft.source.audio.durationSeconds);
     if (audio) m_timeline->setWaveform(audio->waveform(), draft.source.audio.durationSeconds);
+#ifdef Q_OS_ANDROID
+    auto split = new QTabWidget(this);
+    split->addTab(m_track, tr("预览"));
+    auto timelinePage = new QWidget;
+    auto timelineLayout = new QVBoxLayout(timelinePage);
+    auto tools = new QHBoxLayout;
+    auto mode = new QComboBox(timelinePage);
+    mode->addItems({tr("定位"), tr("平移"), tr("循环")});
+    auto zoomIn = new QPushButton(tr("放大"), timelinePage);
+    auto zoomOut = new QPushButton(tr("缩小"), timelinePage);
+    tools->addWidget(mode, 1); tools->addWidget(zoomIn); tools->addWidget(zoomOut);
+    timelineLayout->addLayout(tools); timelineLayout->addWidget(m_timeline, 1);
+    split->addTab(timelinePage, tr("时间轴"));
+    connect(mode, QOverload<int>::of(&QComboBox::currentIndexChanged), m_timeline, [this](int index) { m_timeline->setInteractionMode(index); });
+    connect(zoomIn, &QPushButton::clicked, m_timeline, [this] { m_timeline->zoomBy(1.4); });
+    connect(zoomOut, &QPushButton::clicked, m_timeline, [this] { m_timeline->zoomBy(1.0 / 1.4); });
+#else
     auto split = new QSplitter(Qt::Vertical, this);
     split->addWidget(m_track);
     split->addWidget(m_timeline);
     split->setStretchFactor(0, 2);
     split->setStretchFactor(1, 1);
+#endif
     layout->addWidget(split, 1);
     auto transport = new QHBoxLayout;
     m_play->setObjectName(QStringLiteral("generationPreviewPlay"));
     m_play->setText(audio && audio->isPlaying() ? tr("暂停") : tr("试听"));
     m_play->setEnabled(audio && audio->isReady());
     transport->addWidget(m_play);
+#ifndef Q_OS_ANDROID
     transport->addWidget(new QLabel(tr("点击时间轴跳转 · 滚轮缩放 · 中键拖动平移"), this));
+#endif
     transport->addStretch();
     layout->addLayout(transport);
     if (audio) {
@@ -223,6 +264,9 @@ GenerationPreviewDialog::GenerationPreviewDialog(const GenerationDraft &draft, i
         displayDraft(); refreshRefinementControls();
     });
     auto buttons = new QDialogButtonBox(QDialogButtonBox::Cancel, this);
+#ifdef Q_OS_ANDROID
+    buttons->setOrientation(Qt::Vertical);
+#endif
     buttons->button(QDialogButtonBox::Cancel)->setText(tr("取消"));
     buttons->button(QDialogButtonBox::Cancel)->setObjectName(QStringLiteral("generationPreviewCancel"));
     auto apply = buttons->addButton(tr("应用候选谱"), QDialogButtonBox::AcceptRole);

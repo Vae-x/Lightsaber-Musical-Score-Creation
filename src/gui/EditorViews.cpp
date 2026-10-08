@@ -448,16 +448,18 @@ void TimelineView::resizeEvent(QResizeEvent *) {
 }
 void TimelineView::mousePressEvent(QMouseEvent *event) {
     setFocus();
+    m_touchToggleId.clear();
     if (!contentRect().contains(event->localPos()))
         return;
     m_press = m_current = event->localPos();
     m_pressSelection = m_selected;
-    m_additive = event->modifiers().testFlag(Qt::ControlModifier);
-    if (event->button() == Qt::RightButton || event->button() == Qt::MiddleButton) {
+    m_additive = m_touchAdditive || event->modifiers().testFlag(Qt::ControlModifier);
+    if (event->button() == Qt::RightButton || event->button() == Qt::MiddleButton
+        || (event->button() == Qt::LeftButton && m_interactionMode == 1)) {
         m_drag = Pan;
         m_pressScroll = m_scroll->value();
         setCursor(Qt::ClosedHandCursor);
-    } else if (event->button() == Qt::LeftButton && event->modifiers().testFlag(Qt::ShiftModifier)) {
+    } else if (event->button() == Qt::LeftButton && (m_interactionMode == 2 || event->modifiers().testFlag(Qt::ShiftModifier))) {
         m_drag = MakeLoop;
     } else if (event->button() == Qt::LeftButton) {
         const int index = tracksRect().contains(event->localPos()) ? objectAt(event->localPos()) : -1;
@@ -465,8 +467,11 @@ void TimelineView::mousePressEvent(QMouseEvent *event) {
             const EditorObject &object = m_index->objects[index];
             QSet<QString> selected = m_selected;
             if (m_additive) {
-                if (selected.contains(object.id))
-                    selected.remove(object.id);
+                if (selected.contains(object.id)) {
+                    // A drag retains the complete touch selection; a tap toggles it.
+                    if (m_touchAdditive && !m_readOnly && !event->modifiers().testFlag(Qt::ControlModifier)) m_touchToggleId = object.id;
+                    else selected.remove(object.id);
+                }
                 else
                     selected.insert(object.id);
             } else if (!selected.contains(object.id)) {
@@ -532,6 +537,8 @@ void TimelineView::mouseReleaseEvent(QMouseEvent *event) {
             setLoop(first, last);
             emit loopChanged(first, last);
         }
+    } else if (m_drag == MoveObjects && !moved && !m_touchToggleId.isEmpty()) {
+        auto selected = m_selected; selected.remove(m_touchToggleId); changeSelection(selected);
     } else if (m_drag == MoveObjects && moved &&
                (std::abs(m_dragBeatDelta) > 1e-8 || m_dragLaneDelta != 0)) {
         // The document validates the complete transaction, including protected
@@ -540,6 +547,7 @@ void TimelineView::mouseReleaseEvent(QMouseEvent *event) {
             emit objectsMoveRequested(m_selected, m_dragBeatDelta, m_dragLaneDelta, 0);
     }
     m_drag = Idle;
+    m_touchToggleId.clear();
     unsetCursor();
     update();
 }
@@ -561,6 +569,15 @@ void TimelineView::wheelEvent(QWheelEvent *event) {
         m_scroll->setValue(static_cast<int>(std::max(0.0, anchor - (anchorX - contentRect().left()) / m_pixelsPerSecond) * 1000));
     }
     event->accept();
+    update();
+}
+void TimelineView::zoomBy(double factor) {
+    if (!std::isfinite(factor) || factor <= 0) return;
+    const double anchorX = (contentRect().left() + contentRect().right()) / 2;
+    const double anchor = timeAtX(anchorX);
+    m_pixelsPerSecond = std::clamp(m_pixelsPerSecond * factor, 4.0, 1800.0);
+    updateScrollRange();
+    m_scroll->setValue(static_cast<int>(std::max(0.0, anchor - (anchorX - contentRect().left()) / m_pixelsPerSecond) * 1000));
     update();
 }
 void TimelineView::keyPressEvent(QKeyEvent *event) {
@@ -645,7 +662,7 @@ void GridEditor::paintEvent(QPaintEvent *) {
             hoverOccupied = true;
         drawObject(painter, display, object, m_selected.contains(object.id));
     }
-    if (m_hover.x() >= 0 && !hoverOccupied) {
+    if (m_hover.x() >= 0 && !hoverOccupied && !m_selectionOnly) {
         EditorObject ghost;
         ghost.type = m_type;
         ghost.color = m_color;
@@ -657,9 +674,16 @@ void GridEditor::paintEvent(QPaintEvent *) {
         painter.drawRoundedRect(cellRect(m_hover.x(), m_hover.y()), 5, 5);
     }
     painter.setPen(muted());
+#ifdef Q_OS_ANDROID
+    painter.drawText(QRectF(8, height() - 32, width() - 16, 24), Qt::AlignCenter,
+                     m_selectionOnly ? QStringLiteral("选择模式 · 点击物件查看属性")
+                         : hoverOccupied ? QStringLiteral("此格已有物件 · 点击选择")
+                                         : QStringLiteral("点击空格放置 · 顶部为第 3 层"));
+#else
     painter.drawText(QRectF(8, height() - 32, width() - 16, 24), Qt::AlignCenter,
                      hoverOccupied ? QStringLiteral("此格已有物件 · 点击选择")
                                    : QStringLiteral("左键放置 · 右键选择 · 顶部为第 3 层"));
+#endif
 }
 void GridEditor::mousePressEvent(QMouseEvent *event) {
     setFocus();
@@ -680,10 +704,10 @@ void GridEditor::mousePressEvent(QMouseEvent *event) {
                 break;
             }
         }
-    if (event->button() == Qt::LeftButton && hit < 0) {
+    if (event->button() == Qt::LeftButton && hit < 0 && !m_selectionOnly) {
         emit addRequested(m_beat, m_hover.x(), m_hover.y());
-    } else if (event->button() == Qt::RightButton || (event->button() == Qt::LeftButton && hit >= 0)) {
-        QSet<QString> selected = event->modifiers().testFlag(Qt::ControlModifier) ? m_selected : QSet<QString>();
+    } else if (event->button() == Qt::RightButton || event->button() == Qt::LeftButton) {
+        QSet<QString> selected = (m_touchAdditive || event->modifiers().testFlag(Qt::ControlModifier)) ? m_selected : QSet<QString>();
         if (hit >= 0) {
             const EditorObject &object = m_index->objects[hit];
             if (selected.contains(object.id))
@@ -857,7 +881,7 @@ void TrackView::paintGL() {
 void TrackView::mousePressEvent(QMouseEvent *event) {
     if (event->button() != Qt::LeftButton)
         return;
-    QSet<QString> selection = event->modifiers().testFlag(Qt::ControlModifier) ? m_selected : QSet<QString>();
+    QSet<QString> selection = (m_touchAdditive || event->modifiers().testFlag(Qt::ControlModifier)) ? m_selected : QSet<QString>();
     for (int i = m_hits.size() - 1; i >= 0; --i) {
         if (m_hits[i].first.contains(event->localPos())) {
             const QString id = m_index->objects[m_hits[i].second].id;

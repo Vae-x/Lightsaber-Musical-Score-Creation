@@ -1,3 +1,4 @@
+#include "WorkerThread.h"
 #include "RhythmAnalyzer.h"
 
 #include <QFile>
@@ -21,7 +22,7 @@ void RhythmAnalyzer::analyze(const QString &pcmPath, int sampleRate, int channel
     }
     struct Result { RhythmEstimate estimate; QString error; bool cancelled = false; };
     const auto result = std::make_shared<Result>();
-    m_thread = QThread::create([pcmPath, sampleRate, channels, result] {
+    m_thread = lmsc::createWorkerThread([pcmPath, sampleRate, channels, result] {
         QFile pcm(pcmPath);
         if (!pcm.open(QIODevice::ReadOnly)) { result->error = QObject::tr("无法读取估拍所需的 PCM 音频。"); return; }
         // At most three minutes are analysed. Input stays on disk; only the 100Hz

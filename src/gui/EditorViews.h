@@ -45,6 +45,10 @@ public:
     void setLoop(double startSeconds, double endSeconds);
     void setFollowPlayhead(bool enabled);
     void setReadOnly(bool enabled);
+    // Explicit tools give touch users the same operations as modifier keys.
+    void setInteractionMode(int mode) { m_interactionMode = mode; } // 0 edit, 1 pan, 2 loop
+    void setAdditiveSelection(bool enabled) { m_touchAdditive = enabled; }
+    void zoomBy(double factor);
 
 signals:
     void seekRequested(double seconds);
@@ -98,11 +102,14 @@ private:
     bool m_follow = true;
     bool m_additive = false;
     bool m_readOnly = false;
+    int m_interactionMode = 0;
+    bool m_touchAdditive = false;
     DragMode m_drag = Idle;
     QPointF m_press;
     QPointF m_current;
     int m_pressScroll = 0;
     QSet<QString> m_pressSelection;
+    QString m_touchToggleId;
 };
 
 class GridEditor : public QWidget {
@@ -115,6 +122,8 @@ public:
     void setBeat(double beat);
     void setObjects(const QVector<EditorObject> &objects);
     void setSelectedIds(const QSet<QString> &ids);
+    void setSelectionOnly(bool enabled) { m_selectionOnly = enabled; }
+    void setAdditiveSelection(bool enabled) { m_touchAdditive = enabled; }
 
 signals:
     void addRequested(double beat, int x, int y);
@@ -138,6 +147,8 @@ private:
     int m_type = EditorObject::Note;
     int m_color = 0;
     int m_direction = 8;
+    bool m_selectionOnly = false;
+    bool m_touchAdditive = false;
 };
 
 class TrackView : public QOpenGLWidget {
@@ -152,6 +163,7 @@ public:
                         std::function<double(double)> secondsToBeat);
     void setPlayheadSeconds(double seconds);
     void setSelectedIds(const QSet<QString> &ids);
+    void setAdditiveSelection(bool enabled) { m_touchAdditive = enabled; }
 
 signals:
     void selectionChanged(QSet<QString> ids);
@@ -177,4 +189,5 @@ private:
     double m_offset = 0.0;
     double m_lookAhead = 6.0;
     double m_cameraScale = 1.0;
+    bool m_touchAdditive = false;
 };

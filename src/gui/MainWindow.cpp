@@ -17,6 +17,10 @@
 #include "core/MtpExportService.h"
 #include "core/WorkspacePaths.h"
 #include "core/SongExporter.h"
+#ifdef Q_OS_ANDROID
+#include "core/AndroidStorage.h"
+#include <QStandardPaths>
+#endif
 #include "core/AiTextTransport.h"
 #include "core/LocalAiGenerationService.h"
 #include "core/HybridAiGenerationService.h"
@@ -38,6 +42,7 @@
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QGroupBox>
+#include <QGridLayout>
 #include <QHBoxLayout>
 #include <QImage>
 #include <QIcon>
@@ -65,6 +70,7 @@
 #include <QTabWidget>
 #include <QTimer>
 #include <QToolBar>
+#include <QToolButton>
 #include <QUrl>
 #include <QUuid>
 #include <QVBoxLayout>
@@ -72,6 +78,24 @@
 #include <cmath>
 
 namespace {
+#ifdef Q_OS_ANDROID
+class AndroidSelectionGuard {
+public:
+    explicit AndroidSelectionGuard(QWidget *widget) : m_widget(widget), m_enabled(widget->isEnabled()) { widget->setEnabled(false); }
+    ~AndroidSelectionGuard() { if (m_widget) m_widget->setEnabled(m_enabled); }
+private:
+    QPointer<QWidget> m_widget;
+    bool m_enabled;
+};
+QString pickAndroidFile(QWidget *parent, const QStringList &mimeTypes, QString *error) {
+    AndroidSelectionGuard guard(parent);
+    return lmsc::AndroidStorage::pickInputFile(mimeTypes, error);
+}
+QString pickAndroidDirectory(QWidget *parent, bool import, QString *error) {
+    AndroidSelectionGuard guard(parent);
+    return import ? lmsc::AndroidStorage::pickSongDirectory(error) : lmsc::AndroidStorage::pickDirectory(error);
+}
+#endif
 QStringList directionNames() {
     return {QStringLiteral("↑ 上"), QStringLiteral("↓ 下"), QStringLiteral("← 左"),
             QStringLiteral("→ 右"), QStringLiteral("↖ 左上"), QStringLiteral("↗ 右上"),
@@ -132,6 +156,15 @@ public:
         return page ? page->minimumSizeHint().expandedTo(page->minimumSize()) : QSize();
     }
 };
+#ifdef Q_OS_ANDROID
+class MobileEditorTabs final : public QTabWidget {
+public:
+    explicit MobileEditorTabs(QWidget *parent) : QTabWidget(parent) {
+        if (auto tabLayout = layout()) tabLayout->setSizeConstraint(QLayout::SetNoConstraint);
+    }
+    QSize minimumSizeHint() const override { return QSize(200, 120); }
+};
+#endif
 }
 
 MainWindow::MainWindow(QWidget *parent, const QString &settingsFile)
@@ -142,7 +175,10 @@ MainWindow::MainWindow(QWidget *parent, const QString &settingsFile)
       m_mtpExport(new MtpExportService(this)),
       m_loader(new QFutureWatcher<DocumentLoadResult>(this)) {
     ui->setupUi(this);
-    const auto preferences = lmsc::AppSettings(m_settingsFile).load();
+    auto preferences = lmsc::AppSettings(m_settingsFile).load();
+#ifdef Q_OS_ANDROID
+    preferences.aiConnection = QStringLiteral("api");
+#endif
     m_generationPreferences = preferences;
     lmsc::DiagnosticLog::instance().setEnabled(preferences.diagnosticLogEnabled);
     lmsc::DiagnosticLog::instance().record("application.started");
@@ -164,8 +200,13 @@ MainWindow::MainWindow(QWidget *parent, const QString &settingsFile)
     setWindowIcon(QIcon(QStringLiteral(":/icons/app.png")));
     lmsc::WorkspacePaths::projectsDirectory();
     const QRect available = QGuiApplication::primaryScreen()->availableGeometry();
+#ifdef Q_OS_ANDROID
+    resize(available.size());
+    setMinimumSize(240, 240);
+#else
     resize(std::min(1440, available.width() - 40), std::min(900, available.height() - 60));
     setMinimumSize(std::min(1050, available.width() - 40), std::min(660, available.height() - 60));
+#endif
     buildEditor();
     buildActions();
     buildWorkspace();
@@ -201,11 +242,13 @@ MainWindow::MainWindow(QWidget *parent, const QString &settingsFile)
         setBusy(false);
         if (m_discardLoad) {
             m_discardLoad = false; m_creationLoad = false;
+            m_importedProjectPending = false;
             if (m_mediaFlow) { m_mediaFlow = false; restoreDocumentAudio(); }
             return;
         }
         if (!result.error.isEmpty()) {
             m_creationLoad = false;
+            m_importedProjectPending = false;
             if (m_mediaFlow) { m_mediaFlow = false; restoreDocumentAudio(); }
             emit loadFailed(result.error);
             showError(result.error);
@@ -215,6 +258,9 @@ MainWindow::MainWindow(QWidget *parent, const QString &settingsFile)
         m_creationLoad = false;
         if (created) { m_analyzeNew = true; m_mediaFlow = false; }
         replaceDocument(result.document);
+#ifdef Q_OS_ANDROID
+        if (m_importedProjectPending) { m_importedProjectPending = false; saveProject(true); }
+#endif
         if (created) {
             statusBar()->showMessage(tr("新歌已创建，正在估计节拍；保存工程后启用自动恢复"), 20000);
             if (!m_testMode) saveProject(true);
@@ -284,12 +330,12 @@ void MainWindow::buildEditor() {
     };
     button(tr("新歌 · MP3 / MP4"), [this] { newSong(); });
     button(tr("导入歌曲"), [this] { importSongFolder(); });
-    button(tr("打开编辑工程"), [this] {
-        if (m_busy || !confirmDocumentChange()) return;
-        const QString path = QFileDialog::getOpenFileName(this, tr("打开编辑工程"),
-            lmsc::WorkspacePaths::projectsDirectory(), tr("编辑工程 (*.lmsc)"));
-        if (!path.isEmpty()) openPath(path);
-    });
+    button(tr("打开编辑工程"), [this] { openProjectDialog(); });
+#ifdef Q_OS_ANDROID
+    button(tr("分享完整工程"), [this] { shareProject(); });
+    auto androidScope = new QLabel(tr("Android 版支持文件导入、曲谱编辑、API 与本地制谱、完整歌曲导出。\n工程和原始媒体副本保存在应用中；卸载前请分享完整工程。头显运行使用二维窗口，游戏目录权限需在目标设备中验证。"), left);
+    androidScope->setWordWrap(true); leftLayout->addWidget(androidScope);
+#endif
     m_recropButton = new QPushButton(tr("重新裁剪来源 · 新建空白谱"), left);
     leftLayout->addWidget(m_recropButton);
     connect(m_recropButton, &QPushButton::clicked, this, [this] {
@@ -473,6 +519,10 @@ void MainWindow::buildEditor() {
     hint->setWordWrap(true);
     hint->setProperty("role", "muted");
     rl->addStretch(); rl->addWidget(hint);
+#ifdef Q_OS_ANDROID
+    hint->setText(tr("网格：放置模式点击空格添加；选择模式点击物件查看属性。\n多选开关可追加选择。时间轴可切换编辑、平移、循环工具；拖动选中物件移动，空白处拖动框选。\n受保护内容仍由核心拒绝修改。"));
+    buildMobileEditor(outer, split, leftScroll, placement);
+#endif
     split->setStretchFactor(1, 1);
     auto transport = new QHBoxLayout;
     m_playButton = new QPushButton(tr("▶ 播放"), m_editorPage);
@@ -516,7 +566,25 @@ void MainWindow::buildEditor() {
     m_positionLabel = new QLabel(tr("0.00 秒 · 0.00 拍"), m_editorPage);
     m_positionLabel->setMinimumWidth(180);
     transport->addWidget(m_positionLabel);
+#ifdef Q_OS_ANDROID
+    while (auto item = transport->takeAt(0)) {
+        auto widget = item->widget();
+        if (widget && widget != m_positionLabel && qobject_cast<QLabel *>(widget)) delete widget;
+        delete item;
+    }
+    delete transport;
+    auto mobileTransport = new QGridLayout;
+    mobileTransport->addWidget(m_playButton, 0, 0); mobileTransport->addWidget(stop, 0, 1);
+    mobileTransport->addWidget(m_speed, 0, 2); mobileTransport->addWidget(m_snap, 0, 3);
+    m_speed->setAccessibleName(tr("播放速度")); m_snap->setAccessibleName(tr("拍点吸附"));
+    m_positionLabel->setMinimumWidth(0);
+    mobileTransport->addWidget(m_seekSlider, 1, 0, 1, 2);
+    mobileTransport->addWidget(m_positionLabel, 1, 2, 1, 2);
+    leftLayout->addWidget(m_loop); leftLayout->addWidget(m_metronome);
+    outer->addLayout(mobileTransport);
+#else
     outer->addLayout(transport);
+#endif
     m_progress = new QProgressBar(this);
     m_progress->setMaximumWidth(250);
     m_progress->setMinimumHeight(m_progress->fontMetrics().height() + 8);
@@ -546,9 +614,74 @@ void MainWindow::buildEditor() {
     });
 }
 
+#ifdef Q_OS_ANDROID
+void MainWindow::buildMobileEditor(QVBoxLayout *outer, QSplitter *split, QScrollArea *files, QWidget *placement) {
+    const int position = outer->indexOf(split);
+    outer->removeWidget(split);
+    m_mobileEditorTabs = new MobileEditorTabs(m_editorPage);
+    m_mobileEditorTabs->setObjectName(QStringLiteral("mobileEditorTabs"));
+    m_mobileEditorTabs->setDocumentMode(true);
+    m_mobileEditorTabs->setUsesScrollButtons(true);
+    files->setMinimumWidth(0); files->setMaximumWidth(QWIDGETSIZE_MAX);
+    m_toolsTabs->setMinimumWidth(0); m_toolsTabs->setMaximumWidth(QWIDGETSIZE_MAX);
+    if (auto objects = m_toolsTabs->widget(0)) objects->setMinimumWidth(0);
+    m_mobileEditorTabs->addTab(files, tr("工程"));
+    auto gridPage = new QWidget;
+    auto gridLayout = new QVBoxLayout(gridPage);
+    gridLayout->setContentsMargins(4, 4, 4, 4);
+    auto choices = new QHBoxLayout;
+    m_placeType->setAccessibleName(tr("放置物件类型"));
+    m_placeColor->setAccessibleName(tr("放置颜色"));
+    m_placeDirection->setAccessibleName(tr("放置方向"));
+    choices->addWidget(m_placeType); choices->addWidget(m_placeColor); choices->addWidget(m_placeDirection);
+    gridLayout->addLayout(choices);
+    placement->hide();
+    auto selection = new QHBoxLayout;
+    auto tool = new QComboBox(gridPage);
+    tool->setObjectName(QStringLiteral("mobileGridTool")); tool->addItems({tr("放置"), tr("选择")});
+    auto multi = new QCheckBox(tr("多选"), gridPage);
+    multi->setObjectName(QStringLiteral("mobileMultiSelection"));
+    auto properties = new QPushButton(tr("属性"), gridPage);
+    auto remove = new QPushButton(tr("删除"), gridPage);
+    selection->addWidget(tool); selection->addWidget(multi); selection->addWidget(properties); selection->addWidget(remove);
+    gridLayout->addLayout(selection);
+    m_grid->setMinimumSize(0, 120); gridLayout->addWidget(m_grid, 1);
+    m_mobileEditorTabs->addTab(gridPage, tr("网格"));
+    connect(tool, QOverload<int>::of(&QComboBox::currentIndexChanged), m_grid, [this](int index) { m_grid->setSelectionOnly(index == 1); });
+    connect(multi, &QCheckBox::toggled, this, [this](bool enabled) {
+        m_grid->setAdditiveSelection(enabled); m_timeline->setAdditiveSelection(enabled); m_track->setAdditiveSelection(enabled);
+    });
+    connect(properties, &QPushButton::clicked, this, [this] { m_toolsTabs->setCurrentIndex(0); m_mobileEditorTabs->setCurrentIndex(4); });
+    connect(remove, &QPushButton::clicked, this, [this] { if (editorCommandAllowed()) deleteObjects(); });
+    auto timelinePage = new QWidget;
+    auto timelineLayout = new QVBoxLayout(timelinePage);
+    timelineLayout->setContentsMargins(4, 4, 4, 4);
+    auto tools = new QHBoxLayout;
+    auto interaction = new QComboBox(timelinePage);
+    interaction->setObjectName(QStringLiteral("mobileTimelineTool")); interaction->addItems({tr("编辑 / 框选"), tr("平移"), tr("循环")});
+    auto zoomIn = new QPushButton(tr("放大"), timelinePage);
+    auto zoomOut = new QPushButton(tr("缩小"), timelinePage);
+    tools->addWidget(interaction, 1); tools->addWidget(zoomIn); tools->addWidget(zoomOut);
+    timelineLayout->addLayout(tools);
+    m_timeline->setMinimumSize(0, 120); timelineLayout->addWidget(m_timeline, 1);
+    m_mobileEditorTabs->addTab(timelinePage, tr("时间轴"));
+    connect(interaction, QOverload<int>::of(&QComboBox::currentIndexChanged), m_timeline, [this](int index) { m_timeline->setInteractionMode(index); });
+    connect(zoomIn, &QPushButton::clicked, m_timeline, [this] { m_timeline->zoomBy(1.4); });
+    connect(zoomOut, &QPushButton::clicked, m_timeline, [this] { m_timeline->zoomBy(1.0 / 1.4); });
+    m_track->setMinimumSize(0, 120); m_mobileEditorTabs->addTab(m_track, tr("预览"));
+    m_mobileEditorTabs->addTab(m_toolsTabs, tr("工具"));
+    outer->insertWidget(position, m_mobileEditorTabs, 1);
+    delete split;
+}
+#endif
+
 void MainWindow::buildWorkspace() {
     ui->centralwidget->setObjectName(QStringLiteral("workspaceContent"));
+#ifdef Q_OS_ANDROID
+    auto layout = new QVBoxLayout(ui->centralwidget);
+#else
     auto layout = new QHBoxLayout(ui->centralwidget);
+#endif
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
     m_sidebar = new lmsc::NavigationSidebar(ui->centralwidget);
@@ -578,7 +711,9 @@ void MainWindow::buildWorkspace() {
     m_aiPage->setGenerationService(m_defaultGenerationService, m_defaultGenerationService);
     m_aiPage->setLocalGenerationService(m_localGenerationService, m_localGenerationService);
     m_aiPage->setHybridGenerationService(m_hybridGenerationService, m_hybridGenerationService);
+#ifndef Q_OS_ANDROID
     m_aiPage->setInfernoGenerationService(m_infernoGenerationService, m_infernoGenerationService);
+#endif
     toolsLayout->addWidget(m_aiPage, 1);
     m_draftReplacement = new QWidget(m_generationTools);
     m_draftReplacement->setObjectName(QStringLiteral("draftReplacementPrompt"));
@@ -639,7 +774,25 @@ void MainWindow::buildWorkspace() {
     });
     m_settingsPanel = new lmsc::SettingsPanel(m_workspacePages, m_settingsFile, true);
     m_workspacePages->addWidget(m_settingsPanel);
+#ifdef Q_OS_ANDROID
+    m_sidebar->hide();
+    auto workspaceNavigation = new QComboBox(ui->centralwidget);
+    workspaceNavigation->setObjectName(QStringLiteral("mobileWorkspaceNavigation"));
+    workspaceNavigation->addItem(tr("曲谱编辑"), 0);
+    workspaceNavigation->addItem(tr("生成与精修"), 1);
+    workspaceNavigation->addItem(tr("外观"), 2);
+    workspaceNavigation->addItem(tr("API 模型"), 3);
+    workspaceNavigation->addItem(tr("网络"), 5);
+    workspaceNavigation->addItem(tr("关于"), 6);
+    layout->addWidget(workspaceNavigation);
+    connect(workspaceNavigation, QOverload<int>::of(&QComboBox::activated), navigation,
+            [workspaceNavigation, navigation](int index) { navigation->setCurrentRow(workspaceNavigation->itemData(index).toInt()); });
+    connect(navigation, &QListWidget::currentRowChanged, workspaceNavigation, [workspaceNavigation](int row) {
+        workspaceNavigation->setCurrentIndex(workspaceNavigation->findData(row));
+    });
+#else
     layout->addWidget(m_sidebar);
+#endif
     layout->addWidget(m_workspacePages, 1);
     connect(navigation, &QListWidget::currentRowChanged, this, &MainWindow::selectWorkspacePage);
     connect(m_settingsPanel, &lmsc::SettingsPanel::navigationRequested, this, [navigation](int index) {
@@ -684,6 +837,9 @@ void MainWindow::buildWorkspace() {
 
 void MainWindow::selectWorkspacePage(int row) {
     if (row < 0 || row > 6) return;
+#ifdef Q_OS_ANDROID
+    if (row == 4) row = 3; // The desktop account page cannot launch a mobile CLI.
+#endif
     if (row < 2) {
         m_workspacePages->setCurrentWidget(m_editorPage);
         if (row == 1) showGenerationTools();
@@ -792,11 +948,10 @@ void MainWindow::buildActions() {
     };
     action(file, tr("新歌"), QKeySequence::New, [this] { newSong(); });
     action(file, tr("导入歌曲"), QKeySequence::Open, [this] { importSongFolder(); });
-    action(file, tr("打开编辑工程"), QKeySequence("Ctrl+Shift+O"), [this] {
-        if (m_busy || !confirmDocumentChange()) return;
-        const auto path = QFileDialog::getOpenFileName(this, tr("打开编辑工程"), lmsc::WorkspacePaths::projectsDirectory(), tr("编辑工程 (*.lmsc)"));
-        if (!path.isEmpty()) openPath(path);
-    });
+    action(file, tr("打开编辑工程"), QKeySequence("Ctrl+Shift+O"), [this] { openProjectDialog(); });
+#ifdef Q_OS_ANDROID
+    action(file, tr("分享完整工程"), {}, [this] { shareProject(); });
+#endif
     file->addSeparator();
     m_saveAction = action(file, tr("保存工程"), QKeySequence::Save, [this] { saveProject(); });
     action(file, tr("工程另存为"), QKeySequence::SaveAs, [this] { saveProject(true); });
@@ -821,6 +976,16 @@ void MainWindow::buildActions() {
     });
     toolbar->addAction(m_saveAction); toolbar->addAction(m_exportAction); toolbar->addSeparator();
     toolbar->addAction(m_undoAction); toolbar->addAction(m_redoAction);
+#ifdef Q_OS_ANDROID
+    auto filesButton = new QToolButton(toolbar);
+    filesButton->setText(tr("文件")); filesButton->setMenu(file); filesButton->setPopupMode(QToolButton::InstantPopup);
+    toolbar->insertWidget(m_saveAction, filesButton);
+    auto editsButton = new QToolButton(toolbar);
+    editsButton->setText(tr("编辑")); editsButton->setMenu(edit); editsButton->setPopupMode(QToolButton::InstantPopup);
+    toolbar->addWidget(editsButton);
+    m_saveAction->setText(tr("保存")); m_exportAction->setText(tr("导出"));
+    menuBar()->hide();
+#endif
     auto settings = menuBar()->addMenu(tr("设置"));
     auto settingsAction = action(settings, tr("外观设置"), QKeySequence("Ctrl+,"), [this] { showSettings(); });
     settingsAction->setObjectName(QStringLiteral("openSettingsAction"));
@@ -849,12 +1014,50 @@ void MainWindow::showSettings() {
 
 void MainWindow::importSongFolder() {
     if (m_busy || !confirmDocumentChange()) return;
+#ifdef Q_OS_ANDROID
+    QMessageBox chooser(QMessageBox::Question, tr("导入歌曲"), tr("选择 BeatSaver ZIP，或复制系统文件选择器中的完整歌曲文件夹。原歌曲保持原样。"), QMessageBox::Cancel, this);
+    auto zip = chooser.addButton(tr("ZIP 文件"), QMessageBox::ActionRole);
+    auto folder = chooser.addButton(tr("歌曲文件夹"), QMessageBox::ActionRole);
+    chooser.exec();
+    QString error, path;
+    if (chooser.clickedButton() == zip) path = pickAndroidFile(this, {QStringLiteral("application/zip"), QStringLiteral("application/octet-stream")}, &error);
+    else if (chooser.clickedButton() == folder) path = pickAndroidDirectory(this, true, &error);
+    if (!error.isEmpty()) showError(error);
+    else if (!path.isEmpty()) openPath(path);
+    return;
+#else
     SongImportDialog dialog(m_mtp, this);
     if (dialog.exec() != QDialog::Accepted) return;
     if (!dialog.fromDevice()) { openPath(dialog.localPath()); return; }
     m_mtpImportPending = true;
     setBusy(true, tr("正在从头显复制歌曲到电脑…"));
     m_mtp->importSong(dialog.selectedSong());
+#endif
+}
+
+void MainWindow::openProjectDialog() {
+    if (m_busy || !confirmDocumentChange()) return;
+    QString path;
+#ifdef Q_OS_ANDROID
+    QMessageBox chooser(QMessageBox::Question, tr("打开编辑工程"), tr("应用中的工程可以继续编辑。导入外部工程时，请选择同时包含 project.lmsc 和 assets-*、source-* 的完整工程文件夹。"), QMessageBox::Cancel, this);
+    auto local = chooser.addButton(tr("应用中工程"), QMessageBox::ActionRole);
+    auto external = chooser.addButton(tr("导入完整工程"), QMessageBox::ActionRole);
+    chooser.exec();
+    if (chooser.clickedButton() == local) {
+        path = QFileDialog::getOpenFileName(this, tr("打开应用中工程"), lmsc::WorkspacePaths::projectsDirectory(), tr("编辑工程 (*.lmsc)"), nullptr, QFileDialog::DontUseNativeDialog);
+    } else if (chooser.clickedButton() == external) {
+        QString error;
+        const QString directory = pickAndroidDirectory(this, true, &error);
+        if (!error.isEmpty()) { showError(error); return; }
+        if (directory.isEmpty()) return;
+        path = QDir(directory).filePath(QStringLiteral("project.lmsc"));
+        if (!QFileInfo(path).isFile()) { showError(tr("该文件夹没有 project.lmsc；请选完整工程目录。")); return; }
+        m_importedProjectPending = true;
+    }
+#else
+    path = QFileDialog::getOpenFileName(this, tr("打开编辑工程"), lmsc::WorkspacePaths::projectsDirectory(), tr("编辑工程 (*.lmsc)"));
+#endif
+    if (!path.isEmpty()) openPath(path);
 }
 
 void MainWindow::showAbout() {
@@ -1205,8 +1408,14 @@ void MainWindow::calibrateTempo() {
 
 void MainWindow::newSong() {
     if (m_busy || !confirmDocumentChange()) return;
+#ifdef Q_OS_ANDROID
+    QString inputError;
+    const QString path = pickAndroidFile(this, {QStringLiteral("audio/*"), QStringLiteral("video/*")}, &inputError);
+    if (!inputError.isEmpty()) { showError(inputError); return; }
+#else
     const QString path = QFileDialog::getOpenFileName(this, tr("选择新歌音频或视频"), {},
           tr("音乐和视频 (*.mp3 *.mp4 *.m4a *.ogg *.wav *.flac);;所有文件 (*)"));
+#endif
     if (path.isEmpty()) return;
     m_recropPending = false;
     m_mediaFlow = true;
@@ -1222,8 +1431,22 @@ void MainWindow::showNewSongDialog(const MediaInfo &info) {
     QDialog dialog(this);
     dialog.setWindowTitle(tr("创建新歌 · 音轨与裁剪"));
     dialog.resize(580, 490);
+#ifdef Q_OS_ANDROID
+    dialog.resize(size());
+    auto dialogLayout = new QVBoxLayout(&dialog);
+    auto dialogScroll = new QScrollArea(&dialog);
+    dialogScroll->setWidgetResizable(true); dialogScroll->setFrameShape(QFrame::NoFrame);
+    dialogScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    auto dialogContent = new QWidget;
+    dialogScroll->setWidget(dialogContent); dialogLayout->addWidget(dialogScroll, 1);
+    auto layout = new QVBoxLayout(dialogContent);
+#else
     auto layout = new QVBoxLayout(&dialog);
+#endif
     auto form = new QFormLayout;
+#ifdef Q_OS_ANDROID
+    form->setRowWrapPolicy(QFormLayout::WrapAllRows);
+#endif
     auto title = new QLineEdit(QFileInfo(info.path).completeBaseName(), &dialog);
     auto artist = new QLineEdit(&dialog);
     auto mapper = new QLineEdit("LMSC", &dialog);
@@ -1236,7 +1459,13 @@ void MainWindow::showNewSongDialog(const MediaInfo &info) {
     auto coverBrowse = new QPushButton(tr("选择"), coverRow);
     coverLayout->addWidget(cover); coverLayout->addWidget(coverBrowse);
     connect(coverBrowse, &QPushButton::clicked, &dialog, [&] {
+#ifdef Q_OS_ANDROID
+        QString error;
+        const auto path = pickAndroidFile(&dialog, {QStringLiteral("image/*")}, &error);
+        if (!error.isEmpty()) { showError(error); return; }
+#else
         const auto path = QFileDialog::getOpenFileName(&dialog, tr("选择封面"), {}, tr("图片 (*.png *.jpg *.jpeg)"));
+#endif
         if (!path.isEmpty()) cover->setText(path);
     });
     auto track = new QComboBox(&dialog);
@@ -1283,7 +1512,11 @@ void MainWindow::showNewSongDialog(const MediaInfo &info) {
     connect(stop, &QPushButton::clicked, m_audio, &AudioService::stop);
     auto buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
     buttons->button(QDialogButtonBox::Ok)->setText(tr("转换并创建"));
+#ifdef Q_OS_ANDROID
+    dialogLayout->addWidget(buttons);
+#else
     layout->addWidget(buttons);
+#endif
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
     connect(buttons, &QDialogButtonBox::accepted, &dialog, [&] {
         if (title->text().trimmed().isEmpty()) { showError(tr("请填写歌曲名")); return; }
@@ -1373,8 +1606,12 @@ bool MainWindow::saveProject(bool saveAs) {
     if (path.isEmpty()) {
         const QString suggested = lmsc::WorkspacePaths::suggestedProjectFile(m_document->title());
         if (suggested.isEmpty()) { showError(tr("无法创建默认工程目录，请检查磁盘空间和写入权限")); return false; }
+#ifdef Q_OS_ANDROID
+        path = suggested;
+#else
         path = QFileDialog::getSaveFileName(this, tr("保存独立编辑工程"), suggested,
                                            tr("编辑工程 (*.lmsc)"));
+#endif
         if (path.isEmpty()) return false;
         if (!path.endsWith(".lmsc", Qt::CaseInsensitive)) path += ".lmsc";
     }
@@ -1404,10 +1641,17 @@ bool MainWindow::saveProject(bool saveAs) {
 
 void MainWindow::exportSong() {
     if (m_busy || !m_document->isLoaded()) return;
+#ifdef Q_OS_ANDROID
+    const QString exportRoot = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath(QStringLiteral("exports"));
+    if (!QDir().mkpath(exportRoot)) { showError(tr("无法创建应用中的歌曲副本目录。")); return; }
+    const QString parentDirectory = exportRoot;
+#else
     SongExportDialog dialog(m_mtpExport, m_document->title(), this);
     if (dialog.exec() != QDialog::Accepted) return;
+    const QString parentDirectory = dialog.parentDirectory();
+#endif
     QString namingError;
-    const QString path = lmsc::WorkspacePaths::suggestedSongExportFolder(m_document->title(), dialog.parentDirectory(), &namingError);
+    const QString path = lmsc::WorkspacePaths::suggestedSongExportFolder(m_document->title(), parentDirectory, &namingError);
     if (path.isEmpty()) { showError(namingError); return; }
     const double leadIn = m_document->isNewSong() ? m_exportLeadIn->value() : 0;
     const QString toolsDirectory = m_audio->toolsDirectory();
@@ -1426,6 +1670,20 @@ void MainWindow::exportSong() {
     loop.exec();
     const auto result = watcher.result();
     if (!result.ok) { m_storageBusy = false; setBusy(false); showError(result.error); return; }
+#ifdef Q_OS_ANDROID
+    QString exportError;
+    const QString tree = pickAndroidDirectory(this, false, &exportError);
+    if (tree.isEmpty()) {
+        m_storageBusy = false; setBusy(false);
+        if (!exportError.isEmpty()) showError(exportError + tr("\n完整应用副本保留在：%1").arg(path));
+        else QMessageBox::information(this, tr("已保留歌曲副本"), tr("已取消系统目录导出，完整歌曲仍保存在应用中：\n%1").arg(path));
+        return;
+    }
+    const QString location = lmsc::AndroidStorage::copyDirectoryToTree(path, tree, &exportError);
+    m_storageBusy = false; setBusy(false);
+    if (location.isEmpty()) { showError(exportError + tr("\n完整应用副本保留在：%1").arg(path)); return; }
+    QMessageBox::information(this, tr("导出完成"), tr("已在系统选择的目录中新建完整歌曲：\n%1\n\n完整应用副本保留在：\n%2\n\n可将整个歌曲目录复制到游戏中。头显的 Android/data 权限及两款游戏实际游玩需分别验证。").arg(location, path));
+#else
     QString deviceLocation;
     if (dialog.toDevice()) {
         QString transferError;
@@ -1477,7 +1735,23 @@ void MainWindow::exportSong() {
     auto open = message.addButton(tr("打开歌曲目录"), QMessageBox::ActionRole);
     connect(open, &QPushButton::clicked, &message, [path] { QDesktopServices::openUrl(QUrl::fromLocalFile(path)); });
     message.exec();
+#endif
 }
+
+#ifdef Q_OS_ANDROID
+void MainWindow::shareProject() {
+    if (m_busy || !m_document->isLoaded() || !saveProject()) return;
+    QString error;
+    const QString tree = pickAndroidDirectory(this, false, &error);
+    if (tree.isEmpty()) { if (!error.isEmpty()) showError(error); return; }
+    m_storageBusy = true; setBusy(true, tr("正在分享完整工程与资源…")); m_cancelButton->hide();
+    const QString folder = QFileInfo(m_document->projectPath()).absolutePath();
+    const QString location = lmsc::AndroidStorage::copyProjectDirectoryToTree(folder, tree, &error);
+    m_storageBusy = false; setBusy(false);
+    if (location.isEmpty()) showError(error);
+    else QMessageBox::information(this, tr("工程分享完成"), tr("完整工程及 assets-*、source-*、恢复快照已复制到：\n%1\n应用中的工程可继续编辑。").arg(location));
+}
+#endif
 
 bool MainWindow::confirmDocumentChange() {
     cancelRefinement();

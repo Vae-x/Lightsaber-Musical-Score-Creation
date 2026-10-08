@@ -43,6 +43,16 @@ QString projectName(QString name) {
 }
 
 QString WorkspacePaths::projectsDirectory(const QString &executableDirectory, const QString &documentsDirectory) {
+#ifdef Q_OS_ANDROID
+    Q_UNUSED(executableDirectory)
+    Q_UNUSED(documentsDirectory)
+    // The APK installation directory is read-only. Keep the entry file, assets,
+    // sources and recovery snapshots together in application-owned storage.
+    const QString data = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (data.isEmpty() || !QDir::isAbsolutePath(data)) return {};
+    const QString projects = QDir(data).filePath(QStringLiteral("projects"));
+    return ensureWritable(projects) ? QDir(projects).absolutePath() : QString();
+#else
     const QString location = executableDirectory.isEmpty() ? QCoreApplication::applicationDirPath() : executableDirectory;
     QDir cursor(location);
     if (isInstalledDirectory(cursor)) return documentsProjectsDirectory(documentsDirectory);
@@ -59,6 +69,7 @@ QString WorkspacePaths::projectsDirectory(const QString &executableDirectory, co
     }
     if (ensureWritable(preferred)) return QDir(preferred).absolutePath();
     return documentsProjectsDirectory(documentsDirectory);
+#endif
 }
 
 QString WorkspacePaths::suggestedProjectFile(const QString &title, const QString &projectsRoot) {

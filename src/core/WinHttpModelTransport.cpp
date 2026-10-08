@@ -1,3 +1,4 @@
+#include "WorkerThread.h"
 #include "WinHttpModelTransport.h"
 
 #ifdef Q_OS_WIN
@@ -325,7 +326,7 @@ void WinHttpModelTransport::start(const QUrl &url, const QString &key,
     const auto state = std::make_shared<WinHttpRequestState>();
     state->requestBody = body;
     state->deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(qMax(1, timeoutMs));
-    QThread *thread = QThread::create([state, url, key, providerId, post, timeoutMs, proxy] {
+    QThread *thread = lmsc::createWorkerThread([state, url, key, providerId, post, timeoutMs, proxy] {
         performRequest(state, url, key, providerId, post, qMax(1, timeoutMs), proxy);
     });
     m_tasks.insert(thread, state);

@@ -1,3 +1,4 @@
+#include "WorkerThread.h"
 #include "AiRefinementService.h"
 #include "AiTextTransport.h"
 #include "BeatmapPlayabilityValidator.h"
@@ -270,7 +271,7 @@ struct AiRefinementService::Impl {
             analysis = cachedAnalysis; owner->setProperty("refinementAnalysisCacheHit", true); analyzed(); return;
         }
         const auto output = std::make_shared<Work>(); output->key = key; work = output; const quint64 generation = epoch;
-        worker = QThread::create([snapshot, output] {
+        worker = lmsc::createWorkerThread([snapshot, output] {
             output->success = MusicFeatureAnalyzer::analyze(snapshot, &output->analysis, &output->error,
                 [] { return QThread::currentThread()->isInterruptionRequested(); },
                 [output](int percent) { output->percent = percent; });

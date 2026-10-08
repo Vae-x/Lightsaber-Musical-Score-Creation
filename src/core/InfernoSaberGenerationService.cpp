@@ -1,3 +1,4 @@
+#include "WorkerThread.h"
 #include "InfernoSaberGenerationService.h"
 #include "BeatmapPlayabilityValidator.h"
 #include "LocalChartGenerator.h"
@@ -296,7 +297,7 @@ struct InfernoSaberGenerationService::Impl {
         if(finishing) result->analysis=cachedAnalysis;
         const auto settings=config;const auto previousHash=audioHash;
         status.stage=finishing?QStringLiteral("正在检查完整谱面、动作与音乐覆盖"):QStringLiteral("正在本地分析音乐并生成节奏基准");
-        auto *worker=QThread::create([snapshot,directory,result,settings,finishing,previousHash] {
+        auto *worker=lmsc::createWorkerThread([snapshot,directory,result,settings,finishing,previousHash] {
             try {
                 auto cancelled=[] {return QThread::currentThread()->isInterruptionRequested();};
                 if(finishing) {

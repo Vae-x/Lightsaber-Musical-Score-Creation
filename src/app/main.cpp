@@ -1,6 +1,7 @@
 #include <QApplication>
 #include <QCommandLineParser>
 #include <QDir>
+#include <QDebug>
 #include <QFile>
 #include <QFont>
 #include <QIcon>
@@ -19,6 +20,9 @@
 #include "gui/EditorViews.h"
 
 int main(int argc, char *argv[]) {
+#ifdef Q_OS_ANDROID
+    qputenv("ANDROID_OPENSSL_SUFFIX", "_1_1");
+#endif
     QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
     QCoreApplication::setAttribute(Qt::AA_UseHighDpiPixmaps);
     QApplication application(argc, argv);
@@ -33,7 +37,9 @@ int main(int argc, char *argv[]) {
     application.setApplicationVersion(lmsc::AppInfo::version());
     application.setOrganizationName("LMSC");
     application.setWindowIcon(QIcon(":/icons/app.png"));
+#ifndef Q_OS_ANDROID
     application.setFont(QFont("Microsoft YaHei UI", 9));
+#endif
     QCommandLineParser parser;
     parser.addHelpOption();
     parser.addOption({QStringList{"open"}, QStringLiteral("打开歌曲文件夹、ZIP 或编辑工程。"), "path"});
@@ -43,16 +49,25 @@ int main(int argc, char *argv[]) {
     const QString check = parser.value("smoke-check");
     const QString capture = parser.value("capture");
     const bool automated = !check.isEmpty() || !capture.isEmpty();
+#ifdef Q_OS_ANDROID
+    if (automated) qInfo() << "Android editor validation:" << parser.value("open") << check << capture;
+#endif
     std::unique_ptr<QTemporaryDir> isolatedSettings;
     QString settingsFile;
     if (automated) {
         isolatedSettings.reset(new QTemporaryDir);
-        if (!isolatedSettings->isValid()) return 1;
+        if (!isolatedSettings->isValid()) {
+            qWarning() << "Cannot create isolated validation settings";
+            return 1;
+        }
         settingsFile = isolatedSettings->filePath(QStringLiteral("settings.ini"));
-        lmsc::AppPreferences preferences;
+        auto preferences = lmsc::AppSettings(settingsFile).load();
         preferences.diagnosticLogEnabled = false;
         QString settingsError;
-        if (!lmsc::AppSettings(settingsFile).save(preferences, &settingsError)) return 1;
+        if (!lmsc::AppSettings(settingsFile).save(preferences, &settingsError)) {
+            qWarning().noquote() << "Cannot save validation settings:" << settingsError;
+            return 1;
+        }
     }
     MainWindow window(nullptr, settingsFile);
     window.setTestMode(automated);
@@ -88,7 +103,11 @@ int main(int argc, char *argv[]) {
             timer->start(250);
         });
     }
+#ifdef Q_OS_ANDROID
+    window.showFullScreen();
+#else
     window.show();
+#endif
     if (parser.isSet("open")) QTimer::singleShot(0, &window, [&] { window.openPath(parser.value("open")); });
     return application.exec();
 }

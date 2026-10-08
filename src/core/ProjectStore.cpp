@@ -1,4 +1,7 @@
 #include "ProjectStore.h"
+#ifdef Q_OS_ANDROID
+#include "AndroidStorage.h"
+#endif
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
@@ -113,10 +116,12 @@ bool ProjectStore::readJson(const QString &path, QJsonObject *json, QString *err
 }
 
 bool ProjectStore::extractZip(const QString &archive, const QString &destination, QString *error) {
-#ifndef Q_OS_WIN
+#ifdef Q_OS_ANDROID
+    return AndroidStorage::extractZip(archive, destination, error);
+#elif !defined(Q_OS_WIN)
     Q_UNUSED(archive)
     Q_UNUSED(destination)
-    return fail(error, QStringLiteral("首版 ZIP 导入使用 Windows 内置解压服务。"));
+    return fail(error, QStringLiteral("此平台尚未提供 ZIP 导入服务。"));
 #else
     if (!QFileInfo(archive).isFile() || !QDir(destination).entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty())
         return fail(error, QStringLiteral("ZIP 不存在或解压目标不是空目录。"));

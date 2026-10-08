@@ -1,3 +1,4 @@
+#include "WorkerThread.h"
 #include "HybridAiGenerationService.h"
 #include "AiTextTransport.h"
 #include "LocalChartGenerator.h"
@@ -117,7 +118,7 @@ struct HybridAiGenerationService::Impl {
         }
         const auto result = std::make_shared<Work>(); result->key = key;
         work = result; const quint64 generation = epoch;
-        worker = QThread::create([snapshot, result] {
+        worker = lmsc::createWorkerThread([snapshot, result] {
             result->success = MusicFeatureAnalyzer::analyze(snapshot, &result->analysis, &result->error,
                 [] { return QThread::currentThread()->isInterruptionRequested(); },
                 [result](int value) { result->percent = value; });
@@ -196,7 +197,7 @@ struct HybridAiGenerationService::Impl {
         const auto music = analysis;
         const auto result = std::make_shared<Work>(); result->generating = true; result->key = audioKey(snapshot);
         work = result;
-        worker = QThread::create([snapshot, music, result] {
+        worker = lmsc::createWorkerThread([snapshot, music, result] {
             result->success = LocalChartGenerator::generate(snapshot, music, &result->draft, &result->error,
                 [] { return QThread::currentThread()->isInterruptionRequested(); },
                 [result](int value) { result->percent = value; });

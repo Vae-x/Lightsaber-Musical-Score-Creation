@@ -233,6 +233,7 @@ private slots:
     void inlinePromptCannotReplaceOtherDifficulty();
     void outputLimitSettingsReachGenerationTransport();
     void clickPlaceApplyUndoAndDifficulty();
+    void touchToolsWithoutKeyboardModifiers();
     void protectedSelectionRejectsEntireDrag();
     void importMp3AndCropThroughDialogs_data();
     void importMp3AndCropThroughDialogs();
@@ -1928,6 +1929,71 @@ void MainWindowTest::clickPlaceApplyUndoAndDifficulty() {
     QVERIFY(!apply->isEnabled());
     difficulties->setCurrentRow(0);
     QCOMPARE(objectCount(window), 4);
+    window.close();
+}
+
+void MainWindowTest::touchToolsWithoutKeyboardModifiers() {
+    MainWindow window(nullptr, settingsFile()); window.setTestMode(true); window.show();
+    QSignalSpy ready(&window, &MainWindow::documentReady);
+    window.openPath(m_song);
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 20000);
+    QTRY_VERIFY_WITH_TIMEOUT(window.isAudioReady(), 20000);
+    auto *grid = window.findChild<GridEditor *>();
+    auto *timeline = window.findChild<TimelineView *>();
+    auto *audio = window.findChild<AudioService *>();
+    auto *direction = field<QComboBox>(window, QStringLiteral("方向"));
+    QVERIFY(grid && timeline && audio && direction);
+    QApplication::setActiveWindow(&window);
+    audio->seek(0.5);
+    direction->setCurrentIndex(3);
+    QTest::mouseClick(grid, Qt::LeftButton, Qt::NoModifier, gridCell(*grid, 1, 1));
+    QTest::mouseClick(grid, Qt::LeftButton, Qt::NoModifier, gridCell(*grid, 2, 1));
+    QCOMPARE(objectCount(window), 5);
+    grid->setSelectionOnly(true);
+    QTest::mouseClick(grid, Qt::LeftButton, Qt::NoModifier, gridCell(*grid, 3, 1));
+    QCOMPARE(objectCount(window), 5); // Selecting empty space must not place a note.
+    QSet<QString> selected;
+    connect(grid, &GridEditor::selectionChanged, &window, [&](const QSet<QString> &ids) { selected = ids; });
+    grid->setAdditiveSelection(true);
+    QTest::mouseClick(grid, Qt::LeftButton, Qt::NoModifier, gridCell(*grid, 1, 1));
+    QTest::mouseClick(grid, Qt::LeftButton, Qt::NoModifier, gridCell(*grid, 2, 1));
+    QCOMPARE(selected.size(), 2);
+    for (const auto &object : session(window)->activeDocument()->objects())
+        if (selected.contains(object.id)) QCOMPARE(object.direction, 3);
+    const double row = (timeline->height() - 20 - 88) / 4.0;
+    const QPoint head(97, qRound(88 + row * 1.5));
+    auto drag = [&](const QPoint &from, const QPoint &to) {
+        QTest::mousePress(timeline, Qt::LeftButton, Qt::NoModifier, from);
+        QMouseEvent move(QEvent::MouseMove, to, Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(timeline, &move);
+        QTest::mouseRelease(timeline, Qt::LeftButton, Qt::NoModifier, to);
+    };
+    timeline->setInteractionMode(0);
+    timeline->setAdditiveSelection(true);
+    drag(head, head + QPoint(23, 0));
+    for (const auto &object : session(window)->activeDocument()->objects())
+        if (selected.contains(object.id)) QCOMPARE(object.beat, 1.5);
+    timeline->setFocus();
+    auto *undo = namedAction(window, QStringLiteral("撤销"));
+    auto *redo = namedAction(window, QStringLiteral("重做"));
+    QVERIFY(undo && redo);
+    undo->trigger();
+    for (const auto &object : session(window)->activeDocument()->objects())
+        if (selected.contains(object.id)) QCOMPARE(object.beat, 1.0);
+    redo->trigger();
+    for (const auto &object : session(window)->activeDocument()->objects())
+        if (selected.contains(object.id)) QCOMPARE(object.beat, 1.5);
+    const auto revision = session(window)->activeDocument()->revision();
+    timeline->setInteractionMode(1);
+    drag(QPoint(300, 35), QPoint(180, 35));
+    QCOMPARE(session(window)->activeDocument()->revision(), revision);
+    QSignalSpy loops(timeline, &TimelineView::loopChanged);
+    timeline->setInteractionMode(2);
+    drag(QPoint(90, 35), QPoint(180, 35));
+    QCOMPARE(loops.count(), 1);
+    QVERIFY(loops.first()[1].toDouble() > loops.first()[0].toDouble());
+    timeline->zoomBy(1.4);
+    timeline->zoomBy(1.0 / 1.4);
     window.close();
 }
 

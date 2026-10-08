@@ -1,3 +1,4 @@
+#include "WorkerThread.h"
 #include "LocalAiGenerationService.h"
 #include "LocalChartGenerator.h"
 #include "DiagnosticLog.h"
@@ -132,7 +133,7 @@ struct LocalAiGenerationService::Impl {
         output->cacheKey = key;
         workerEpoch = epoch;
         const quint64 generation = epoch;
-        auto *thread = QThread::create([snapshot, output, cached, reuse] {
+        auto *thread = lmsc::createWorkerThread([snapshot, output, cached, reuse] {
             auto cancelled = [] { return QThread::currentThread()->isInterruptionRequested(); };
             if (cancelled()) return;
             if (reuse) {

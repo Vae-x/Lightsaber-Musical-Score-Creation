@@ -1,6 +1,9 @@
 #include "SongExporter.h"
 #include "BeatmapDocument.h"
 #include "ProjectStore.h"
+#ifdef Q_OS_ANDROID
+#include "NativeAudioTool.h"
+#endif
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -98,9 +101,15 @@ bool SongExporter::exportSong(const BeatmapDocument &document, const QString &de
     for (const auto &object : document.objects())
         if (object.isProtected())
             return fail(error, QStringLiteral("曲谱含受保护物件，不能自动后移；请将导出开场缓冲设为 0。"));
+#ifdef Q_OS_ANDROID
+    Q_UNUSED(toolsDirectory)
+    if (!NativeAudioTool::available())
+        return fail(error, QStringLiteral("APK 缺少可用的 Android 音频组件，无法添加开场缓冲。"));
+#else
     const QString ffmpeg = QDir(toolsDirectory).filePath(QStringLiteral("ffmpeg.exe"));
     if (toolsDirectory.isEmpty() || !QFileInfo(ffmpeg).isFile())
         return fail(error, QStringLiteral("缺少随软件提供的音频组件，无法添加开场缓冲。"));
+#endif
     const QString parent = target.absolutePath();
     if (!QDir().mkpath(parent)) return fail(error, QStringLiteral("无法建立导出父目录。"));
     QTemporaryDir staging(QDir(parent).filePath(QStringLiteral(".lmsc-buffer-XXXXXX")));
@@ -141,6 +150,18 @@ bool SongExporter::exportSong(const BeatmapDocument &document, const QString &de
     }
     const QString originalAudio = QDir(song).filePath(audioFile);
     const QString paddedAudio = QDir(staging.path()).filePath(QStringLiteral("padded.ogg"));
+    const QStringList arguments{QStringLiteral("-hide_banner"), QStringLiteral("-v"), QStringLiteral("error"),
+        QStringLiteral("-nostdin"), QStringLiteral("-n"), QStringLiteral("-i"), originalAudio,
+        QStringLiteral("-map"), QStringLiteral("0:a:0"), QStringLiteral("-vn"), QStringLiteral("-sn"), QStringLiteral("-dn"),
+        QStringLiteral("-map_metadata"), QStringLiteral("-1"), QStringLiteral("-ar"), QStringLiteral("44100"),
+        QStringLiteral("-af"), QStringLiteral("aresample=44100,adelay=delays=%1S:all=1").arg(delaySamples),
+        QStringLiteral("-c:a"), QStringLiteral("libvorbis"), QStringLiteral("-q:a"), QStringLiteral("5"), paddedAudio};
+#ifdef Q_OS_ANDROID
+    const auto audioResult = NativeAudioTool::run(false, arguments, {}, {}, 180000);
+    if (audioResult.timedOut) return fail(error, QStringLiteral("添加开场缓冲超时，未完成导出。"));
+    if (audioResult.exitCode != 0 || QFileInfo(paddedAudio).size() <= 0)
+        return fail(error, QStringLiteral("添加开场缓冲失败：%1").arg(audioResult.error));
+#else
     QProcess process;
 #ifdef Q_OS_WIN
     process.setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments *args) { args->flags |= 0x08000000; });
@@ -148,12 +169,7 @@ bool SongExporter::exportSong(const BeatmapDocument &document, const QString &de
     process.setStandardOutputFile(QProcess::nullDevice());
     const QString logPath = QDir(staging.path()).filePath(QStringLiteral("ffmpeg.log"));
     process.setStandardErrorFile(logPath);
-    process.start(ffmpeg, {QStringLiteral("-hide_banner"), QStringLiteral("-v"), QStringLiteral("error"),
-        QStringLiteral("-nostdin"), QStringLiteral("-n"), QStringLiteral("-i"), originalAudio,
-        QStringLiteral("-map"), QStringLiteral("0:a:0"), QStringLiteral("-vn"), QStringLiteral("-sn"), QStringLiteral("-dn"),
-        QStringLiteral("-map_metadata"), QStringLiteral("-1"), QStringLiteral("-ar"), QStringLiteral("44100"),
-        QStringLiteral("-af"), QStringLiteral("aresample=44100,adelay=delays=%1S:all=1").arg(delaySamples),
-        QStringLiteral("-c:a"), QStringLiteral("libvorbis"), QStringLiteral("-q:a"), QStringLiteral("5"), paddedAudio});
+    process.start(ffmpeg, arguments);
     if (!process.waitForStarted(10000)) return fail(error, QStringLiteral("音频组件无法启动：%1").arg(process.errorString()));
     if (!process.waitForFinished(180000)) {
         process.kill(); process.waitForFinished(3000);
@@ -164,6 +180,7 @@ bool SongExporter::exportSong(const BeatmapDocument &document, const QString &de
         log.seek(qMax<qint64>(0, log.size() - 3000));
         return fail(error, QStringLiteral("添加开场缓冲失败：%1").arg(QString::fromUtf8(log.readAll()).trimmed()));
     }
+#endif
     if (!QFile::remove(originalAudio) || !QFile::rename(paddedAudio, originalAudio))
         return fail(error, QStringLiteral("无法完成导出音频替换。"));
     info.insert("_previewStartTime", info.value("_previewStartTime").toDouble() + actualDelay);

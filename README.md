@@ -1,6 +1,6 @@
 # 光剑曲谱制作
 
-基于 **Qt5 / C++** 的 Windows 曲谱编辑器，支持手动编排、MP3/MP4 音频处理和 AI 整曲制谱。用户已反馈此前导出歌曲可用于 PICO Neo 3 的《星穹绿洲》和《光之乐团》。APK 留在后续阶段。
+基于 **Qt5 / C++** 的曲谱编辑器，Windows 版支持手动编排、MP3/MP4 音频处理和 AI 整曲制谱。新增面向普通 Android 手机的 APK 预览版，同一 APK 可作为头显二维应用尝试运行。用户已反馈此前 Windows 版导出歌曲可用于 PICO Neo 3 的《星穹绿洲》和《光之乐团》；Android 安装、文件权限和游戏内游玩另行验收。
 
 **v0.6.0** 提供 Windows 安装版和免安装便携版，生成、手改与精修统一在编辑页，工作草稿可保存续编；保留本地快速制谱、音频处理、设备导入导出及确认后删除单首歌曲，具体验证范围见 [更新记录](CHANGELOG.md)。
 
@@ -23,6 +23,16 @@
 
 `assets-*` 是工程的原始资源快照，正式导出会合并编辑结果；手动复制请使用导出完成窗口提供的歌曲目录。
 
+## Android APK 预览版
+
+面向 **Android 7.0 / API 24 及以上、64 位 ARM 手机**；同一 APK 也包含 `x86_64` 供模拟器检查。头显使用普通二维界面，无需更换主框架，也不提供 VR 沉浸式编辑。Android 版保持谱面保护、音频处理、API 与本地快速制谱，使用系统文件选择器导入、分享工程和导出歌曲；Windows 的 USB/MTP、单曲设备删除、Codex 本机授权和 InfernoSaber 桌面环境不在 APK 中开放。
+
+已完成双 ABI 测试签名 APK，本地产物为 `dist/光剑曲谱制作-0.6.0-安卓预览版-20261008-090935.apk`，旁边的 `.sha256` 可用于校验；APK 尚未发布到公开 Release，已有 Windows Release 保持原样。将 APK 复制到手机后打开，按系统提示允许该文件来源安装，首次启动后从“工程”页导入 ZIP/歌曲文件夹，或选择媒体创建新歌。网格页提供放置/选择、多选、颜色与方向；时间轴页提供编辑、平移、循环和缩放工具；顶部“文件”与“编辑”按钮可保存、导出、撤销和重做。
+
+**工程默认保存在应用私有目录，卸载应用或清除应用数据会移除这些副本。** 卸载、换机或清除数据前，从“工程 → 分享完整工程”选择系统目录，保留整个工程文件夹，包括 `project.lmsc`、`assets-*`、`source-*` 和恢复快照。外部工程使用“打开编辑工程 → 导入完整工程”恢复。歌曲导出先保留完整应用副本，再向所选目录新增 `光剑曲谱制作/歌曲名-by光剑曲谱/`；导出歌曲用于游戏，继续编辑请备份完整工程。
+
+截至 **2026-10-08**，双 ABI APK 构建与 v2 签名校验完成；Windows Debug **29 / 29 项 CTest**、随后 **5 / 5 项相关 GUI 回归**及最终 Debug 构建通过，Java 合成边界 **83 个断言**通过。x86_64 模拟器平台报告音频 4 项、存储 8 项通过，主程序启动及手机尺寸布局已检查。真实 SAF 用例默认跳过，后续只打开文件选择器；完整 GUI 编辑往返和 SAF 写入未确认，手机、PICO 与游戏游玩未实测，Windows Release 本轮未验证。已按用户要求停止后续模拟器验证。安装、构建命令、许可和权限限制见 [Android 打包与使用说明](docs/Android打包与使用说明.md)。
+
 ## 软件截图
 
 以下为真实软件界面，使用合成歌曲和模拟设备目录；不包含用户曲目、账号或密钥。
@@ -43,7 +53,7 @@
 
 ![电脑与 PICO 游戏导出选择](docs/images/export-dialog.png)
 
-## 功能与兼容范围
+## Windows 功能与兼容范围
 
 - **歌曲与音频**：自动识别目录或 BeatSaver ZIP；MP3/MP4 可选音轨、裁剪、转换 Ogg，自动估算 BPM 和第一拍，支持手动校准。
 - **手动编辑**：五种通用难度标识，普通红蓝方块、方向、炸弹、墙；多选、复制粘贴、镜像、撤销重做、慢速试听、循环、节拍器与节拍吸附。
@@ -76,6 +86,8 @@ v0.5.0 已在 Windows 11 与真实 PICO Neo 3 上完成两游戏的 USB 分类�
 源码按 `src/app/`（入口）、`src/core/`（曲谱与服务）、`src/gui/`（Qt 窗口与控件）分工。同类 `.h/.cpp` 和窗口 `.ui` 放在一起；目录、工具链和构建方法见 [工程目录说明](docs/工程目录说明.md)。
 
 根 `CMakeLists.txt` 为推荐入口，`src/CMakeLists.txt` 继续兼容已有 CLion 工程。采用 Qt 5.12.12 / MinGW 7.3 的 32 位应用工具链；FFmpeg 和 WPD 传输工具为 64 位，因此发行包面向 Windows 64 位。音频依赖用 `scripts/setup-audio-tools.ps1` 准备；设备 helper 通过 Windows .NET Framework C# 编译器构建，源代码在仓库中。新构建集中于 `build/debug/`、`build/release/`，便携包用 `scripts/package-portable.ps1` 创建，安装包在完整发布目录基础上用 `scripts/package-installer.ps1` 与 Inno Setup 6.7.3 创建，详见 [安装版打包说明](docs/安装版打包说明.md)。
+
+Android 保持 Qt5/C++，使用独立 Qt 5.15.2 Android 工具链及 `build/` 下专用输出，不替换 Windows 的 Qt 5.12.12 配置。APK 通过 `scripts/setup-android-tools.ps1`、`scripts/package-android.ps1` 准备和打包，音频组件固定 FFmpegKit 6.0.4，API Key 使用 Android Keystore 加密保存，详见 [Android 说明](docs/Android打包与使用说明.md) 与 [Android 音频组件来源和许可](third_party/android-ffmpeg/README.md)。
 
 本地歌曲、编辑工程、设备元数据、构建与便携包均不提交；`samples/beatmaps/`、`projects/` 只跟踪 `.gitkeep`，依赖二进制留在忽略目录。持续协作与中文提交推送规则见 [AGENTS.md](AGENTS.md)。
 

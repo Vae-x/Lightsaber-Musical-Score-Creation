@@ -122,7 +122,9 @@ AiRecognitionPage::AiRecognitionPage(QWidget *parent)
     m_mode->addItem(tr("AI 建议 + 本地编排"), Hybrid);
     m_mode->addItem(tr("本地快速制谱"), LocalQuick);
     m_mode->addItem(tr("大语言模型制谱"), LanguageModel);
+#ifndef Q_OS_ANDROID
     m_mode->addItem(tr("本地模型 · InfernoSaber"), InfernoSaber);
+#endif
     modes->addWidget(m_mode);
     serviceLayout->addLayout(modes);
     auto options = new QVBoxLayout;

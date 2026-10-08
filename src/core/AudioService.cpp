@@ -1,4 +1,8 @@
 #include "AudioService.h"
+#include "WorkerThread.h"
+#ifdef Q_OS_ANDROID
+#include "NativeAudioTool.h"
+#endif
 
 #include <QAudioDeviceInfo>
 #include <QAudioFormat>
@@ -129,6 +133,14 @@ AudioService::AudioService(QObject *parent) : QObject(parent), m_cache(std::make
 
 AudioService::~AudioService() {
     m_shuttingDown = true;
+#ifdef Q_OS_ANDROID
+    if (m_nativeThread) {
+        m_nativeThread->disconnect(this);
+        m_nativeControl->cancelled.store(true);
+        m_nativeThread->wait();
+        if (m_task != Task::Probe && !m_taskOutput.isEmpty()) QFile::remove(m_taskOutput);
+    }
+#endif
     m_process.disconnect(this);
     if (m_process.state() != QProcess::NotRunning) {
         m_process.kill(); m_process.waitForFinished(3000);
@@ -158,13 +170,21 @@ QString AudioService::toolsDirectory() const {
 }
 
 QString AudioService::toolPath(const QString &name) const {
+#ifdef Q_OS_ANDROID
+    return name;
+#else
     const QString directory = toolsDirectory();
     return directory.isEmpty() ? QString() : QDir(directory).filePath(name + ".exe");
+#endif
 }
 bool AudioService::toolsAvailable() const {
+#ifdef Q_OS_ANDROID
+    return lmsc::NativeAudioTool::available();
+#else
     const QString directory = toolsDirectory();
     return !directory.isEmpty() && QFileInfo::exists(QDir(directory).filePath("ffmpeg.exe"))
            && QFileInfo::exists(QDir(directory).filePath("ffprobe.exe"));
+#endif
 }
 bool AudioService::isBusy() const { return m_task != Task::None || m_waveThread; }
 
@@ -183,12 +203,48 @@ lmsc::PcmAudioSnapshot AudioService::pcmSnapshot() const {
 
 void AudioService::startProcess(Task task, const QString &program, const QStringList &arguments) {
     if (isBusy()) { emit errorOccurred(tr("已有音频任务，请等待完成或取消。")); return; }
+#ifdef Q_OS_ANDROID
+    Q_UNUSED(program)
+    if (!toolsAvailable()) {
+        emit errorOccurred(tr("APK 缺少可用的 Android 音频组件，请重新安装完整安装包。")); return;
+    }
+#else
     if (program.isEmpty() || !QFileInfo::exists(program)) {
         emit errorOccurred(tr("缺少随软件提供的音频组件，请重新解压完整便携包。")); return;
     }
+#endif
     m_task = task; m_cancelled = false; m_stdout.clear(); m_stderr.clear(); m_progressBuffer.clear();
     emit taskProgress(task == Task::Probe ? tr("检查音轨") : task == Task::Convert ? tr("转换音频") : task == Task::Speed ? tr("准备保持音高的慢放") : tr("解码音频"), -1);
+#ifdef Q_OS_ANDROID
+    m_nativeControl = std::make_shared<lmsc::NativeAudioControl>();
+    const auto control = m_nativeControl;
+    const auto result = std::make_shared<lmsc::NativeAudioResult>();
+    const double taskDuration = m_taskDuration;
+    m_nativeThread = lmsc::createWorkerThread([this, task, arguments, control, result, taskDuration] {
+        *result = lmsc::NativeAudioTool::run(task == Task::Probe, arguments, control,
+            [this, task, taskDuration](double seconds) {
+                if (taskDuration <= 0) return;
+                const int percent = qBound(0, static_cast<int>(seconds / taskDuration * 100), 99);
+                QMetaObject::invokeMethod(this, [this, task, percent] {
+                    if (!m_shuttingDown && !m_cancelled && m_task == task)
+                        emit taskProgress(task == Task::Convert ? tr("转换音频") : tr("准备音频"), percent);
+                }, Qt::QueuedConnection);
+            });
+    });
+    QThread *thread = m_nativeThread;
+    thread->setParent(this);
+    connect(thread, &QThread::finished, this, [this, thread, result] {
+        m_nativeThread = nullptr;
+        m_nativeControl.reset();
+        thread->deleteLater();
+        if (m_task == Task::Probe) m_stdout = result->output;
+        m_stderr = result->error.toUtf8();
+        finishProcess(result->timedOut ? -1 : result->exitCode, QProcess::NormalExit);
+    });
+    thread->start();
+#else
     m_process.start(program, arguments);
+#endif
 }
 
 void AudioService::probeMedia(const QString &path) {
@@ -322,7 +378,7 @@ void AudioService::buildWaveform(const QString &pcmPath) {
     emit taskProgress(tr("分析音频波形"), -1);
     struct WaveResult { QVector<float> peaks; QString error; bool interrupted = false; };
     const auto result = std::make_shared<WaveResult>();
-    m_waveThread = QThread::create([pcmPath, result] {
+    m_waveThread = lmsc::createWorkerThread([pcmPath, result] {
         QFile file(pcmPath);
         if (!file.open(QIODevice::ReadOnly)) result->error = QObject::tr("无法读取 PCM 波形缓存。");
         else {
@@ -362,6 +418,9 @@ void AudioService::buildWaveform(const QString &pcmPath) {
 
 void AudioService::cancelTask() {
     m_cancelled = true;
+#ifdef Q_OS_ANDROID
+    if (m_nativeControl) m_nativeControl->cancelled.store(true);
+#endif
     if (m_process.state() != QProcess::NotRunning) m_process.kill();
     if (m_waveThread) m_waveThread->requestInterruption();
 }
@@ -387,7 +446,7 @@ void AudioService::restartPlayback(double seconds, bool playing) {
     format.setSampleSize(16); format.setCodec("audio/pcm"); format.setByteOrder(QAudioFormat::LittleEndian); format.setSampleType(QAudioFormat::SignedInt);
     const auto output = QAudioDeviceInfo::defaultOutputDevice();
     if (output.isNull() || !output.isFormatSupported(format)) {
-        emit errorOccurred(tr("当前声音设备不支持 44.1kHz 双声道 PCM，请检查 Windows 声音输出。")); emit playbackChanged(false); return;
+        emit errorOccurred(tr("当前声音设备不支持 44.1kHz 双声道 PCM，请检查声音输出。")); emit playbackChanged(false); return;
     }
     m_device.reset(new PcmPlaybackDevice(activePcm()));
     if (!m_device->valid()) { emit errorOccurred(tr("PCM 试听缓存无法打开。")); emit playbackChanged(false); return; }

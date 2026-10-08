@@ -8,6 +8,10 @@
 #include <QStyle>
 #include <QTimer>
 #include <QWidget>
+#ifdef Q_OS_ANDROID
+#include <QDebug>
+#include <QSvgRenderer>
+#endif
 
 namespace {
 QString currentMode = QStringLiteral("system");
@@ -343,6 +347,17 @@ namespace lmsc {
 void ThemeManager::apply(const QString &mode) {
     if (!qApp || applyingTheme)
         return;
+#ifdef Q_OS_ANDROID
+    // Keep QtSvg in the native dependency graph so androiddeployqt includes
+    // the SVG image/icon plugins used by the stylesheet's controls.
+    static const bool svgResourcesReady = [] {
+        QSvgRenderer renderer(QStringLiteral(":/icons/check-dark.svg"));
+        if (!renderer.isValid())
+            qWarning() << "Cannot render the bundled control icons";
+        return renderer.isValid();
+    }();
+    Q_UNUSED(svgResourcesReady)
+#endif
     if (!nativePaletteCaptured) {
         nativePalette = qApp->palette();
         nativePaletteCaptured = true;

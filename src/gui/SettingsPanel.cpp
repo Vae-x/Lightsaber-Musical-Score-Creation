@@ -63,7 +63,11 @@ QWidget *scrollPage(QWidget *content) {
 QVBoxLayout *pageLayout(QWidget *page, const QString &title, const QString &summary) {
     page->setProperty("role", "settingsPage");
     auto layout = new QVBoxLayout(page);
+#ifdef Q_OS_ANDROID
+    layout->setContentsMargins(8, 8, 8, 8);
+#else
     layout->setContentsMargins(28, 28, 28, 24);
+#endif
     layout->setSpacing(16);
     layout->addWidget(description(title, page, "pageTitle"));
     if (!summary.isEmpty()) layout->addWidget(description(summary, page));
@@ -73,7 +77,11 @@ QFrame *settingsCard(QWidget *parent, const QString &title = {}, const QString &
     auto card = new QFrame(parent);
     card->setProperty("role", "settingsCard");
     auto layout = new QVBoxLayout(card);
+#ifdef Q_OS_ANDROID
+    layout->setContentsMargins(8, 8, 8, 8);
+#else
     layout->setContentsMargins(20, 18, 20, 18);
+#endif
     layout->setSpacing(12);
     if (!title.isEmpty()) layout->addWidget(description(title, card, "cardTitle"));
     if (!summary.isEmpty()) layout->addWidget(description(summary, card));
@@ -84,6 +92,9 @@ QFormLayout *settingsForm() {
     form->setHorizontalSpacing(16);
     form->setVerticalSpacing(12);
     form->setRowWrapPolicy(QFormLayout::WrapLongRows);
+#ifdef Q_OS_ANDROID
+    form->setRowWrapPolicy(QFormLayout::WrapAllRows);
+#endif
     form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
     form->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
     return form;
@@ -99,6 +110,9 @@ SettingsPanel::SettingsPanel(QWidget *parent, const QString &settingsFile, bool 
     setAttribute(Qt::WA_StyledBackground, true);
     QString loadError;
     m_preferences = m_store.load(&loadError);
+#ifdef Q_OS_ANDROID
+    m_preferences.aiConnection = QStringLiteral("api");
+#endif
     m_savedPreferences = m_preferences;
     m_savedTheme = ThemeManager::mode();
 
@@ -147,7 +161,11 @@ SettingsPanel::SettingsPanel(QWidget *parent, const QString &settingsFile, bool 
     outer->addLayout(body, 1);
     auto footer = new QWidget(this);
     footer->setObjectName(QStringLiteral("settingsFooter"));
+#ifdef Q_OS_ANDROID
+    auto footerLayout = new QVBoxLayout(footer);
+#else
     auto footerLayout = new QHBoxLayout(footer);
+#endif
     footerLayout->setContentsMargins(24, 14, 24, 14);
     footerLayout->setSpacing(16);
     m_saveStatus = description(loadError, footer, loadError.isEmpty() ? "muted" : "warning");
@@ -224,6 +242,9 @@ SettingsPanel::SettingsPanel(QWidget *parent, const QString &settingsFile, bool 
 SettingsPanel::~SettingsPanel() { m_api->cancel(); m_codex->stop(); }
 
 void SettingsPanel::selectPage(int index) {
+#ifdef Q_OS_ANDROID
+    if (index == 2) index = 1;
+#endif
     if (index < 0 || index >= m_pages->count()) return;
     if (m_navigation->currentRow() != index) {
         m_navigation->setCurrentRow(index);
@@ -238,6 +259,9 @@ void SettingsPanel::selectPage(int index) {
 
 void SettingsPanel::showInfernoSettings() {
     selectPage(1);
+#ifdef Q_OS_ANDROID
+    return;
+#endif
     auto scroll = qobject_cast<QScrollArea *>(m_pages->widget(1));
     auto card = findChild<QFrame *>(QStringLiteral("infernoModelCard"));
     if (scroll && card) scroll->ensureWidgetVisible(card, 16, 16);
@@ -285,13 +309,19 @@ QWidget *SettingsPanel::buildAppearancePage() {
 QWidget *SettingsPanel::buildModelPage() {
     auto page = new QWidget;
     auto layout = pageLayout(page, tr("大语言模型"), tr("选择连接方式，配置提供商与可用模型。"));
-    layout->addWidget(buildInfernoCard(page));
+    auto infernoCard = buildInfernoCard(page);
+    layout->addWidget(infernoCard);
+#ifdef Q_OS_ANDROID
+    infernoCard->hide();
+#endif
     auto connectionCard = settingsCard(page, tr("连接方式"));
     auto connectionForm = settingsForm();
     m_connection = new QComboBox(connectionCard);
     m_connection->setObjectName(QStringLiteral("aiConnection"));
     m_connection->addItem(tr("API Key · OpenAI 兼容协议"), QStringLiteral("api"));
+#ifndef Q_OS_ANDROID
     m_connection->addItem(tr("Codex · ChatGPT 账号授权"), QStringLiteral("codex"));
+#endif
     m_connection->setCurrentIndex(qMax(0, m_connection->findData(m_preferences.aiConnection)));
     connectionForm->addRow(tr("使用方式"), m_connection);
     qobject_cast<QVBoxLayout *>(connectionCard->layout())->addLayout(connectionForm);
@@ -380,7 +410,11 @@ QWidget *SettingsPanel::buildModelPage() {
     m_connectionPages->setCurrentIndex(m_connection->currentIndex());
     connect(m_connection, QOverload<int>::of(&QComboBox::currentIndexChanged), m_connectionPages, &QStackedWidget::setCurrentIndex);
     layout->addWidget(m_connectionPages);
+#ifdef Q_OS_ANDROID
+    layout->addWidget(description(tr("API Key 使用 Android Keystore 加密保存在应用中。Android 版提供 API 与本地快速制谱；Codex 本机程序和 InfernoSaber 桌面环境不在手机上运行。"), page));
+#else
     layout->addWidget(description(tr("Windows 会为当前用户加密保存 API Key；连接设置和本地模型目录不会进入歌曲工程或导出包。"), page));
+#endif
     layout->addStretch();
     connect(m_provider, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this] {
         if (!m_loadingProvider) selectProvider(m_provider->currentData().toString());
@@ -760,6 +794,33 @@ QWidget *SettingsPanel::buildAboutPage() {
             licenseButton->setText(tr("查看 GPLv3 许可"));
         }
     });
+#ifdef Q_OS_ANDROID
+    layout->addWidget(description(tr("Android 预览版是普通二维应用。手机与头显使用相同 APK；安装、编辑、文件权限和游戏内游玩需分别验证。"), page));
+    layout->addWidget(description(tr("Android 音频使用 FFmpegKit 6.0.4；Qt、FFmpegKit/FFmpeg 和 OpenSSL 保留各自的原文许可与声明。下方可查看 APK 随附的第三方许可，GPLv3 全文仍使用上方入口。"), page));
+    auto thirdPartyButton = new QPushButton(tr("查看 Android 第三方许可"), page);
+    thirdPartyButton->setObjectName(QStringLiteral("showAndroidThirdPartyLicenses"));
+    layout->addWidget(thirdPartyButton, 0, Qt::AlignLeft);
+    auto thirdPartyText = new QTextBrowser(page);
+    thirdPartyText->setObjectName(QStringLiteral("androidThirdPartyLicenseText"));
+    thirdPartyText->setOpenExternalLinks(false); thirdPartyText->setFixedHeight(280); thirdPartyText->hide();
+    layout->addWidget(thirdPartyText);
+    connect(thirdPartyButton, &QPushButton::clicked, this, [thirdPartyButton, thirdPartyText] {
+        if (!thirdPartyText->isHidden()) {
+            thirdPartyText->hide(); thirdPartyButton->setText(tr("查看 Android 第三方许可")); return;
+        }
+        QStringList texts;
+        const QStringList files{QStringLiteral("README.md"), QStringLiteral("android-ffmpeg/LICENSE.txt"),
+            QStringLiteral("android-ffmpeg/THIRD-PARTY-NOTICES.txt"), QStringLiteral("qt/LICENSE.LGPL3"),
+            QStringLiteral("qt/LICENSE.GPL3"), QStringLiteral("openssl/LICENSE")};
+        for (const auto &name : files) {
+            QFile file(QStringLiteral("assets:/licenses/") + name);
+            texts.append(QStringLiteral("===== %1 =====\n").arg(name)
+                + (file.open(QIODevice::ReadOnly) ? QString::fromUtf8(file.readAll()) : tr("无法读取该第三方许可原文，请检查安装包是否完整。")));
+        }
+        thirdPartyText->setPlainText(texts.join(QStringLiteral("\n\n")));
+        thirdPartyText->show(); thirdPartyButton->setText(tr("收起 Android 第三方许可"));
+    });
+#endif
     layout->addStretch();
     return page;
 }

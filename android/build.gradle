@@ -1,0 +1,63 @@
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies { classpath 'com.android.tools.build:gradle:8.6.1' }
+}
+
+repositories {
+    google()
+    mavenCentral()
+}
+apply plugin: 'com.android.application'
+
+dependencies {
+    implementation fileTree(dir: 'libs', include: ['*.jar', '*.aar'])
+}
+
+android {
+    namespace 'org.lmsc.score'
+    compileSdk 35
+    buildToolsVersion '35.0.0'
+    defaultConfig {
+        applicationId project.hasProperty('lmscTestApk') ? 'org.lmsc.score.tests' : 'org.lmsc.score'
+        minSdk 24
+        targetSdk 34
+        versionCode 6001
+        versionName '0.6.0-android-preview'
+    }
+    signingConfigs {
+        debug {
+            storeFile file(project.property('lmscDebugKeystore'))
+            storePassword 'android'
+            keyAlias 'lmsc-preview'
+            keyPassword 'android'
+        }
+    }
+    sourceSets {
+        main {
+            manifest.srcFile 'AndroidManifest.xml'
+            java.srcDirs = [qt5AndroidDir + '/src', 'src']
+            aidl.srcDirs = [qt5AndroidDir + '/src', 'src']
+            res.srcDirs = [qt5AndroidDir + '/res', 'res']
+            assets.srcDirs = ['assets']
+            jniLibs.srcDirs = ['libs']
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    buildFeatures { aidl true }
+    packagingOptions {
+        jniLibs {
+            // The package script supplies the pinned Qt-compatible NDK21
+            // runtime and removes the AAR's conflicting C++ runtime.
+            pickFirsts += ['**/libc++_shared.so']
+            useLegacyPackaging true
+        }
+    }
+    lint { abortOnError true }
+    androidResources { noCompress += ['rcc'] }
+}

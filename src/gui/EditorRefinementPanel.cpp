@@ -57,6 +57,9 @@ EditorRefinementPanel::EditorRefinementPanel(QWidget *parent) : QWidget(parent) 
     layout->addWidget(textLabel(tr("查看版本"), content));
     layout->addWidget(m_version);
     m_selectedOnly = new QCheckBox(tr("仅精修选段（Shift 拖动时间轴）"), content);
+#ifdef Q_OS_ANDROID
+    m_selectedOnly->setText(tr("仅精修选段（时间轴循环工具）"));
+#endif
     m_selectedOnly->setObjectName(QStringLiteral("editorRefinementSelectedOnly"));
     layout->addWidget(m_selectedOnly);
     auto range = new QGridLayout;
